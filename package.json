@@ -27,7 +27,9 @@
   ],
   "files": [
     "index.ts",
+    "shared",
     "README.md",
+    "CHANGELOG.md",
     "LICENSE",
     "shared-julia-repl.png"
   ],
@@ -41,6 +43,7 @@
     "@earendil-works/pi-coding-agent": "*"
   },
   "scripts": {
+    "test": "node --test",
     "typecheck": "tsc --noEmit"
   },
   "devDependencies": {

@@ -4,9 +4,11 @@
     "module": "NodeNext",
     "moduleResolution": "NodeNext",
     "strict": true,
+    "allowJs": true,
+    "checkJs": false,
     "skipLibCheck": true,
     "noEmit": true,
     "types": ["node"]
   },
-  "include": ["index.ts"]
+  "include": ["index.ts", "shared/**/*.js"]
 }

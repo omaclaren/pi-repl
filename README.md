@@ -22,6 +22,8 @@ With `pi-repl` you can:
 - start, attach to, inspect, and stop a shared Haskell (GHCi) REPL
 - start, attach to, inspect, and stop a shared Clojure REPL
 - let pi read the raw shared REPL transcript for extra context when needed
+- keep a bounded clean record of compatible-client submissions and captured output, synchronized automatically with a compatible `pi-studio` using the same tmux session
+- export that clean record as canonical Markdown
 - check which shared REPL sessions are running
 - inspect which Python interpreter and environment the shared Python/IPython REPL is using with `/repl env`
 - stop the shared REPL when you are done
@@ -74,6 +76,12 @@ Restart pi after installing.
 | `/repl attach r` | Show how to attach to the shared R session |
 | `/repl attach ghci` | Show how to attach to the shared Haskell (GHCi) session |
 | `/repl attach clojure` | Show how to attach to the shared Clojure session |
+| `/repl export` | Export the clean record when exactly one shared session is running |
+| `/repl export python` | Export the shared Python/IPython clean record as canonical Markdown |
+| `/repl export julia` | Export the shared Julia clean record as canonical Markdown |
+| `/repl export r` | Export the shared R clean record as canonical Markdown |
+| `/repl export ghci` | Export the shared Haskell (GHCi) clean record as canonical Markdown |
+| `/repl export clojure` | Export the shared Clojure clean record as canonical Markdown |
 | `/repl stop` | Stop the shared session if only one is running |
 | `/repl stop python` | Stop the shared Python/IPython session |
 | `/repl stop julia` | Stop the shared Julia session |
@@ -81,9 +89,9 @@ Restart pi after installing.
 | `/repl stop ghci` | Stop the shared Haskell (GHCi) session |
 | `/repl stop clojure` | Stop the shared Clojure session |
 
-For R, both `/repl R` and `/repl r` work. The same applies to `/lab`, `/repl status`, `/repl attach`, and `/repl stop`.
+For R, both `/repl R` and `/repl r` work. The same applies to `/lab`, `/repl status`, `/repl attach`, `/repl export`, and `/repl stop`.
 
-For Clojure, `/repl clojure` is canonical and `/repl clj` also works. The same applies to `/lab`, `/repl status`, `/repl attach`, and `/repl stop`.
+For Clojure, `/repl clojure` is canonical and `/repl clj` also works. The same applies to `/lab`, `/repl status`, `/repl attach`, `/repl export`, and `/repl stop`.
 
 ## Tools used by pi
 
@@ -97,14 +105,24 @@ For Clojure, `/repl clojure` is canonical and `/repl clj` also works. The same a
 Notes:
 
 - `repl_status` is what pi uses to check which shared REPL sessions are currently running
-- while a shared REPL is running, `repl_status` also exposes the raw session history log path
-- pi can read that history file for context about what has already happened in the shared REPL
+- while a shared REPL is running, `repl_status` exposes the versioned clean-record ID/path/count/tail and the separate raw session history path
+- pi can use the clean entries when it needs compatible-client code/output boundaries, or read the raw history for context about direct pane interaction
 - the relevant shared session must already be running before `repl_send`
 - you can ask pi naturally to run code in Python, IPython, Julia, R, Haskell, or Clojure; pi chooses the tool parameters internally
 - for plain Python, `print(...)` is the safest way to get values back reliably
 - in Haskell (GHCi), use normal interactive syntax such as `let` bindings or `:{ ... :}` blocks for multiline declarations
 - in Clojure, use normal interactive syntax such as `let`, `def`/`defn`, or `do` forms for multiline code
 - tool output includes both the submitted code and the captured output
+
+## Shared clean record
+
+`pi-repl` remains independently usable and has no dependency on `pi-studio`. When a compatible `pi-studio` uses the same tmux REPL session, both clients automatically discover one session-owned clean record and see each other's submitted code and captured output.
+
+Compatible clients publish a versioned opaque ID in tmux and store the bounded JSON snapshot in a private per-user temporary directory. The record is tied to the exact tmux session ID and creation time, uses atomic locked updates, and holds a shared send lease from pre-send capture through completion capture. If `repl_send` times out or is aborted after submission, that live client retains the lease until the runtime completion marker appears or the exact tmux session ends; caller cancellation does not stop code already running in the REPL. This serializes compatible Studio and `pi-repl` sends so they do not claim each other's output.
+
+The clean record does **not** infer semantic boundaries for commands typed directly into an attached tmux pane. Direct interaction remains in the raw pane/history mirror. `/repl export [target]` writes the canonical clean-record Markdown to a new no-clobber file in Pi's current working directory; its metadata identifies entry origin, mode, status, runtime, and timestamp and states the direct-input limitation.
+
+Existing sessions attach lazily. Unsupported versions and invalid or stale session identities are left untouched, with ordinary `pi-repl` behavior and raw history still available. See [`shared/REPL_SESSION_RECORD_PROTOCOL.md`](./shared/REPL_SESSION_RECORD_PROTOCOL.md) for protocol, safety, retention, and compatibility details.
 
 ## Shared sessions
 
@@ -152,6 +170,8 @@ tmux attach -t pi-repl-python
 /repl clojure
 /repl status clojure
 /repl attach clojure
+
+/repl export python
 ```
 
 Example requests once the REPL is running:
@@ -167,8 +187,8 @@ Example requests once the REPL is running:
 ## Notes
 
 - `tmux` is required.
-- While a shared REPL is running, `pi-repl` keeps a raw transcript log of the tmux pane output for that session.
-- That transcript is plain text and may include prompts, echoed input, output, and errors.
+- While a shared REPL is running, `pi-repl` keeps both the compatible-client clean record and a raw transcript log of the tmux pane output for that session.
+- The raw transcript is plain text and may include prompts, echoed input, output, direct pane interaction, and errors; it is not parsed into clean entries.
 - `/repl env` is currently implemented for Python/IPython only.
 
 ## Related extensions
