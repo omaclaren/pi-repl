@@ -4,6 +4,8 @@ All notable changes to `pi-repl` are documented here.
 
 ## [Unreleased]
 
+## [0.4.0] — 2026-09-02
+
 ### Added
 - Add protocol-v1 clean records owned by the exact tmux session lifetime, discovered through first-writer-wins tmux metadata and stored as private bounded atomic snapshots.
 - Synchronize compatible-client code, lifecycle status, and captured output bidirectionally with `pi-studio` while keeping both extensions independently usable.
