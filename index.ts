@@ -25,6 +25,15 @@ import {
 	renderReplSessionRecordMarkdown,
 	upsertReplSessionRecordEntry,
 } from "./shared/repl-session-record.js";
+import {
+	createReplSubmissionDisplay,
+	normalizeReplSubmissionEchoMode,
+	stripReplSubmissionDisplay,
+} from "./shared/repl-submission-display.js";
+import {
+	cleanupPrivateReplControlFiles,
+	createPrivateReplControlFiles,
+} from "./shared/repl-control-files.js";
 
 const SUPPORTED_RUNTIMES = ["julia", "python", "ipython", "r", "ghci", "clojure", "clj", "bun"] as const;
 const DEFAULT_PYTHON_SESSION = "pi-repl-python";
@@ -190,9 +199,13 @@ type ClojureRuntime = "clojure" | "clj";
 type ManagedRuntime = PythonRuntime | "julia" | "r" | "ghci" | ClojureRuntime;
 type ImplementedRuntime = PythonRuntime | "julia" | "r" | "ghci" | "clojure";
 type SessionSelector = "python" | "julia" | "r" | "ghci" | "clojure";
+type ReplSubmissionEchoMode = "off" | "summary" | "full";
+type ReplSubmissionDisplay = ReturnType<typeof createReplSubmissionDisplay>;
+type ReplSendParams = { code: string; target?: string; timeoutMs?: number; echoMode?: string };
 
 type ReplCommand =
 	| { action: "help" }
+	| { action: "echo"; mode?: ReplSubmissionEchoMode }
 	| { action: "status"; runtime?: ManagedRuntime }
 	| { action: "env"; runtime?: ManagedRuntime }
 	| { action: "stop"; runtime?: ManagedRuntime }
@@ -241,6 +254,8 @@ type ReplSendDetails = {
 	timeoutMs: number;
 	target: SessionSelector;
 	submittedCode: string;
+	echoMode: ReplSubmissionEchoMode;
+	submissionAnchorId?: string;
 	previewComment?: string;
 	recordId?: string;
 	recordPath?: string;
@@ -264,7 +279,19 @@ const REPL_SEND_PARAMS = Type.Object({
 			maximum: MAX_REPL_SEND_TIMEOUT_MS,
 		}),
 	),
+	echoMode: Type.Optional(
+		Type.Union(
+			[Type.Literal("off"), Type.Literal("summary"), Type.Literal("full")],
+			{ description: "How much submitted code to echo visibly in the raw REPL pane. Defaults to the current /repl echo setting (off initially). Summary shows short submissions in full and truncates longer ones; Full has larger bounds and writes source code into persistent raw terminal history." },
+		),
+	),
 });
+
+let replSubmissionEchoMode = normalizeReplSubmissionEchoMode(process.env.PI_REPL_ECHO_MODE) as ReplSubmissionEchoMode;
+
+function resolveReplSubmissionEchoMode(value?: string): ReplSubmissionEchoMode {
+	return normalizeReplSubmissionEchoMode(value, replSubmissionEchoMode) as ReplSubmissionEchoMode;
+}
 
 const REPL_STATUS_PARAMS = Type.Object({
 	target: Type.Optional(
@@ -354,6 +381,7 @@ function formatUsage(): string {
 		"  /repl r",
 		"  /repl ghci",
 		"  /repl clojure",
+		"  /repl echo [off|summary|full]",
 		"  /repl status [python|julia|r|ghci|clojure]",
 		"  /repl env [python]",
 		"  /repl attach [python|julia|r|ghci|clojure]",
@@ -371,6 +399,7 @@ function formatUsage(): string {
 		"  - /repl ghci manages the shared tmux session pi-repl-ghci",
 		"  - /repl clojure and /repl clj manage the shared tmux session pi-repl-clojure",
 		"  - /repl status, /repl attach, /repl export, and /repl stop can target Python/IPython, Julia, R, GHCi, or Clojure",
+		"  - /repl echo controls the bounded submitted-code display in the raw pane; PI_REPL_ECHO_MODE sets the startup default",
 		"  - /repl export writes the selected session's canonical clean record as Markdown",
 		"  - /repl env inspects the shared Python/IPython session",
 		"  - the repl_send tool can execute code in the shared Python/IPython, Julia, R, GHCi, or Clojure session",
@@ -396,6 +425,14 @@ function parseReplCommand(args: string): ReplCommand {
 
 	if (["help", "-h", "--help", "?"].includes(firstLower)) {
 		return { action: "help" };
+	}
+
+	if (firstLower === "echo") {
+		if (rest.length === 0) return { action: "echo" };
+		if (rest.length > 1 || !["off", "summary", "full"].includes(rest[0].toLowerCase())) {
+			return { action: "error", message: "Usage: /repl echo [off|summary|full]" };
+		}
+		return { action: "echo", mode: rest[0].toLowerCase() as ReplSubmissionEchoMode };
 	}
 
 	if (firstLower === "status" || firstLower === "env" || firstLower === "stop" || firstLower === "attach" || firstLower === "export") {
@@ -914,6 +951,8 @@ type ReplControlPaths = {
 type ReplSubmissionState = {
 	sessionName: string;
 	sessionTarget: string;
+	tmuxSessionId: string;
+	tmuxSessionCreatedAt: number;
 	cwd: string;
 	runtime: ImplementedRuntime;
 	beforeCapture: string;
@@ -921,60 +960,43 @@ type ReplSubmissionState = {
 	completionObserved: boolean;
 };
 
-function getReplControlPaths(sessionName: string): ReplControlPaths {
-	if (sessionName === DEFAULT_PYTHON_SESSION) {
-		return {
-			dir: REPL_CONTROL_ROOT,
-			sourceFile: join(REPL_CONTROL_ROOT, "pr.py"),
-			doneFile: join(REPL_CONTROL_ROOT, "pr.done"),
-		};
-	}
-
-	if (sessionName === DEFAULT_JULIA_SESSION) {
-		return {
-			dir: REPL_CONTROL_ROOT,
-			sourceFile: join(REPL_CONTROL_ROOT, "jr.jl"),
-			doneFile: join(REPL_CONTROL_ROOT, "jr.done"),
-		};
-	}
-
-	if (sessionName === DEFAULT_R_SESSION) {
-		return {
-			dir: REPL_CONTROL_ROOT,
-			sourceFile: join(REPL_CONTROL_ROOT, "rr.R"),
-			doneFile: join(REPL_CONTROL_ROOT, "rr.done"),
-		};
-	}
-
-	if (sessionName === DEFAULT_GHCI_SESSION) {
-		return {
-			dir: REPL_CONTROL_ROOT,
-			sourceFile: join(REPL_CONTROL_ROOT, "gr.ghci"),
-			doneFile: join(REPL_CONTROL_ROOT, "gr.done"),
-		};
-	}
-
-	if (sessionName === DEFAULT_CLOJURE_SESSION) {
-		return {
-			dir: REPL_CONTROL_ROOT,
-			sourceFile: join(REPL_CONTROL_ROOT, "cr.clj"),
-			doneFile: join(REPL_CONTROL_ROOT, "cr.done"),
-		};
-	}
-
-	const dir = join(REPL_CONTROL_ROOT, sessionName);
-	return {
-		dir,
-		sourceFile: join(dir, "control.py"),
-		doneFile: join(dir, "done.flag"),
-	};
+function getReplControlExtension(runtime: ImplementedRuntime): string {
+	if (runtime === "julia") return "jl";
+	if (runtime === "r") return "R";
+	if (runtime === "ghci") return "ghci";
+	if (runtime === "clojure") return "clj";
+	return "py";
 }
 
-function buildPythonControlSource(runtime: PythonRuntime, code: string, doneFile: string): string {
+function buildPythonDisplayStatements(display: ReplSubmissionDisplay, indent = ""): string[] {
+	if (!display.enabled) return [];
+	return display.prefixLines.map((line) => `${indent}__pi_repl_builtins.print(${JSON.stringify(line)})`);
+}
+
+function buildJuliaDisplayStatements(display: ReplSubmissionDisplay, indent = ""): string[] {
+	if (!display.enabled) return [];
+	return display.prefixLines.map((line) => `${indent}Base.println(${JSON.stringify(line)})`);
+}
+
+function buildRDisplayStatements(display: ReplSubmissionDisplay, indent = ""): string[] {
+	if (!display.enabled) return [];
+	return display.prefixLines.map((line) => `${indent}base::cat(${JSON.stringify(`${line}\n`)})`);
+}
+
+function buildClojureDisplayStatements(display: ReplSubmissionDisplay, indent = ""): string[] {
+	if (!display.enabled) return [];
+	return display.prefixLines.map((line) => `${indent}(clojure.core/println ${JSON.stringify(line)})`);
+}
+
+function buildPythonControlSource(runtime: PythonRuntime, code: string, doneFile: string, display: ReplSubmissionDisplay): string {
+	const prefix = buildPythonDisplayStatements(display);
+	const completion = display.enabled ? [`    __pi_repl_builtins.print(${JSON.stringify(display.endMarker)})`] : [];
 	if (runtime === "ipython") {
 		return [
 			"from pathlib import Path as __pi_repl_path",
+			"import builtins as __pi_repl_builtins",
 			"import traceback as __pi_repl_traceback",
+			...prefix,
 			"try:",
 			"    __pi_repl_ip = get_ipython()",
 			"    if __pi_repl_ip is None:",
@@ -985,24 +1007,30 @@ function buildPythonControlSource(runtime: PythonRuntime, code: string, doneFile
 			"except Exception:",
 			"    __pi_repl_traceback.print_exc()",
 			"finally:",
+			...completion,
 			`    __pi_repl_path(${JSON.stringify(doneFile)}).write_text('done\\n', encoding='utf-8')`,
 		].join("\n");
 	}
 
 	return [
 		"from pathlib import Path as __pi_repl_path",
+		"import builtins as __pi_repl_builtins",
 		"import traceback as __pi_repl_traceback",
+		...prefix,
 		"try:",
 		`    exec(compile(${JSON.stringify(code)}, '<pi-repl>', 'exec'), globals())`,
 		"except Exception:",
 		"    __pi_repl_traceback.print_exc()",
 		"finally:",
+		...completion,
 		`    __pi_repl_path(${JSON.stringify(doneFile)}).write_text('done\\n', encoding='utf-8')`,
 	].join("\n");
 }
 
-function buildJuliaControlSource(code: string, doneFile: string): string {
+function buildJuliaControlSource(code: string, doneFile: string, display: ReplSubmissionDisplay): string {
+	const completion = display.enabled ? [`    Base.println(${JSON.stringify(display.endMarker)})`] : [];
 	return [
+		...buildJuliaDisplayStatements(display),
 		"try",
 		`    local __pi_result = Base.include_string(Main, ${JSON.stringify(code)}, "pi-repl")`,
 		"    if !isnothing(__pi_result)",
@@ -1011,14 +1039,17 @@ function buildJuliaControlSource(code: string, doneFile: string): string {
 		"catch e",
 		"    Base.display_error(stderr, e, catch_backtrace())",
 		"finally",
+		...completion,
 		`    write(${JSON.stringify(doneFile)}, "done\\n")`,
 		"end",
 	].join("\n");
 }
 
-function buildRControlSource(code: string, doneFile: string): string {
+function buildRControlSource(code: string, doneFile: string, display: ReplSubmissionDisplay): string {
+	const completion = display.enabled ? [`    base::cat(${JSON.stringify(`${display.endMarker}\n`)})`] : [];
 	return [
 		"local({",
+		...buildRDisplayStatements(display, "  "),
 		`  .__pi_repl_done_file <- ${JSON.stringify(doneFile)}`,
 		`  .__pi_repl_code <- ${JSON.stringify(code)}`,
 		"  tryCatch({",
@@ -1039,19 +1070,25 @@ function buildRControlSource(code: string, doneFile: string): string {
 		"      message(\"Error in \", paste(deparse(.__pi_repl_call), collapse = \" \"), \": \", conditionMessage(e))",
 		"    }",
 		"  }, finally = {",
+		...completion,
 		"    writeLines(\"done\", .__pi_repl_done_file)",
 		"  })",
 		"})",
 	].join("\n");
 }
 
-function buildGhciControlSource(code: string): string {
-	return code.replace(/\r/g, "").trimEnd();
+function buildGhciControlSource(code: string, display: ReplSubmissionDisplay): string {
+	const prefix = display.enabled
+		? display.prefixLines.map((line) => `:! command printf '%s\\n' ${shellQuote(line)}`)
+		: [];
+	return [...prefix, code.replace(/\r/g, "").trimEnd()].filter(Boolean).join("\n");
 }
 
-function buildClojureControlSource(code: string, doneFile: string): string {
+function buildClojureControlSource(code: string, doneFile: string, display: ReplSubmissionDisplay): string {
+	const completion = display.enabled ? [`      (clojure.core/println ${JSON.stringify(display.endMarker)})`] : [];
 	return [
 		"(let [code " + JSON.stringify(code) + "]",
+		...buildClojureDisplayStatements(display, "  "),
 		"  (try",
 		"    (let [rdr (clojure.lang.LineNumberingPushbackReader. (java.io.StringReader. code))]",
 		"      (loop [last-val nil has-val false]",
@@ -1062,16 +1099,17 @@ function buildClojureControlSource(code: string, doneFile: string): string {
 		"    (catch Throwable t",
 		"      (#'clojure.main/repl-caught t))",
 		"    (finally",
+		...completion,
 		`      (spit ${JSON.stringify(doneFile)} "done\\n"))))`,
 	].join("\n");
 }
 
-function buildReplControlSource(runtime: ImplementedRuntime, code: string, doneFile: string): string {
-	if (runtime === "julia") return buildJuliaControlSource(code, doneFile);
-	if (runtime === "r") return buildRControlSource(code, doneFile);
-	if (runtime === "ghci") return buildGhciControlSource(code);
-	if (runtime === "clojure") return buildClojureControlSource(code, doneFile);
-	return buildPythonControlSource(runtime, code, doneFile);
+function buildReplControlSource(runtime: ImplementedRuntime, code: string, doneFile: string, display: ReplSubmissionDisplay): string {
+	if (runtime === "julia") return buildJuliaControlSource(code, doneFile, display);
+	if (runtime === "r") return buildRControlSource(code, doneFile, display);
+	if (runtime === "ghci") return buildGhciControlSource(code, display);
+	if (runtime === "clojure") return buildClojureControlSource(code, doneFile, display);
+	return buildPythonControlSource(runtime, code, doneFile, display);
 }
 
 function buildReplSubmissionLine(runtime: ImplementedRuntime, sourceFile: string): string {
@@ -1091,22 +1129,10 @@ function buildReplSubmissionLine(runtime: ImplementedRuntime, sourceFile: string
 	return `exec(open(${quotedPath}).read(),globals())`;
 }
 
-function buildReplPreviewComment(runtime: ImplementedRuntime, code: string): string | undefined {
-	const normalized = code.replace(/\r/g, "").trimEnd();
-	const lines = normalized.split("\n");
-	if (lines.length === 1) {
-		const oneLine = lines[0].trim().replace(/\s+/g, " ");
-		if (oneLine.length > 0 && oneLine.length <= 80) {
-			return undefined;
-		}
-	}
-	const prefix = runtime === "ghci" ? "--" : runtime === "clojure" ? ";;" : "#";
-	return `${prefix} pi-repl: running ${lines.length}-line snippet`;
-}
-
-function buildReplCompletionLine(runtime: ImplementedRuntime, doneFile: string): string | undefined {
+function buildReplCompletionLine(runtime: ImplementedRuntime, doneFile: string, display: ReplSubmissionDisplay): string | undefined {
 	if (runtime === "ghci") {
-		return `:! touch ${shellQuote(doneFile)}`;
+		const displayCommand = display.enabled ? `command printf '%s\\n' ${shellQuote(display.endMarker)}; ` : "";
+		return `:! ${displayCommand}touch ${shellQuote(doneFile)}`;
 	}
 	return undefined;
 }
@@ -1116,27 +1142,29 @@ function buildSubmissionText(submissionLine: string, previewComment?: string, co
 }
 
 function prepareReplControlFiles(
-	sessionName: string,
 	runtime: ImplementedRuntime,
 	code: string,
-): { controlPaths: ReplControlPaths; submissionLine: string; completionLine?: string; previewComment?: string; submissionText: string } {
-	const controlPaths = getReplControlPaths(sessionName);
-	mkdirSync(controlPaths.dir, { recursive: true });
-	try {
-		unlinkSync(controlPaths.doneFile);
-	} catch {
-		// ignore if no previous done file exists
-	}
-
-	writeFileSync(controlPaths.sourceFile, buildReplControlSource(runtime, code, controlPaths.doneFile), "utf-8");
+	details: { submissionId: string; echoMode: ReplSubmissionEchoMode },
+): { controlPaths: ReplControlPaths; submissionLine: string; completionLine?: string; previewComment?: string; submissionText: string; display: ReplSubmissionDisplay } {
+	const display = createReplSubmissionDisplay({
+		entryId: details.submissionId,
+		origin: "pi-repl",
+		code,
+		mode: details.echoMode,
+	});
+	const controlPaths: ReplControlPaths = createPrivateReplControlFiles({
+		extension: getReplControlExtension(runtime),
+		buildSource: ({ doneFile }: ReplControlPaths) => buildReplControlSource(runtime, code, doneFile, display),
+	});
 	const submissionLine = buildReplSubmissionLine(runtime, controlPaths.sourceFile);
-	const completionLine = buildReplCompletionLine(runtime, controlPaths.doneFile);
-	const previewComment = buildReplPreviewComment(runtime, code);
+	const completionLine = buildReplCompletionLine(runtime, controlPaths.doneFile, display);
+	const previewComment = undefined;
 	return {
 		controlPaths,
 		submissionLine,
 		completionLine,
 		previewComment,
+		display,
 		submissionText: buildSubmissionText(submissionLine, previewComment, completionLine),
 	};
 }
@@ -1184,7 +1212,7 @@ async function pasteTextToTmuxPane(
 async function capturePaneOutput(pi: ExtensionAPI, sessionTarget: string, cwd: string): Promise<string> {
 	const result = await execTmux(
 		pi,
-		["capture-pane", "-p", "-t", getPaneTarget(sessionTarget), "-S", `-${REPL_SEND_CAPTURE_LINES}`],
+		["capture-pane", "-J", "-p", "-t", getPaneTarget(sessionTarget), "-S", `-${REPL_SEND_CAPTURE_LINES}`],
 		cwd,
 		5_000,
 	);
@@ -1219,8 +1247,9 @@ function extractPaneDelta(before: string, after: string): string {
 	return afterLines.slice(index).join("\n");
 }
 
-function cleanupReplDelta(delta: string, submissionLine: string, previewComment?: string, completionLine?: string): string {
-	const lines = stripBoundaryBlankLines(delta).split("\n");
+function cleanupReplDelta(delta: string, submissionLine: string, previewComment?: string, completionLine?: string, display?: ReplSubmissionDisplay): string {
+	const displayCleaned = display ? stripReplSubmissionDisplay(delta, display) : delta;
+	const lines = stripBoundaryBlankLines(displayCleaned).split("\n");
 	const loaderHints = [submissionLine, "exec(open(", "run_cell(open(", "include(", "source(", ":script ", "load-file", "/tmp/pr.py", "/tmp/jr.jl", "/tmp/rr.R", "/tmp/gr.ghci", "/tmp/cr.clj", "/tmp/pi-repl", "control.py", ":pi-repl/silent"];
 	const previewHints = previewComment ? [previewComment, "# pi-repl:", "-- pi-repl:", ";; pi-repl:"] : ["# pi-repl:", "-- pi-repl:", ";; pi-repl:"];
 
@@ -1283,6 +1312,7 @@ async function waitForReplDoneFile(
 	doneFile: string,
 	timeoutMs: number,
 	signal?: AbortSignal,
+	captureContext?: { beforeCapture: string; prepared: ReturnType<typeof prepareReplControlFiles> },
 ): Promise<void> {
 	const deadline = Date.now() + timeoutMs;
 	let latestCapture = "";
@@ -1302,7 +1332,16 @@ async function waitForReplDoneFile(
 		await sleep(REPL_SEND_POLL_MS);
 	}
 
-	const tail = truncateTail(latestCapture, {
+	const latestOutput = captureContext
+		? cleanupReplDelta(
+			extractPaneDelta(captureContext.beforeCapture, latestCapture),
+			captureContext.prepared.submissionLine,
+			captureContext.prepared.previewComment,
+			captureContext.prepared.completionLine,
+			captureContext.prepared.display,
+		)
+		: latestCapture;
+	const tail = truncateTail(latestOutput, {
 		maxLines: 40,
 		maxBytes: 8 * 1024,
 	}).content.trim();
@@ -1325,11 +1364,14 @@ function normalizeReplSendTarget(target?: string): SessionSelector | undefined {
 
 async function runReplCode(
 	pi: ExtensionAPI,
-	params: { code: string; target?: string; timeoutMs?: number },
+	params: ReplSendParams,
 	ctx: ExtensionContext,
 	signal?: AbortSignal,
-	expectedSession?: ReplSessionIdentity,
-	onSubmissionStarted?: (state: ReplSubmissionState) => void,
+	options: {
+		expectedSession?: ReplSessionIdentity;
+		onSubmissionStarted?: (state: ReplSubmissionState) => void;
+		submissionId?: string;
+	} = {},
 ): Promise<{ output: string; details: ReplSendDetails }> {
 	const code = params.code ?? "";
 	if (!code.trim()) {
@@ -1393,11 +1435,11 @@ async function runReplCode(
 	}
 
 	if (
-		expectedSession
+		options.expectedSession
 		&& (
-			sessionInfo.sessionName !== expectedSession.sessionName
-			|| sessionInfo.tmuxSessionId !== expectedSession.tmuxSessionId
-			|| sessionInfo.tmuxSessionCreatedAt !== expectedSession.tmuxSessionCreatedAt
+			sessionInfo.sessionName !== options.expectedSession.sessionName
+			|| sessionInfo.tmuxSessionId !== options.expectedSession.tmuxSessionId
+			|| sessionInfo.tmuxSessionCreatedAt !== options.expectedSession.tmuxSessionCreatedAt
 		)
 	) {
 		throw new Error(`REPL session ${sessionName} changed while repl_send was waiting to execute.`);
@@ -1416,10 +1458,16 @@ async function runReplCode(
 	const timeoutMs = clampReplSendTimeout(params.timeoutMs);
 	const sessionTarget = sessionInfo.tmuxSessionId || sessionName;
 	const beforeCapture = await capturePaneOutput(pi, sessionTarget, ctx.cwd);
-	const prepared = prepareReplControlFiles(sessionName, runtime, code);
+	const echoMode = resolveReplSubmissionEchoMode(params.echoMode);
+	const prepared = prepareReplControlFiles(runtime, code, {
+		submissionId: options.submissionId || `pi-repl:local:${randomUUID()}`,
+		echoMode,
+	});
 	const submissionState: ReplSubmissionState = {
 		sessionName,
 		sessionTarget,
+		tmuxSessionId: sessionInfo.tmuxSessionId,
+		tmuxSessionCreatedAt: sessionInfo.tmuxSessionCreatedAt,
 		cwd: ctx.cwd,
 		runtime,
 		beforeCapture,
@@ -1427,37 +1475,50 @@ async function runReplCode(
 		completionObserved: false,
 	};
 
-	await pasteTextToTmuxPane(pi, sessionTarget, ctx.cwd, prepared.submissionText, () => onSubmissionStarted?.(submissionState));
-	await waitForReplDoneFile(
-		pi,
-		sessionName,
-		sessionTarget,
-		ctx.cwd,
-		prepared.controlPaths.doneFile,
-		timeoutMs,
-		signal,
-	);
-	submissionState.completionObserved = true;
-	const afterCapture = await capturePaneOutput(pi, sessionTarget, ctx.cwd);
-	const delta = extractPaneDelta(beforeCapture, afterCapture);
-	const output = cleanupReplDelta(delta, prepared.submissionLine, prepared.previewComment, prepared.completionLine);
+	let submissionStarted = false;
 	try {
-		unlinkSync(prepared.controlPaths.doneFile);
-	} catch {
-		// ignore cleanup errors
-	}
-
-	return {
-		output,
-		details: {
+		await pasteTextToTmuxPane(pi, sessionTarget, ctx.cwd, prepared.submissionText, () => {
+			submissionStarted = true;
+			options.onSubmissionStarted?.(submissionState);
+		});
+		await waitForReplDoneFile(
+			pi,
 			sessionName,
-			runtime,
-			target,
+			sessionTarget,
+			ctx.cwd,
+			prepared.controlPaths.doneFile,
 			timeoutMs,
-			submittedCode: code,
-			previewComment: prepared.previewComment,
-		},
-	};
+			signal,
+			{ beforeCapture, prepared },
+		);
+		submissionState.completionObserved = true;
+		const afterCapture = await capturePaneOutput(pi, sessionTarget, ctx.cwd);
+		const delta = extractPaneDelta(beforeCapture, afterCapture);
+		const output = cleanupReplDelta(delta, prepared.submissionLine, prepared.previewComment, prepared.completionLine, prepared.display);
+		cleanupPrivateReplControlFiles(prepared.controlPaths);
+
+		return {
+			output,
+			details: {
+				sessionName,
+				runtime,
+				target,
+				timeoutMs,
+				submittedCode: code,
+				echoMode,
+				submissionAnchorId: prepared.display.enabled ? prepared.display.anchorId : undefined,
+				previewComment: prepared.previewComment,
+			},
+		};
+	} catch (error) {
+		if (existsSync(prepared.controlPaths.doneFile)) submissionState.completionObserved = true;
+		if (!submissionStarted || submissionState.completionObserved) {
+			cleanupPrivateReplControlFiles(prepared.controlPaths);
+		} else if (!options.onSubmissionStarted) {
+			retainReplSubmissionUntilSettled(pi, submissionState, null);
+		}
+		throw error;
+	}
 }
 
 function sleepWithoutKeepingProcessAlive(ms: number): Promise<void> {
@@ -1467,21 +1528,26 @@ function sleepWithoutKeepingProcessAlive(ms: number): Promise<void> {
 	});
 }
 
-function retainReplSendLeaseUntilSubmissionSettles(
+function retainReplSubmissionUntilSettled(
 	pi: ExtensionAPI,
 	state: ReplSubmissionState,
-	lease: Awaited<ReturnType<typeof acquireReplSessionSendLease>>,
+	lease: Awaited<ReturnType<typeof acquireReplSessionSendLease>> | null,
 ): void {
 	// A timeout or abort only stops the caller's wait; it does not stop code that
-	// is already running in the shared REPL. Keep the cross-client lease alive
-	// until the wrapper's completion marker appears (or the exact tmux session
-	// ends), so a later compatible send cannot be attributed to overlapping work.
+	// is already running in the shared REPL. Keep the private control files (and
+	// any shared lease) until the wrapper reports completion or the session ends.
 	void (async () => {
 		let missingChecks = 0;
 		try {
 			while (!existsSync(state.prepared.controlPaths.doneFile)) {
+				if (!existsSync(state.prepared.controlPaths.sourceFile)) return;
 				try {
-					if (await tmuxSessionExists(pi, state.sessionTarget, state.cwd)) {
+					const current = await readSessionInfo(pi, state.sessionName, state.cwd);
+					if (
+						current
+						&& current.tmuxSessionId === state.tmuxSessionId
+						&& current.tmuxSessionCreatedAt === state.tmuxSessionCreatedAt
+					) {
 						missingChecks = 0;
 					} else {
 						missingChecks += 1;
@@ -1493,29 +1559,26 @@ function retainReplSendLeaseUntilSubmissionSettles(
 				}
 				await sleepWithoutKeepingProcessAlive(REPL_SEND_POLL_MS);
 			}
-			try {
-				unlinkSync(state.prepared.controlPaths.doneFile);
-			} catch {
-				// Another cleanup path may already have removed the marker.
-			}
 		} finally {
-			await lease.release().catch(() => undefined);
+			cleanupPrivateReplControlFiles(state.prepared.controlPaths);
+			await lease?.release().catch(() => undefined);
 		}
 	})();
 }
 
 async function runRecordedReplCode(
 	pi: ExtensionAPI,
-	params: { code: string; target?: string; timeoutMs?: number },
+	params: ReplSendParams,
 	ctx: ExtensionContext,
 	signal: AbortSignal | undefined,
 	metadata: { requestId: string; label: string; mode: "raw" | "literate" | "agent" },
 ): Promise<{ output: string; details: ReplSendDetails }> {
 	const target = normalizeReplSendTarget(params.target) ?? "python";
 	const sessionName = getSessionNameForSelector(target);
+	const submissionId = `pi-repl:${metadata.requestId}`;
 	const sessionInfo = await readSessionInfo(pi, sessionName, ctx.cwd);
 	if (!sessionInfo?.recordId || !sessionInfo.recordPath || sessionInfo.recordWarning) {
-		const execution = await runReplCode(pi, params, ctx, signal);
+		const execution = await runReplCode(pi, params, ctx, signal, { submissionId });
 		return {
 			...execution,
 			details: {
@@ -1552,7 +1615,7 @@ async function runRecordedReplCode(
 	try {
 		try {
 			const recorded = upsertReplSessionRecordEntry(sessionInfo.recordId, identity, {
-				id: `pi-repl:${metadata.requestId}`,
+				id: submissionId,
 				requestId: metadata.requestId,
 				origin: "pi-repl",
 				label: metadata.label,
@@ -1566,8 +1629,12 @@ async function runRecordedReplCode(
 		}
 
 		try {
-			const execution = await runReplCode(pi, params, ctx, signal, identity, (state) => {
-				submissionStateRef.current = state;
+			const execution = await runReplCode(pi, params, ctx, signal, {
+				expectedSession: identity,
+				submissionId,
+				onSubmissionStarted: (state) => {
+					submissionStateRef.current = state;
+				},
 			});
 			if (recordEntry) {
 				try {
@@ -1614,8 +1681,9 @@ async function runRecordedReplCode(
 			&& !submissionState.completionObserved
 			&& !existsSync(submissionState.prepared.controlPaths.doneFile)
 		) {
-			retainReplSendLeaseUntilSubmissionSettles(pi, submissionState, lease);
+			retainReplSubmissionUntilSettled(pi, submissionState, lease);
 		} else {
+			cleanupPrivateReplControlFiles(submissionState?.prepared.controlPaths);
 			await lease.release().catch(() => undefined);
 		}
 	}
@@ -1665,7 +1733,7 @@ function formatReplSendResult(output: string, details: ReplSendDetails): { text:
 
 async function executeReplSend(
 	pi: ExtensionAPI,
-	params: { code: string; target?: string; timeoutMs?: number },
+	params: ReplSendParams,
 	ctx: ExtensionContext,
 	signal: AbortSignal | undefined,
 	toolCallId: string,
@@ -2318,6 +2386,19 @@ async function handleRepl(pi: ExtensionAPI, args: string, ctx: ExtensionCommandC
 		return;
 	}
 
+	if (parsed.action === "echo") {
+		if (parsed.mode) replSubmissionEchoMode = parsed.mode;
+		const privacyNote = replSubmissionEchoMode === "full"
+			? " Full mode writes bounded submitted source code into persistent raw terminal history."
+			: "";
+		notify(
+			ctx,
+			`REPL submission echo: ${replSubmissionEchoMode}. Use /repl echo off|summary|full to change it for this Pi process; set PI_REPL_ECHO_MODE to choose the startup default.${privacyNote}`,
+			replSubmissionEchoMode === "full" ? "warning" : "info",
+		);
+		return;
+	}
+
 	const hasTmux = await commandExists(pi, "tmux", ctx.cwd);
 	if (!hasTmux) {
 		notify(ctx, "tmux was not found on PATH. pi-repl requires tmux.", "error");
@@ -2521,6 +2602,7 @@ export default function (pi: ExtensionAPI) {
 			"If you need context about prior direct REPL interaction, inspect repl_status details and read the session history file listed there.",
 			"The session history file is raw tmux pane output, so expect prompts and echoed input as well as results.",
 			"This is a shared long-lived session: inspect state before mutating it, and do not assume variables already exist.",
+			"Submitted-code display is off by default; use echoMode='summary' or echoMode='full' only when the user asks to show code and alignment anchors in the raw pane.",
 			"Keep snippets small. If you need a value back reliably, print it explicitly.",
 			"In GHCi, use normal interactive syntax such as let-bindings or :{ ... :} blocks for multiline declarations.",
 			"In Clojure, use normal interactive syntax such as let-bindings, def/defn, or do forms for multiline code.",
@@ -2528,7 +2610,7 @@ export default function (pi: ExtensionAPI) {
 		],
 		parameters: REPL_SEND_PARAMS,
 		async execute(toolCallId, params, signal, _onUpdate, ctx) {
-			return executeReplSend(pi, params as { code: string; target?: string; timeoutMs?: number }, ctx, signal, toolCallId);
+			return executeReplSend(pi, params as ReplSendParams, ctx, signal, toolCallId);
 		},
 	});
 }

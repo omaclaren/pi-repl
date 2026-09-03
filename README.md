@@ -23,6 +23,7 @@ With `pi-repl` you can:
 - start, attach to, inspect, and stop a shared Clojure REPL
 - let pi read the raw shared REPL transcript for extra context when needed
 - keep a bounded clean record of compatible-client submissions and captured output, synchronized automatically with a compatible `pi-studio` using the same tmux session
+- optionally show bounded, request-specific submitted code and compact alignment anchors in the raw pane, with Off as the privacy-conscious default
 - export that clean record as canonical Markdown
 - check which shared REPL sessions are running
 - inspect which Python interpreter and environment the shared Python/IPython REPL is using with `/repl env`
@@ -64,6 +65,10 @@ Restart pi after installing.
 | `/lab r` | Same as `/repl r` |
 | `/lab ghci` | Same as `/repl ghci` |
 | `/lab clojure` | Same as `/repl clojure` |
+| `/repl echo` | Show the current submitted-code pane-echo mode |
+| `/repl echo off` | Disable submitted-code displays and raw-history anchors for new sends (default) |
+| `/repl echo summary` | Show short submissions in full, truncating after 6 lines or 600 source characters, with compact anchors |
+| `/repl echo full` | Show up to 40 lines or 4,000 source characters and anchors in persistent raw history |
 | `/repl status` | Show running shared REPL sessions |
 | `/repl status python` | Show status for the shared Python/IPython session |
 | `/repl status julia` | Show status for the shared Julia session |
@@ -113,16 +118,28 @@ Notes:
 - in Haskell (GHCi), use normal interactive syntax such as `let` bindings or `:{ ... :}` blocks for multiline declarations
 - in Clojure, use normal interactive syntax such as `let`, `def`/`defn`, or `do` forms for multiline code
 - tool output includes both the submitted code and the captured output
+- `repl_send` accepts `echoMode: off|summary|full` for a single send; otherwise it uses `/repl echo`, initialized from `PI_REPL_ECHO_MODE` or Off
+- Full echo mode writes bounded submitted source code into persistent raw terminal history; Summary shows short submissions in full and truncates after 6 lines or 600 source characters
 
 ## Shared clean record
 
 `pi-repl` remains independently usable and has no dependency on `pi-studio`. When a compatible `pi-studio` uses the same tmux REPL session, both clients automatically discover one session-owned clean record and see each other's submitted code and captured output.
 
-Compatible clients publish a versioned opaque ID in tmux and store the bounded JSON snapshot in a private per-user temporary directory. The record is tied to the exact tmux session ID and creation time, uses atomic locked updates, and holds a shared send lease from pre-send capture through completion capture. If `repl_send` times out or is aborted after submission, that live client retains the lease until the runtime completion marker appears or the exact tmux session ends; caller cancellation does not stop code already running in the REPL. This serializes compatible Studio and `pi-repl` sends so they do not claim each other's output.
+Compatible clients publish a versioned opaque ID in tmux and store the bounded JSON snapshot in a private per-user temporary directory. The record is tied to the exact tmux session ID and creation time, uses atomic locked updates, and holds a shared send lease from pre-send capture through completion capture. If `repl_send` times out or is aborted after submission, that live client retains the lease until the runtime completion signal appears or the exact tmux session ends; caller cancellation does not stop code already running in the REPL. This serializes compatible Studio and `pi-repl` sends so they do not claim each other's output.
 
 The clean record does **not** infer semantic boundaries for commands typed directly into an attached tmux pane. Direct interaction remains in the raw pane/history mirror. `/repl export [target]` writes the canonical clean-record Markdown to a new no-clobber file in Pi's current working directory; its metadata identifies entry origin, mode, status, runtime, and timestamp and states the direct-input limitation.
 
 Existing sessions attach lazily. Unsupported versions and invalid or stale session identities are left untouched, with ordinary `pi-repl` behavior and raw history still available. See [`shared/REPL_SESSION_RECORD_PROTOCOL.md`](./shared/REPL_SESSION_RECORD_PROTOCOL.md) for protocol, safety, retention, and compatibility details.
+
+### Submission display and alignment anchors
+
+Optional pane echo places submitted code after a compact begin anchor, followed by a plain `── output ──` divider and a completion anchor. The anchors contain a stable 12-character hash derived from the Shared REPL Record entry ID, allowing known sends to be aligned in future derived transcripts without exposing the entry ID itself. `repl_send` removes the exact header, source preview, divider, and footer from captured output and the clean record, while they remain in raw pane history.
+
+Use `/repl echo off|summary|full` to change the default for the current Pi process, or set `PI_REPL_ECHO_MODE` before startup. A per-send `echoMode` overrides that default. **Off** is the startup default and emits no optional display or alignment anchors, although the REPL can still echo its unavoidable temporary-file control command. **Summary** shows short submissions in full, truncates after 6 lines or 600 source characters, and puts a plain output divider before runtime output. **Full** raises those bounds to 40 lines or 4,000 source characters and therefore persists more source code in raw terminal history. Terminal, line-separator, and bidirectional control characters are escaped in all visible previews.
+
+Runtime wrappers use compact request-unique paths such as `/tmp/pi-rc-<user-key>/<token>.py` instead of fixed global files such as `/tmp/pr.py`. The per-user root is current-user-owned mode `0700`, source files are mode `0600`, and files are removed after capture or by the timeout/abort watcher once execution settles. The short command remains readable while separate Pi processes, tmux servers, runtimes, and Studio sends cannot overwrite one another's control files.
+
+These anchors are presentation and alignment evidence only. They do not make direct attached-pane input authoritative and never promote inferred raw history into protocol-v1 entries.
 
 ## Shared sessions
 
@@ -152,6 +169,7 @@ tmux attach -t pi-repl-python
 ```text
 /repl ipython
 /repl env
+/repl echo summary
 /repl status
 /repl attach
 
@@ -188,7 +206,7 @@ Example requests once the REPL is running:
 
 - `tmux` is required.
 - While a shared REPL is running, `pi-repl` keeps both the compatible-client clean record and a raw transcript log of the tmux pane output for that session.
-- The raw transcript is plain text and may include prompts, echoed input, output, direct pane interaction, and errors; it is not parsed into clean entries.
+- The raw transcript is plain text and may include prompts, echoed input, request-specific display anchors, output, direct pane interaction, and errors; it is not parsed into clean entries.
 - `/repl env` is currently implemented for Python/IPython only.
 
 ## Related extensions
