@@ -4,6 +4,8 @@ All notable changes to `pi-repl` are documented here.
 
 ## [Unreleased]
 
+## [0.4.1] — 2026-09-03
+
 ### Added
 - Add deterministic raw-pane submission displays and alignment anchors across Python/IPython, Julia, R, GHCi, and Clojure, with privacy-conscious **Off** default, adaptive **Summary**, and bounded **Full** modes.
 - Add `/repl echo [off|summary|full]`, per-send `echoMode`, and `PI_REPL_ECHO_MODE` startup configuration.
