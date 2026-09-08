@@ -9,11 +9,12 @@ import { randomUUID } from "node:crypto";
 import { acquireReplSessionSendLease, readReplSessionRecord, upsertReplSessionRecordEntry } from "../shared/repl-session-record.js";
 
 const exec = promisify(execFile);
-const originalEnv = { TMPDIR: process.env.TMPDIR, PI_REPL_CONTROL_ROOT: process.env.PI_REPL_CONTROL_ROOT, SHELL: process.env.SHELL };
+const originalEnv = { TMPDIR: process.env.TMPDIR, PI_REPL_CONTROL_ROOT: process.env.PI_REPL_CONTROL_ROOT, SHELL: process.env.SHELL, PI_REPL_ECHO_MODE: process.env.PI_REPL_ECHO_MODE };
 const root = mkdtempSync(join(tmpdir(), "pi-repl-integration-"));
 process.env.TMPDIR = root;
 process.env.PI_REPL_CONTROL_ROOT = join(root, "controls");
 process.env.SHELL = "/bin/sh";
+delete process.env.PI_REPL_ECHO_MODE;
 const { default: register } = await import("../index.ts");
 const available = process.platform !== "win32" && spawnSync("tmux", ["-V"]).status === 0;
 const optionalRuntimes = new Set((process.env.PI_REPL_TEST_RUNTIMES || "").split(","));
@@ -107,7 +108,7 @@ async function fixture(t, { index = 0, runtime = "python" } = {}) {
 	const sessionName = `pi-repl-${runtime === "ipython" ? "python" : runtime}`;
 	const target = runtime === "ipython" ? "python" : runtime;
 	const repl = (args) => commands.get("repl").handler(args, ctx);
-	const send = (code, options = {}, signal) => tools.get("repl_send").execute(randomUUID(), { code, target, echoMode: "off", ...options }, signal, undefined, ctx);
+	const send = (code, options = {}, signal) => tools.get("repl_send").execute(randomUUID(), { code, target, ...options }, signal, undefined, ctx);
 	const status = () => tools.get("repl_status").execute(randomUUID(), { target }, undefined, undefined, ctx);
 	await repl(runtime);
 	assert.equal(notifications.some((n) => n.level === "error" || n.level === "warning"), false, JSON.stringify(notifications));
@@ -123,6 +124,37 @@ async function fixture(t, { index = 0, runtime = "python" } = {}) {
 	}
 	return { cwd, calls, notifications, tmux, sessionName, target, repl, send, status, onEnter: (callback) => { afterEnter = callback; } };
 }
+
+test("Summary is the default pane display; command and per-send overrides still work", { timeout: 30000 }, async (t) => {
+	const f = await fixture(t);
+	if (!f) return;
+	await f.repl("echo");
+	assert.match(f.notifications.at(-1).message, /REPL submission echo: summary/);
+	const code = "for i in range(1, 6):\n    print(i)";
+	const result = await f.send(code);
+	assert.equal(result.details.echoMode, "summary");
+	assert.ok(result.details.submissionAnchorId);
+	assert.match(result.content[0].text, /Output:\n1\n2\n3\n4\n5/);
+	assert.doesNotMatch(result.content[0].text, /──|│/);
+	const historyPath = (await f.status()).details.python.historyPath;
+	await eventually(() => readFileSync(historyPath, "utf8").includes(`── done · ${result.details.submissionAnchorId} ──`));
+	assert.match(readFileSync(historyPath, "utf8"), /│ for i in range\(1, 6\):\n│     print\(i\)\n── output ──/);
+
+	const quiet = await f.send("print('quiet')", { echoMode: "off" });
+	assert.equal(quiet.details.echoMode, "off");
+	assert.equal(quiet.details.submissionAnchorId, undefined);
+	assert.equal((await f.send("print('default again')")).details.echoMode, "summary");
+	try {
+		await f.repl("echo off");
+		assert.equal((await f.send("print('quiet by command')")).details.echoMode, "off");
+		assert.equal((await f.send("print('one summary')", { echoMode: "summary" })).details.echoMode, "summary");
+		assert.equal((await f.send("print('still quiet')")).details.echoMode, "off");
+		await f.repl("echo full");
+		assert.equal((await f.send("print('explicit full')")).details.echoMode, "full");
+	} finally {
+		await f.repl("echo summary");
+	}
+});
 
 for (const index of [0, 1]) {
 	test(`Python lifecycle, private history, clean records and export with tmux indexes ${index}`, { timeout: 45000 }, async (t) => {

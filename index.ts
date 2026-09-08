@@ -285,7 +285,7 @@ const REPL_SEND_PARAMS = Type.Object({
 	echoMode: Type.Optional(
 		StringEnum(
 			["off", "summary", "full"] as const,
-			{ description: "How much submitted code to echo visibly in the raw REPL pane. Defaults to the current /repl echo setting (off initially). Summary shows short submissions in full and truncates longer ones; Full has larger bounds and writes source code into persistent raw terminal history." },
+			{ description: "How much submitted code to echo visibly in the raw REPL pane. Defaults to the current /repl echo setting (summary initially, unless PI_REPL_ECHO_MODE overrides it). Summary shows short submissions in full and truncates longer ones; Full has larger bounds and writes source code into persistent raw terminal history." },
 		),
 	),
 });
@@ -2628,7 +2628,7 @@ export default function (pi: ExtensionAPI) {
 			"If you need context about prior direct REPL interaction, inspect repl_status details and read the session history file listed there.",
 			"The session history file is raw tmux pane output, so expect prompts and echoed input as well as results.",
 			"This is a shared long-lived session: inspect state before mutating it, and do not assume variables already exist.",
-			"Submitted-code display is off by default; use echoMode='summary' or echoMode='full' only when the user asks to show code and alignment anchors in the raw pane.",
+			"repl_send shows bounded submitted code and alignment anchors in the raw pane by default (Summary). Respect the current /repl echo setting; use echoMode='off' when the user asks for quiet output, and echoMode='full' only when explicitly requested.",
 			"Keep snippets small. If you need a value back reliably, print it explicitly.",
 			"In GHCi, use normal interactive syntax such as let-bindings or :{ ... :} blocks for multiline declarations.",
 			"In Clojure, use normal interactive syntax such as let-bindings, def/defn, or do forms for multiline code.",

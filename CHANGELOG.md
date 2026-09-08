@@ -12,6 +12,7 @@ All notable changes to `pi-repl` are documented here.
 - Bound the complete `repl_send` response, including submitted code, and save truncated responses privately.
 
 ### Changed
+- Default submitted-code pane echo to **Summary** so short agent submissions are readable alongside their output. Keep **Off** for quiet operation, **Full** as an explicit opt-in, and honour environment, command and per-send overrides. The display format and shared-record protocol are unchanged.
 - Refresh development dependencies to Pi 0.85.1 and the current `typebox` API, using a provider-compatible string enum for echo modes. Keep TypeScript on 5.9.
 - Store transient tmux paste-buffer files in the private control directory too. Allow a validated `PI_REPL_CONTROL_ROOT` override for isolation.
 

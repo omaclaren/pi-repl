@@ -23,7 +23,7 @@ With `pi-repl` you can:
 - start, attach to, inspect, and stop a shared Clojure REPL
 - let pi read the raw shared REPL transcript for extra context when needed
 - keep a bounded clean record of compatible-client submissions and captured output, synchronized automatically with a compatible `pi-studio` using the same tmux session
-- optionally show bounded, request-specific submitted code and compact alignment anchors in the raw pane, with Off as the privacy-conscious default
+- show bounded, request-specific submitted code and compact alignment anchors in the raw pane by default, with Summary previews, Off for quiet output, and Full as an explicit opt-in
 - export that clean record as canonical Markdown
 - check which shared REPL sessions are running
 - inspect which Python interpreter and environment the shared Python/IPython REPL is using with `/repl env`
@@ -66,8 +66,8 @@ Restart pi after installing.
 | `/lab ghci` | Same as `/repl ghci` |
 | `/lab clojure` | Same as `/repl clojure` |
 | `/repl echo` | Show the current submitted-code pane-echo mode |
-| `/repl echo off` | Disable submitted-code displays and raw-history anchors for new sends (default) |
-| `/repl echo summary` | Show short submissions in full, truncating after 6 lines or 600 source characters, with compact anchors |
+| `/repl echo off` | Disable submitted-code displays and raw-history anchors for new sends |
+| `/repl echo summary` | Show short submissions in full, truncating after 6 lines or 600 source characters, with compact anchors (default) |
 | `/repl echo full` | Show up to 40 lines or 4,000 source characters and anchors in persistent raw history |
 | `/repl status` | Show running shared REPL sessions |
 | `/repl status python` | Show status for the shared Python/IPython session |
@@ -118,7 +118,7 @@ Notes:
 - in Haskell (GHCi), use normal interactive syntax such as `let` bindings or `:{ ... :}` blocks for multiline declarations
 - in Clojure, use normal interactive syntax such as `let`, `def`/`defn`, or `do` forms for multiline code
 - tool output includes both the submitted code and the captured output; the complete response is limited to 2,000 lines or 50 KiB, with the full response saved to a private file when truncated
-- `repl_send` accepts `echoMode: off|summary|full` for a single send; otherwise it uses `/repl echo`, initialized from `PI_REPL_ECHO_MODE` or Off
+- `repl_send` accepts `echoMode: off|summary|full` for a single send; otherwise it uses `/repl echo`, initialized from `PI_REPL_ECHO_MODE` or Summary
 - Full echo mode writes bounded submitted source code into persistent raw terminal history; Summary shows short submissions in full and truncates after 6 lines or 600 source characters
 
 ## Shared clean record
@@ -133,9 +133,11 @@ Existing sessions attach lazily. Unsupported versions and invalid or stale sessi
 
 ### Submission display and alignment anchors
 
-Optional pane echo places submitted code after a compact begin anchor, followed by a plain `── output ──` divider and a completion anchor. The anchors contain a stable 12-character hash derived from the Shared REPL Record entry ID, allowing known sends to be aligned in future derived transcripts without exposing the entry ID itself. `repl_send` removes the exact header, source preview, divider, and footer from captured output and the clean record, while they remain in raw pane history.
+Pane echo, enabled in Summary mode by default, places submitted code after a compact begin anchor, followed by a plain `── output ──` divider and a completion anchor. The anchors contain a stable 12-character hash derived from the Shared REPL Record entry ID, allowing known sends to be aligned in future derived transcripts without exposing the entry ID itself. `repl_send` removes the exact header, source preview, divider, and footer from captured output and the clean record, while they remain in raw pane history.
 
-Use `/repl echo off|summary|full` to change the default for the current Pi process, or set `PI_REPL_ECHO_MODE` before startup. A per-send `echoMode` overrides that default. **Off** is the startup default and emits no optional display or alignment anchors, although the REPL can still echo its unavoidable temporary-file control command. **Summary** shows short submissions in full, truncates after 6 lines or 600 source characters, and puts a plain output divider before runtime output. **Full** raises those bounds to 40 lines or 4,000 source characters and therefore persists more source code in raw terminal history. Terminal, line-separator, and bidirectional control characters are escaped in all visible previews.
+Use `/repl echo off|summary|full` to change the default for the current Pi process, or set `PI_REPL_ECHO_MODE` before startup. A per-send `echoMode` overrides that default without changing it. **Summary** is the startup default: it shows short submissions in full, truncates after 6 lines or 600 source characters, and puts a plain output divider before runtime output. **Off** disables the optional display and alignment anchors for quiet output, although the REPL can still echo its unavoidable temporary-file control command. **Full** is an explicit opt-in that raises the bounds to 40 lines or 4,000 source characters. Terminal, line-separator, and bidirectional control characters are escaped in all visible previews.
+
+Both Summary and Full persist the displayed source in raw terminal history. Off suppresses this extra copy, not the submitted code already retained in tool results and the clean record. Explicit `PI_REPL_ECHO_MODE=off` settings are still honoured.
 
 Runtime wrappers use compact request-unique paths such as `/tmp/pi-rc-<user-key>/<token>.py` instead of fixed global files such as `/tmp/pr.py`. The per-user root is current-user-owned mode `0700`, source files are mode `0600`, and files are removed after capture or by the timeout/abort watcher once execution settles. The short command remains readable while separate Pi processes, tmux servers, runtimes, and Studio sends cannot overwrite one another's control files.
 

@@ -43,7 +43,7 @@ test("repl_send emits bounded pane echoes with clean-record-derived anchors", ()
 	assert.match(source, /submissionId = `pi-repl:\$\{metadata\.requestId\}`/);
 	assert.match(source, /\/repl echo \[off\|summary\|full\]/);
 	assert.match(source, /PI_REPL_ECHO_MODE/);
-	assert.match(source, /Submitted-code display is off by default/);
+	assert.match(source, /repl_send shows bounded submitted code and alignment anchors in the raw pane by default \(Summary\)/);
 	assert.match(source, /Full mode writes bounded submitted source code into persistent raw terminal history/);
 	assert.match(source, /"capture-pane", "-J", "-p"/);
 	assert.match(source, /captureContext\.prepared\.display/);

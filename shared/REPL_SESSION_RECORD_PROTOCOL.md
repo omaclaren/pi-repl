@@ -69,7 +69,7 @@ Canonical Markdown exports identify origin, mode, status, runtime, and timestamp
 
 Compatible clients may add protocol-independent submission displays to the raw pane while retaining the same clean record. Display version 1 derives a non-secret 12-hex-character anchor as the first 12 characters of SHA-256 over `pi-repl-submission-display-v1`, a NUL byte, and the stable clean-record entry ID. The entry ID itself is not written to the pane.
 
-**Off** is the default and writes no optional display or alignment anchors. Opt-in **Summary** shows a short submission in full, truncating after 6 source lines or 600 source characters. **Full** raises those bounds to 40 lines or 4,000 characters and warns that source becomes part of persistent raw terminal history. Display text normalizes newlines and tabs, removes trailing display whitespace, and escapes terminal, line-separator, and bidirectional control characters.
+Echo defaults are client preferences, not protocol requirements. `pi-repl` defaults to **Summary**, which shows a short submission in full, truncating after 6 source lines or 600 source characters. **Off** writes no optional display or alignment anchors. Explicit opt-in **Full** raises the bounds to 40 lines or 4,000 characters. Both Summary and Full persist their source preview in raw terminal history; Off does not remove code from the clean record. Other clients, including older installations, may default to Off without affecting interoperability. Display text normalizes newlines and tabs, removes trailing display whitespace, and escapes terminal, line-separator, and bidirectional control characters.
 
 ```text
 ── pi-repl · a1b2c3d4e5f6 · 2 lines ──

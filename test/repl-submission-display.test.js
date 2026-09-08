@@ -14,12 +14,22 @@ import {
 	stripReplSubmissionDisplay,
 } from "../shared/repl-submission-display.js";
 
-test("submission displays default to off and normalize explicit modes", () => {
-	assert.equal(DEFAULT_REPL_SUBMISSION_ECHO_MODE, "off");
+test("submission displays default to summary and preserve explicit modes and fallbacks", () => {
+	assert.equal(DEFAULT_REPL_SUBMISSION_ECHO_MODE, "summary");
+	assert.equal(normalizeReplSubmissionEchoMode(), "summary");
+	assert.equal(normalizeReplSubmissionEchoMode(""), "summary");
 	assert.equal(normalizeReplSubmissionEchoMode("FULL"), "full");
 	assert.equal(normalizeReplSubmissionEchoMode("summary"), "summary");
-	assert.equal(normalizeReplSubmissionEchoMode("unexpected"), "off");
-	assert.equal(normalizeReplSubmissionEchoMode("unexpected", "summary"), "summary");
+	assert.equal(normalizeReplSubmissionEchoMode(" off "), "off");
+	assert.equal(normalizeReplSubmissionEchoMode("unexpected"), "summary");
+	assert.equal(normalizeReplSubmissionEchoMode("unexpected", "off"), "off");
+	assert.equal(normalizeReplSubmissionEchoMode(undefined, "full"), "full");
+	assert.equal(normalizeReplSubmissionEchoMode(undefined, "invalid"), "summary");
+	const display = createReplSubmissionDisplay({ entryId: "default", origin: "pi-repl", code: "print(42)" });
+	assert.equal(display.mode, "summary");
+	assert.equal(display.enabled, true);
+	assert.deepEqual(display.previewLines, ["│ print(42)"]);
+	assert.deepEqual(display.prefixLines, [display.beginMarker, ...display.previewLines, display.outputMarker]);
 });
 
 test("summary displays use stable compact anchors, a plain output divider, and full short source", () => {
@@ -142,7 +152,7 @@ test("full displays escape terminal controls and stay bounded", () => {
 });
 
 test("off mode emits no optional display and leaves capture text unchanged", () => {
-	const display = createReplSubmissionDisplay({ entryId: "entry", origin: "pi-repl", code: "1 + 1" });
+	const display = createReplSubmissionDisplay({ entryId: "entry", origin: "pi-repl", code: "1 + 1", mode: "off" });
 	assert.equal(display.mode, "off");
 	assert.equal(display.enabled, false);
 	assert.deepEqual(display.previewLines, []);
