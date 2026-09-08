@@ -20,7 +20,7 @@ test("repl_send holds the shared lease across execution and records its result",
 	assert.match(source, /const sessionTarget = sessionInfo\.tmuxSessionId \|\| sessionName/);
 	assert.match(source, /changed while repl_send was waiting to execute/);
 	assert.match(source, /runReplCode\(pi, params, ctx, signal, \{[\s\S]*?expectedSession: identity,[\s\S]*?onSubmissionStarted:/);
-	assert.match(source, /pasteTextToTmuxPane\(pi, sessionTarget/);
+	assert.match(source, /pasteTextToTmuxPane\(pi, paneTarget/);
 	assert.match(source, /status: "captured"/);
 	assert.match(source, /retainReplSubmissionUntilSettled/);
 	assert.match(source, /!submissionState\.completionObserved/);

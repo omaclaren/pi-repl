@@ -117,7 +117,7 @@ Notes:
 - for plain Python, `print(...)` is the safest way to get values back reliably
 - in Haskell (GHCi), use normal interactive syntax such as `let` bindings or `:{ ... :}` blocks for multiline declarations
 - in Clojure, use normal interactive syntax such as `let`, `def`/`defn`, or `do` forms for multiline code
-- tool output includes both the submitted code and the captured output
+- tool output includes both the submitted code and the captured output; the complete response is limited to 2,000 lines or 50 KiB, with the full response saved to a private file when truncated
 - `repl_send` accepts `echoMode: off|summary|full` for a single send; otherwise it uses `/repl echo`, initialized from `PI_REPL_ECHO_MODE` or Off
 - Full echo mode writes bounded submitted source code into persistent raw terminal history; Summary shows short submissions in full and truncates after 6 lines or 600 source characters
 
@@ -150,6 +150,8 @@ The default shared tmux session names are:
 - `pi-repl-r` for R
 - `pi-repl-ghci` for Haskell (GHCi)
 - `pi-repl-clojure` for Clojure
+
+Nonzero tmux `base-index` and `pane-base-index` settings are supported. `pi-repl` selects the lowest-indexed pane in the lowest-indexed window, then pins that pane's stable ID for each send so switching active windows cannot redirect its output capture.
 
 The Python/IPython session can currently be launched in either:
 
@@ -207,7 +209,34 @@ Example requests once the REPL is running:
 - `tmux` is required.
 - While a shared REPL is running, `pi-repl` keeps both the compatible-client clean record and a raw transcript log of the tmux pane output for that session.
 - The raw transcript is plain text and may include prompts, echoed input, request-specific display anchors, output, direct pane interaction, and errors; it is not parsed into clean entries.
+- Newly started sessions use unique mode-`0600` raw logs in the current-user-owned mode-`0700` directory `<os temporary directory>/pi-repl-history-<uid>/`. Restarting a session or using another tmux server does not truncate a previous log. Symlinked, foreign-owned, or permissive history roots are refused.
+- Existing sessions and legacy `/tmp/pi-repl/*.history.log` files are left untouched. The new storage applies when you next start a REPL session; restarting a REPL discards its in-memory variables, so do this only when finished with that session. Logs are not automatically deleted.
 - `/repl env` is currently implemented for Python/IPython only.
+
+## Development and local checks
+
+Development checks use Pi 0.85.x, its current `typebox` API, and Node.js 22.19 or later. TypeScript stays on 5.9 for this maintenance update.
+
+```bash
+npm ci
+npm run typecheck
+npm test
+```
+
+`npm test` runs unit tests plus local Python/tmux integration tests. Integration tests use dedicated tmux servers with empty configuration, temporary homes and private test files, and stop those servers afterward. They do not attach to or send code to your existing REPLs. Tests requiring tmux or Python skip when those executables are unavailable; no CI service is required.
+
+To exercise all installed runtimes, or just a selected subset:
+
+```bash
+PI_REPL_TEST_RUNTIMES=all npm test
+PI_REPL_TEST_RUNTIMES=julia,r npm run test:integration
+```
+
+The integration tests cover nonzero indexes, pane selection, session restarts, raw-log permissions, clean records and exports, concurrent sends, timeout/abort leases, and runtime wrappers. Optional runtime tests are opt-in and skip missing executables. Julia tests resolve the existing juliaup-selected binary before isolating the test home.
+
+`PI_REPL_CONTROL_ROOT` optionally overrides the private runtime-control directory; it must be current-user-owned mode `0700`. Tests set it to their temporary directory so even stale-file cleanup stays isolated. This does not change the shared-record protocol or Studio's control-file location.
+
+Before testing the checkout interactively, replace the npm package source with the absolute local repo path and restart Pi. Avoid loading both copies.
 
 ## Related extensions
 

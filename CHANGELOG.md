@@ -4,6 +4,20 @@ All notable changes to `pi-repl` are documented here.
 
 ## [Unreleased]
 
+### Fixed
+- Resolve real tmux window/pane indexes instead of assuming `0.0`, and pin the pane ID throughout a send. Default-session lookups no longer match longer session-name prefixes.
+- Allocate private, unique raw history logs for newly started sessions without truncating earlier logs. Legacy logs and running sessions are left untouched.
+- Retain send leases against both the tmux lifetime and opaque record ID, so a fast tmux-server restart cannot keep an old lease alive by reusing an ID and timestamp.
+- Escape Julia `$` interpolation in generated wrapper strings, including optional source previews and control-file paths.
+- Bound the complete `repl_send` response, including submitted code, and save truncated responses privately.
+
+### Changed
+- Refresh development dependencies to Pi 0.85.1 and the current `typebox` API, using a provider-compatible string enum for echo modes. Keep TypeScript on 5.9.
+- Store transient tmux paste-buffer files in the private control directory too. Allow a validated `PI_REPL_CONTROL_ROOT` override for isolation.
+
+### Added
+- Local integration tests using isolated tmux servers, with optional checks for all supported runtimes. Cover indexes, pane capture, private history, records/exports, concurrent sends, runtime errors and timeout/abort cleanup. No CI workflow added.
+
 ## [0.4.1] — 2026-09-03
 
 ### Added

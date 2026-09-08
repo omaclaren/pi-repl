@@ -7,9 +7,10 @@ import {
 	type TruncationResult,
 } from "@earendil-works/pi-coding-agent";
 import type { ExtensionAPI, ExtensionCommandContext, ExtensionContext } from "@earendil-works/pi-coding-agent";
-import { Type } from "@sinclair/typebox";
+import { StringEnum } from "@earendil-works/pi-ai";
+import { Type } from "typebox";
 import { randomUUID } from "node:crypto";
-import { existsSync, mkdirSync, mkdtempSync, unlinkSync, writeFileSync } from "node:fs";
+import { existsSync, mkdtempSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import {
@@ -35,6 +36,8 @@ import {
 	createPrivateReplControlFiles,
 } from "./shared/repl-control-files.js";
 
+import { createPrivateReplHistoryFile } from "./shared/repl-history.js";
+
 const SUPPORTED_RUNTIMES = ["julia", "python", "ipython", "r", "ghci", "clojure", "clj", "bun"] as const;
 const DEFAULT_PYTHON_SESSION = "pi-repl-python";
 const DEFAULT_JULIA_SESSION = "pi-repl-julia";
@@ -48,8 +51,8 @@ const DEFAULT_REPL_SEND_TIMEOUT_MS = 20_000;
 const MAX_REPL_SEND_TIMEOUT_MS = 120_000;
 const REPL_SEND_POLL_MS = 100;
 const REPL_SEND_CAPTURE_LINES = 5_000;
-const REPL_CONTROL_ROOT = process.platform === "win32" ? tmpdir() : "/tmp";
-const REPL_HISTORY_ROOT = join(REPL_CONTROL_ROOT, "pi-repl");
+// Optional private root override, also used by isolated integration tests.
+const REPL_CONTROL_OPTIONS = { root: process.env.PI_REPL_CONTROL_ROOT };
 const REPL_HISTORY_FILTER_SCRIPT = String.raw`
 let line = [];
 let col = 0;
@@ -280,8 +283,8 @@ const REPL_SEND_PARAMS = Type.Object({
 		}),
 	),
 	echoMode: Type.Optional(
-		Type.Union(
-			[Type.Literal("off"), Type.Literal("summary"), Type.Literal("full")],
+		StringEnum(
+			["off", "summary", "full"] as const,
 			{ description: "How much submitted code to echo visibly in the raw REPL pane. Defaults to the current /repl echo setting (off initially). Summary shows short submissions in full and truncates longer ones; Full has larger bounds and writes source code into persistent raw terminal history." },
 		),
 	),
@@ -349,10 +352,6 @@ function getSessionNameForSelector(selector: SessionSelector): string {
 	if (selector === "ghci") return DEFAULT_GHCI_SESSION;
 	if (selector === "clojure") return DEFAULT_CLOJURE_SESSION;
 	return DEFAULT_PYTHON_SESSION;
-}
-
-function getSessionHistoryPath(sessionName: string): string {
-	return join(REPL_HISTORY_ROOT, `${sessionName}.history.log`);
 }
 
 function sanitizeNamePart(value: string): string {
@@ -584,13 +583,31 @@ function clampReplSendTimeout(timeoutMs: number | undefined): number {
 	return Math.max(1_000, Math.min(MAX_REPL_SEND_TIMEOUT_MS, Math.round(timeoutMs)));
 }
 
-function getPaneTarget(sessionName: string): string {
-	return `${sessionName}:0.0`;
+function getSessionTarget(sessionName: string): string {
+	return /^\$\d+$/.test(sessionName) ? sessionName : `=${sessionName}`;
+}
+
+async function getPaneTarget(pi: ExtensionAPI, sessionName: string, cwd: string): Promise<string> {
+	if (/^%\d+$/.test(sessionName)) return sessionName;
+	// Resolve the first window/pane by its actual indexes, not the user's active
+	// pane or an assumed 0.0. Use the stable pane ID for the whole submission.
+	const result = await execTmux(pi, [
+		"list-panes", "-s", "-t", getSessionTarget(sessionName),
+		"-F", "#{window_index}\t#{pane_index}\t#{pane_id}",
+	], cwd, 3_000);
+	const panes = result.stdout.trim().split("\n")
+		.map((line) => line.split("\t"))
+		.filter(([window, pane, id]) => /^\d+$/.test(window) && /^\d+$/.test(pane) && /^%\d+$/.test(id))
+		.sort((a, b) => Number(a[0]) - Number(b[0]) || Number(a[1]) - Number(b[1]));
+	if (result.code !== 0 || !panes.length) {
+		throw new Error(`Could not locate a REPL pane for ${sessionName}: ${result.stderr.trim() || "no panes found"}`);
+	}
+	return panes[0][2];
 }
 
 async function tmuxSessionExists(pi: ExtensionAPI, sessionName: string, cwd: string): Promise<boolean> {
 	try {
-		const result = await execTmux(pi, ["has-session", "-t", sessionName], cwd, 3_000);
+		const result = await execTmux(pi, ["has-session", "-t", getSessionTarget(sessionName)], cwd, 3_000);
 		return result.code === 0;
 	} catch {
 		return false;
@@ -650,17 +667,17 @@ async function ensureTmuxSessionRecord(
 	recordTail?: SharedReplRecordEntry[];
 	warning?: string;
 }> {
-	let recordId = await readTmuxSessionOption(pi, identity.sessionName, REPL_SESSION_RECORD_ID_OPTION, cwd);
-	let version = await readTmuxSessionOption(pi, identity.sessionName, REPL_SESSION_RECORD_VERSION_OPTION, cwd);
+	let recordId = await readTmuxSessionOption(pi, identity.tmuxSessionId, REPL_SESSION_RECORD_ID_OPTION, cwd);
+	let version = await readTmuxSessionOption(pi, identity.tmuxSessionId, REPL_SESSION_RECORD_VERSION_OPTION, cwd);
 	if (recordId && !isValidReplSessionRecordId(recordId)) {
 		return { warning: `Shared REPL record metadata is invalid for ${identity.sessionName}; leaving it untouched.` };
 	}
 	if (!recordId) {
 		const candidate = createReplSessionRecordId();
-		if (!(await setTmuxSessionOptionIfAbsent(pi, identity.sessionName, REPL_SESSION_RECORD_ID_OPTION, candidate, cwd))) {
+		if (!(await setTmuxSessionOptionIfAbsent(pi, identity.tmuxSessionId, REPL_SESSION_RECORD_ID_OPTION, candidate, cwd))) {
 			return { warning: `Could not attach shared record metadata to ${identity.sessionName}.` };
 		}
-		recordId = await readTmuxSessionOption(pi, identity.sessionName, REPL_SESSION_RECORD_ID_OPTION, cwd);
+		recordId = await readTmuxSessionOption(pi, identity.tmuxSessionId, REPL_SESSION_RECORD_ID_OPTION, cwd);
 	}
 	if (!recordId || !isValidReplSessionRecordId(recordId)) {
 		return { warning: `Could not read valid shared record metadata from ${identity.sessionName}.` };
@@ -668,12 +685,12 @@ async function ensureTmuxSessionRecord(
 	if (!version) {
 		await setTmuxSessionOptionIfAbsent(
 			pi,
-			identity.sessionName,
+			identity.tmuxSessionId,
 			REPL_SESSION_RECORD_VERSION_OPTION,
 			String(REPL_SESSION_RECORD_VERSION),
 			cwd,
 		);
-		version = await readTmuxSessionOption(pi, identity.sessionName, REPL_SESSION_RECORD_VERSION_OPTION, cwd);
+		version = await readTmuxSessionOption(pi, identity.tmuxSessionId, REPL_SESSION_RECORD_VERSION_OPTION, cwd);
 	}
 	if (version !== String(REPL_SESSION_RECORD_VERSION)) {
 		return {
@@ -703,12 +720,17 @@ async function enableSessionHistoryLogging(
 	sessionName: string,
 	cwd: string,
 ): Promise<{ historyPath?: string; warning?: string }> {
-	const historyPath = getSessionHistoryPath(sessionName);
-	mkdirSync(REPL_HISTORY_ROOT, { recursive: true });
-	writeFileSync(historyPath, "", "utf-8");
+	let historyPath: string;
+	let paneTarget: string;
+	try {
+		paneTarget = await getPaneTarget(pi, sessionName, cwd);
+		historyPath = createPrivateReplHistoryFile(sessionName);
+	} catch (error) {
+		return { warning: `History logging could not be enabled for ${sessionName}: ${error instanceof Error ? error.message : String(error)}` };
+	}
 
 	const pipeCommand = `${shellQuote(process.execPath)} -e ${shellQuote(REPL_HISTORY_FILTER_SCRIPT)} >> ${shellQuote(historyPath)}`;
-	const result = await execTmux(pi, ["pipe-pane", "-o", "-t", getPaneTarget(sessionName), pipeCommand], cwd, 5_000);
+	const result = await execTmux(pi, ["pipe-pane", "-o", "-t", paneTarget, pipeCommand], cwd, 5_000);
 	if (result.code !== 0) {
 		const reason = result.stderr.trim() || result.stdout.trim() || `exit code ${result.code}`;
 		return {
@@ -728,13 +750,18 @@ async function enableSessionHistoryLogging(
 }
 
 async function disableSessionHistoryLogging(pi: ExtensionAPI, sessionName: string, cwd: string): Promise<void> {
-	await execTmux(pi, ["pipe-pane", "-t", getPaneTarget(sessionName)], cwd, 3_000).catch(() => undefined);
+	try {
+		const target = await getPaneTarget(pi, sessionName, cwd);
+		await execTmux(pi, ["pipe-pane", "-t", target], cwd, 3_000);
+	} catch {
+		// The pane may already have ended.
+	}
 }
 
 async function readSessionInfo(pi: ExtensionAPI, sessionName: string, cwd: string): Promise<SessionInfo | null> {
 	if (!(await tmuxSessionExists(pi, sessionName, cwd))) return null;
 
-	const target = getPaneTarget(sessionName);
+	const target = await getPaneTarget(pi, sessionName, cwd);
 	const summaryResult = await execTmux(
 		pi,
 		["display-message", "-p", "-t", target, "#{session_name}\t#{session_id}\t#{session_created}\t#{pane_current_command}\t#{pane_current_path}"],
@@ -752,8 +779,8 @@ async function readSessionInfo(pi: ExtensionAPI, sessionName: string, cwd: strin
 	const tmuxSessionCreatedAt = Math.max(0, Math.floor(Number(tmuxSessionCreatedRaw) || 0));
 
 	const tailResult = await execTmux(pi, ["capture-pane", "-p", "-t", target, "-S", `-${DEFAULT_CAPTURE_LINES}`], cwd, 3_000);
-	const runtime = await readTmuxSessionOption(pi, sessionName, REPL_RUNTIME_OPTION, cwd);
-	const historyPath = await readTmuxSessionOption(pi, sessionName, REPL_HISTORY_OPTION, cwd);
+	const runtime = await readTmuxSessionOption(pi, tmuxSessionId, REPL_RUNTIME_OPTION, cwd);
+	const historyPath = await readTmuxSessionOption(pi, tmuxSessionId, REPL_HISTORY_OPTION, cwd);
 	const record = await ensureTmuxSessionRecord(pi, {
 		sessionName: resolvedSessionName,
 		tmuxSessionId,
@@ -949,6 +976,7 @@ type ReplControlPaths = {
 };
 
 type ReplSubmissionState = {
+	recordId?: string;
 	sessionName: string;
 	sessionTarget: string;
 	tmuxSessionId: string;
@@ -973,9 +1001,14 @@ function buildPythonDisplayStatements(display: ReplSubmissionDisplay, indent = "
 	return display.prefixLines.map((line) => `${indent}__pi_repl_builtins.print(${JSON.stringify(line)})`);
 }
 
+function juliaStringLiteral(value: string): string {
+	// JSON escaping alone leaves Julia's $ interpolation active in the wrapper.
+	return JSON.stringify(value).replace(/\$/g, "\\$");
+}
+
 function buildJuliaDisplayStatements(display: ReplSubmissionDisplay, indent = ""): string[] {
 	if (!display.enabled) return [];
-	return display.prefixLines.map((line) => `${indent}Base.println(${JSON.stringify(line)})`);
+	return display.prefixLines.map((line) => `${indent}Base.println(${juliaStringLiteral(line)})`);
 }
 
 function buildRDisplayStatements(display: ReplSubmissionDisplay, indent = ""): string[] {
@@ -1028,11 +1061,11 @@ function buildPythonControlSource(runtime: PythonRuntime, code: string, doneFile
 }
 
 function buildJuliaControlSource(code: string, doneFile: string, display: ReplSubmissionDisplay): string {
-	const completion = display.enabled ? [`    Base.println(${JSON.stringify(display.endMarker)})`] : [];
+	const completion = display.enabled ? [`    Base.println(${juliaStringLiteral(display.endMarker)})`] : [];
 	return [
 		...buildJuliaDisplayStatements(display),
 		"try",
-		`    local __pi_result = Base.include_string(Main, ${JSON.stringify(code)}, "pi-repl")`,
+		`    local __pi_result = Base.include_string(Main, ${juliaStringLiteral(code)}, "pi-repl")`,
 		"    if !isnothing(__pi_result)",
 		"        println(repr(__pi_result))",
 		"    end",
@@ -1040,7 +1073,7 @@ function buildJuliaControlSource(code: string, doneFile: string, display: ReplSu
 		"    Base.display_error(stderr, e, catch_backtrace())",
 		"finally",
 		...completion,
-		`    write(${JSON.stringify(doneFile)}, "done\\n")`,
+		`    write(${juliaStringLiteral(doneFile)}, "done\\n")`,
 		"end",
 	].join("\n");
 }
@@ -1115,7 +1148,7 @@ function buildReplControlSource(runtime: ImplementedRuntime, code: string, doneF
 function buildReplSubmissionLine(runtime: ImplementedRuntime, sourceFile: string): string {
 	const quotedPath = JSON.stringify(sourceFile);
 	if (runtime === "julia") {
-		return `include(${quotedPath})`;
+		return `include(${juliaStringLiteral(sourceFile)})`;
 	}
 	if (runtime === "r") {
 		return `source(${quotedPath},local=.GlobalEnv)`;
@@ -1153,6 +1186,7 @@ function prepareReplControlFiles(
 		mode: details.echoMode,
 	});
 	const controlPaths: ReplControlPaths = createPrivateReplControlFiles({
+		...REPL_CONTROL_OPTIONS,
 		extension: getReplControlExtension(runtime),
 		buildSource: ({ doneFile }: ReplControlPaths) => buildReplControlSource(runtime, code, doneFile, display),
 	});
@@ -1177,8 +1211,9 @@ async function pasteTextToTmuxPane(
 	onPasted?: () => void,
 ): Promise<void> {
 	const bufferName = `pi-repl-${randomUUID()}`;
-	const tempFile = join(REPL_CONTROL_ROOT, `${bufferName}.txt`);
-	writeFileSync(tempFile, text, "utf-8");
+	const target = await getPaneTarget(pi, sessionTarget, cwd);
+	const controlPaths = createPrivateReplControlFiles({ ...REPL_CONTROL_OPTIONS, extension: "txt", buildSource: () => text });
+	const tempFile = controlPaths.sourceFile;
 
 	try {
 		const loadResult = await execTmux(pi, ["load-buffer", "-b", bufferName, tempFile], cwd, 5_000);
@@ -1187,32 +1222,29 @@ async function pasteTextToTmuxPane(
 			throw new Error(`Failed to load tmux buffer: ${reason}`);
 		}
 
-		const pasteResult = await execTmux(pi, ["paste-buffer", "-d", "-b", bufferName, "-t", getPaneTarget(sessionTarget)], cwd, 5_000);
+		const pasteResult = await execTmux(pi, ["paste-buffer", "-d", "-b", bufferName, "-t", target], cwd, 5_000);
 		if (pasteResult.code !== 0) {
 			const reason = pasteResult.stderr.trim() || pasteResult.stdout.trim() || `exit code ${pasteResult.code}`;
 			throw new Error(`Failed to paste tmux buffer: ${reason}`);
 		}
 		onPasted?.();
 
-		const enterResult = await execTmux(pi, ["send-keys", "-t", getPaneTarget(sessionTarget), "C-m"], cwd, 5_000);
+		const enterResult = await execTmux(pi, ["send-keys", "-t", target, "C-m"], cwd, 5_000);
 		if (enterResult.code !== 0) {
 			const reason = enterResult.stderr.trim() || enterResult.stdout.trim() || `exit code ${enterResult.code}`;
 			throw new Error(`Failed to send Enter to tmux pane: ${reason}`);
 		}
 	} finally {
-		try {
-			unlinkSync(tempFile);
-		} catch {
-			// ignore cleanup errors
-		}
+		cleanupPrivateReplControlFiles(controlPaths);
 		await execTmux(pi, ["delete-buffer", "-b", bufferName], cwd, 2_000).catch(() => undefined);
 	}
 }
 
 async function capturePaneOutput(pi: ExtensionAPI, sessionTarget: string, cwd: string): Promise<string> {
+	const target = await getPaneTarget(pi, sessionTarget, cwd);
 	const result = await execTmux(
 		pi,
-		["capture-pane", "-J", "-p", "-t", getPaneTarget(sessionTarget), "-S", `-${REPL_SEND_CAPTURE_LINES}`],
+		["capture-pane", "-J", "-p", "-t", target, "-S", `-${REPL_SEND_CAPTURE_LINES}`],
 		cwd,
 		5_000,
 	);
@@ -1308,6 +1340,7 @@ async function waitForReplDoneFile(
 	pi: ExtensionAPI,
 	sessionName: string,
 	sessionTarget: string,
+	paneTarget: string,
 	cwd: string,
 	doneFile: string,
 	timeoutMs: number,
@@ -1328,7 +1361,7 @@ async function waitForReplDoneFile(
 
 		if (existsSync(doneFile)) return;
 
-		latestCapture = await capturePaneOutput(pi, sessionTarget, cwd);
+		latestCapture = await capturePaneOutput(pi, paneTarget, cwd);
 		await sleep(REPL_SEND_POLL_MS);
 	}
 
@@ -1369,6 +1402,7 @@ async function runReplCode(
 	signal?: AbortSignal,
 	options: {
 		expectedSession?: ReplSessionIdentity;
+		expectedRecordId?: string;
 		onSubmissionStarted?: (state: ReplSubmissionState) => void;
 		submissionId?: string;
 	} = {},
@@ -1440,6 +1474,7 @@ async function runReplCode(
 			sessionInfo.sessionName !== options.expectedSession.sessionName
 			|| sessionInfo.tmuxSessionId !== options.expectedSession.tmuxSessionId
 			|| sessionInfo.tmuxSessionCreatedAt !== options.expectedSession.tmuxSessionCreatedAt
+			|| (options.expectedRecordId && sessionInfo.recordId !== options.expectedRecordId)
 		)
 	) {
 		throw new Error(`REPL session ${sessionName} changed while repl_send was waiting to execute.`);
@@ -1457,13 +1492,15 @@ async function runReplCode(
 						: normalizePythonRuntime(sessionInfo);
 	const timeoutMs = clampReplSendTimeout(params.timeoutMs);
 	const sessionTarget = sessionInfo.tmuxSessionId || sessionName;
-	const beforeCapture = await capturePaneOutput(pi, sessionTarget, ctx.cwd);
+	const paneTarget = await getPaneTarget(pi, sessionTarget, ctx.cwd);
+	const beforeCapture = await capturePaneOutput(pi, paneTarget, ctx.cwd);
 	const echoMode = resolveReplSubmissionEchoMode(params.echoMode);
 	const prepared = prepareReplControlFiles(runtime, code, {
 		submissionId: options.submissionId || `pi-repl:local:${randomUUID()}`,
 		echoMode,
 	});
 	const submissionState: ReplSubmissionState = {
+		recordId: sessionInfo.recordId,
 		sessionName,
 		sessionTarget,
 		tmuxSessionId: sessionInfo.tmuxSessionId,
@@ -1477,7 +1514,7 @@ async function runReplCode(
 
 	let submissionStarted = false;
 	try {
-		await pasteTextToTmuxPane(pi, sessionTarget, ctx.cwd, prepared.submissionText, () => {
+		await pasteTextToTmuxPane(pi, paneTarget, ctx.cwd, prepared.submissionText, () => {
 			submissionStarted = true;
 			options.onSubmissionStarted?.(submissionState);
 		});
@@ -1485,6 +1522,7 @@ async function runReplCode(
 			pi,
 			sessionName,
 			sessionTarget,
+			paneTarget,
 			ctx.cwd,
 			prepared.controlPaths.doneFile,
 			timeoutMs,
@@ -1492,7 +1530,7 @@ async function runReplCode(
 			{ beforeCapture, prepared },
 		);
 		submissionState.completionObserved = true;
-		const afterCapture = await capturePaneOutput(pi, sessionTarget, ctx.cwd);
+		const afterCapture = await capturePaneOutput(pi, paneTarget, ctx.cwd);
 		const delta = extractPaneDelta(beforeCapture, afterCapture);
 		const output = cleanupReplDelta(delta, prepared.submissionLine, prepared.previewComment, prepared.completionLine, prepared.display);
 		cleanupPrivateReplControlFiles(prepared.controlPaths);
@@ -1547,6 +1585,7 @@ function retainReplSubmissionUntilSettled(
 						current
 						&& current.tmuxSessionId === state.tmuxSessionId
 						&& current.tmuxSessionCreatedAt === state.tmuxSessionCreatedAt
+						&& (!state.recordId || current.recordId === state.recordId)
 					) {
 						missingChecks = 0;
 					} else {
@@ -1631,6 +1670,7 @@ async function runRecordedReplCode(
 		try {
 			const execution = await runReplCode(pi, params, ctx, signal, {
 				expectedSession: identity,
+				expectedRecordId: sessionInfo.recordId,
 				submissionId,
 				onSubmissionStarted: (state) => {
 					submissionStateRef.current = state;
@@ -1689,45 +1729,31 @@ async function runRecordedReplCode(
 	}
 }
 
-function formatReplSendResult(output: string, details: ReplSendDetails): { text: string; details: ReplSendDetails } {
-	const submittedCode = details.submittedCode.trimEnd();
-	const outputText = output.trim() ? output : "(no output)";
-	const truncation = truncateHead(outputText, {
-		maxLines: DEFAULT_MAX_LINES,
-		maxBytes: DEFAULT_MAX_BYTES,
-	});
-
-	let resultDetails: ReplSendDetails = details;
-	let renderedOutput = truncation.content;
-
-	if (truncation.truncated) {
-		const tempDir = mkdtempSync(join(tmpdir(), "pi-repl-output-"));
-		const tempFile = join(tempDir, "output.txt");
-		writeFileSync(tempFile, outputText, "utf-8");
-
-		resultDetails = {
-			...details,
-			truncation,
-			fullOutputPath: tempFile,
-		};
-
-		renderedOutput += `\n\n[Output truncated: showing ${truncation.outputLines} of ${truncation.totalLines} lines`;
-		renderedOutput += ` (${formatSize(truncation.outputBytes)} of ${formatSize(truncation.totalBytes)}).`;
-		renderedOutput += ` Full output saved to: ${tempFile}]`;
-	}
-
-	const text = [
+export function formatReplSendResult(output: string, details: ReplSendDetails): { text: string; details: ReplSendDetails } {
+	const fullText = [
 		"Submitted code:",
-		submittedCode,
+		details.submittedCode.trimEnd(),
 		"",
 		"Output:",
-		renderedOutput,
+		output.trim() ? output : "(no output)",
 		...(details.recordWarning ? ["", `Shared record warning: ${details.recordWarning}`] : []),
 	].join("\n");
+	const initial = truncateHead(fullText, { maxLines: DEFAULT_MAX_LINES, maxBytes: DEFAULT_MAX_BYTES });
+	if (!initial.truncated) return { text: fullText, details };
 
+	// Bound the entire response, including submitted source, not just output.
+	// Reserve room for the truncation notice and keep the complete response private.
+	const tempDir = mkdtempSync(join(tmpdir(), "pi-repl-output-"));
+	const tempFile = join(tempDir, "submission.txt");
+	writeFileSync(tempFile, fullText, { encoding: "utf8", mode: 0o600, flag: "wx" });
+	const notice = `\n\n[REPL response truncated. Full submitted code and output saved to: ${tempFile}]`;
+	const truncation = truncateHead(fullText, {
+		maxLines: DEFAULT_MAX_LINES - 3,
+		maxBytes: DEFAULT_MAX_BYTES - Buffer.byteLength(notice, "utf8"),
+	});
 	return {
-		text,
-		details: resultDetails,
+		text: truncation.content + notice,
+		details: { ...details, truncation, fullOutputPath: tempFile },
 	};
 }
 
@@ -2246,7 +2272,7 @@ async function stopReplSession(
 	}
 
 	await disableSessionHistoryLogging(pi, sessionName, ctx.cwd);
-	const result = await execTmux(pi, ["kill-session", "-t", sessionName], ctx.cwd, 5_000);
+	const result = await execTmux(pi, ["kill-session", "-t", getSessionTarget(sessionName)], ctx.cwd, 5_000);
 	if (result.code !== 0) {
 		const reason = result.stderr.trim() || result.stdout.trim() || `exit code ${result.code}`;
 		notify(ctx, `Failed to stop ${sessionName}: ${reason}`, "error");
@@ -2522,7 +2548,7 @@ export default function (pi: ExtensionAPI) {
 		description: "Inspect shared REPL session state for Python/IPython, Julia, R, Haskell (GHCi), and Clojure.",
 		promptSnippet: "Check whether the shared Python/IPython, Julia, R, Haskell (GHCi), and Clojure REPL sessions are running.",
 		promptGuidelines: [
-			"Use this tool before claiming whether a shared REPL is running, especially after a previous failure or status change.",
+			"Use repl_status before claiming whether a shared REPL is running, especially after a previous failure or status change.",
 			"If the user asks specifically about Julia, use target='julia'. If they ask specifically about R, use target='r'. If they ask specifically about GHCi or Haskell, use target='ghci'. If they ask specifically about Clojure, use target='clojure'. If they ask specifically about Python or IPython, use target='python'.",
 			"If you need context about prior direct REPL interaction, inspect repl_status details and read the session history file listed there.",
 		],
@@ -2593,10 +2619,10 @@ export default function (pi: ExtensionAPI) {
 	pi.registerTool({
 		name: "repl_send",
 		label: "REPL Send",
-		description: `Execute code in the shared default Python/IPython, Julia, R, Haskell (GHCi), or Clojure tmux REPL sessions (${DEFAULT_PYTHON_SESSION}, ${DEFAULT_JULIA_SESSION}, ${DEFAULT_R_SESSION}, ${DEFAULT_GHCI_SESSION}, ${DEFAULT_CLOJURE_SESSION}). Output is truncated to ${DEFAULT_MAX_LINES} lines or ${formatSize(DEFAULT_MAX_BYTES)} (whichever is hit first).`,
+		description: `Execute code in the shared default Python/IPython, Julia, R, Haskell (GHCi), or Clojure tmux REPL sessions (${DEFAULT_PYTHON_SESSION}, ${DEFAULT_JULIA_SESSION}, ${DEFAULT_R_SESSION}, ${DEFAULT_GHCI_SESSION}, ${DEFAULT_CLOJURE_SESSION}). The complete response (submitted code and output) is truncated to ${DEFAULT_MAX_LINES} lines or ${formatSize(DEFAULT_MAX_BYTES)} (whichever is hit first); the full response is saved privately when truncated.`,
 		promptSnippet: "Execute a small snippet in the shared Python/IPython, Julia, R, Haskell (GHCi), or Clojure REPL and return its output.",
 		promptGuidelines: [
-			"Use this tool only after a /repl python, /repl ipython, /repl julia, /repl R, /repl ghci, or /repl clojure session has been started.",
+			"Use repl_send only after a /repl python, /repl ipython, /repl julia, /repl R, /repl ghci, or /repl clojure session has been started.",
 			"If the user asks to run code in Julia or in the shared Julia REPL, use target='julia'. If they ask to run code in R or in the shared R REPL, use target='r'. If they ask to run code in GHCi, Haskell, or the shared Haskell REPL, use target='ghci'. If they ask to run code in Clojure or in the shared Clojure REPL, use target='clojure'. Otherwise use the shared Python/IPython session.",
 			"Use repl_status before claiming whether the shared REPL is active if there has been a prior failure or a possible state change.",
 			"If you need context about prior direct REPL interaction, inspect repl_status details and read the session history file listed there.",
