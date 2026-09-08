@@ -4,6 +4,8 @@ All notable changes to `pi-repl` are documented here.
 
 ## [Unreleased]
 
+## [0.4.2] — 2026-09-09
+
 ### Fixed
 - Resolve real tmux window/pane indexes instead of assuming `0.0`, and pin the pane ID throughout a send. Default-session lookups no longer match longer session-name prefixes.
 - Allocate private, unique raw history logs for newly started sessions without truncating earlier logs. Legacy logs and running sessions are left untouched.
