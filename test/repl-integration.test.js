@@ -150,7 +150,7 @@ test("Summary is the default pane display; command and per-send overrides still 
 	assert.doesNotMatch(result.content[0].text, /──|│/);
 	const historyPath = (await f.status()).details.python.historyPath;
 	await eventually(() => readFileSync(historyPath, "utf8").includes(`── done · ${result.details.submissionAnchorId} ──`));
-	assert.match(readFileSync(historyPath, "utf8"), /│ for i in range\(1, 6\):\n│     print\(i\)\n── output ──/);
+	assert.match(readFileSync(historyPath, "utf8"), /│ for i in range\(1, 6\):\n│     print\(i\)\n\n── output ──\n1\n2\n3\n4\n5/);
 
 	const quiet = await f.send("print('quiet')", { echoMode: "off" });
 	assert.equal(quiet.details.echoMode, "off");
@@ -314,8 +314,17 @@ for (const [runtime, code, errorCode] of runtimeCases) {
 		if (!f) return;
 		for (const echoMode of ["off", "summary", "full"]) {
 			const result = await f.send(code, { echoMode });
-			assert.match(result.content[0].text.split("Output:\n")[1], /42/, await f.tmux("capture-pane", "-p", "-J", "-t", `${f.sessionName}:^`, "-S", "-80"));
+			const pane = await f.tmux("capture-pane", "-p", "-J", "-t", `${f.sessionName}:^`, "-S", "-80");
+			assert.match(result.content[0].text.split("Output:\n")[1], /42/, pane);
 			assert.doesNotMatch(result.content[0].text, /──|│/);
+			if (echoMode !== "off") {
+				const begin = `── pi-repl · ${result.details.submissionAnchorId} ·`;
+				assert.ok(pane.includes(begin), pane);
+				const latest = pane.slice(pane.lastIndexOf(begin));
+				assert.match(latest, /│[^\n]*\n\n── output ──\n/, latest);
+			} else {
+				assert.doesNotMatch(pane, /── pi-repl|── output ──|── done/);
+			}
 		}
 		if (runtime === "julia") {
 			const literal = await f.send('println(raw"literal $value and λ")', { echoMode: "full" });
@@ -377,6 +386,38 @@ for (const runtime of ["ruby", "java"]) {
 		});
 	}
 }
+
+test("ghci completes malformed source, including unterminated multiline blocks, and releases the lease", {
+	timeout: 60000, skip: !(optionalRuntimes.has("all") || optionalRuntimes.has("ghci")),
+}, async (t) => {
+	const f = await fixture(t, { runtime: "ghci", index: 1 });
+	if (!f) return;
+	const recordId = (await f.status()).details.ghci.recordId;
+	await f.send("let pi_ghci_value = 41");
+	const malformed = [
+		["let broken =", /parse error/],
+		["print (", /parse error/],
+		[":{\nlet unfinished = 1", /unterminated multiline command/],
+		["{- unfinished comment", /unterminated/],
+	];
+	for (const echoMode of ["off", "summary", "full"]) {
+		for (const [code, expected] of malformed) {
+			// An outer :script driver would skip completion on the unclosed :{
+			// case. Completion must survive without changing the user's code.
+			const result = await f.send(code, { echoMode, timeoutMs: 3000 });
+			assert.match(result.content[0].text.split("Output:\n")[1], expected);
+			assert.doesNotMatch(result.content[0].text, /──|│/);
+			assert.equal(readdirSync(process.env.PI_REPL_CONTROL_ROOT).length, 0);
+			const lease = await acquireReplSessionSendLease(recordId, { waitMs: 0 });
+			await lease.release();
+		}
+		const recovered = await f.send(":{\nlet pi_ghci_twice x =\n      2 * x\n:}\nprint (pi_ghci_twice (pi_ghci_value - 20))", { echoMode });
+		assert.equal(recovered.content[0].text.split("Output:\n")[1], "42");
+	}
+	const status = (await f.status()).details.ghci;
+	assert.equal(status.running, true);
+	assert.ok(status.recordEntries.every((entry) => entry.status === "captured"));
+});
 
 test("ruby preserves interpolation, literal hashes, Unicode, escapes and error recovery", {
 	timeout: 60000, skip: !(optionalRuntimes.has("all") || optionalRuntimes.has("ruby")),

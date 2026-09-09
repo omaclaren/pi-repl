@@ -161,13 +161,15 @@ Existing sessions attach lazily. Unsupported versions and invalid or stale sessi
 
 ### Submission display and alignment anchors
 
-Pane echo, enabled in Summary mode by default, places submitted code after a compact begin anchor, followed by a plain `── output ──` divider and a completion anchor. The anchors contain a stable 12-character hash derived from the Shared REPL Record entry ID, allowing known sends to be aligned in future derived transcripts without exposing the entry ID itself. `repl_send` removes the exact header, source preview, divider, and footer from captured output and the clean record, while they remain in raw pane history.
+Pane echo, enabled in Summary mode by default, places submitted code after a compact begin anchor, followed by one blank line, a plain `── output ──` divider and a completion anchor. Output starts directly below its divider; the extra spacing is display-only and does not change submitted code or captured output. The anchors contain a stable 12-character hash derived from the Shared REPL Record entry ID, allowing known sends to be aligned in future derived transcripts without exposing the entry ID itself. `repl_send` removes the exact header, source preview, divider, and footer from captured output and the clean record, while they remain in raw pane history.
 
 Use `/repl echo off|summary|full` to change the default for the current Pi process, or set `PI_REPL_ECHO_MODE` before startup. A per-send `echoMode` overrides that default without changing it. **Summary** is the startup default: it shows short submissions in full, truncates after 6 lines or 600 source characters, and puts a plain output divider before runtime output. **Off** disables the optional display and alignment anchors for quiet output, although the REPL can still echo its unavoidable temporary-file control command. **Full** is an explicit opt-in that raises the bounds to 40 lines or 4,000 source characters. Terminal, line-separator, and bidirectional control characters are escaped in all visible previews.
 
 Both Summary and Full persist the displayed source in raw terminal history. Off suppresses this extra copy, not the submitted code already retained in tool results and the clean record. Explicit `PI_REPL_ECHO_MODE=off` settings are still honoured.
 
 Runtime wrappers use compact request-unique paths such as `/tmp/pi-rc-<user-key>/<token>.py` instead of fixed global files such as `/tmp/pr.py`. The per-user root is current-user-owned mode `0700`, source files are mode `0600`, and files are removed after capture or by the timeout/abort watcher once execution settles. The short command remains readable while separate Pi processes, tmux servers, runtimes, and Studio sends cannot overwrite one another's control files.
+
+GHCi retains a separate `:! … touch …` completion command. Unlike JShell, a nested GHCi `:script` with an unfinished `:{ … :}` block can abort an outer driver too, skipping its completion step. Keeping completion at the interactive top level lets malformed submissions report their error and release the send lease.
 
 These anchors are presentation and alignment evidence only. They do not make direct attached-pane input authoritative and never promote inferred raw history into protocol-v1 entries.
 

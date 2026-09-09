@@ -1281,6 +1281,9 @@ function buildJavaDriverSource(sourceFile: string, doneFile: string, display: Re
 
 function buildReplCompletionLine(runtime: ImplementedRuntime, doneFile: string, display: ReplSubmissionDisplay): string | undefined {
 	if (runtime === "ghci") {
+		// Keep this at the interactive top level: unlike JShell, an unfinished
+		// :{ block in a nested :script can abort the outer script too, skipping
+		// its completion command and leaving a live session's send lease held.
 		const displayCommand = display.enabled ? `command printf '%s\\n' ${shellQuote(display.endMarker)}; ` : "";
 		return `:! ${displayCommand}touch ${shellQuote(doneFile)}`;
 	}

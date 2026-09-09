@@ -29,7 +29,7 @@ test("submission displays default to summary and preserve explicit modes and fal
 	assert.equal(display.mode, "summary");
 	assert.equal(display.enabled, true);
 	assert.deepEqual(display.previewLines, ["│ print(42)"]);
-	assert.deepEqual(display.prefixLines, [display.beginMarker, ...display.previewLines, display.outputMarker]);
+	assert.deepEqual(display.prefixLines, [display.beginMarker, ...display.previewLines, "", display.outputMarker]);
 });
 
 test("summary displays use stable compact anchors, a plain output divider, and full short source", () => {
@@ -60,7 +60,20 @@ test("summary displays use stable compact anchors, a plain output divider, and f
 	assert.equal(first.endMarker, `── done · ${first.anchorId} ──`);
 	assert.deepEqual(first.previewLines, ["│ x = 1", "│ print(x)"]);
 	assert.equal(first.outputMarker, "── output ──");
-	assert.deepEqual(first.prefixLines, [first.beginMarker, ...first.previewLines, first.outputMarker]);
+	assert.deepEqual(first.prefixLines, [first.beginMarker, ...first.previewLines, "", first.outputMarker]);
+});
+
+test("visible displays separate preview and output with exactly one presentation-only blank line", () => {
+	for (const mode of ["summary", "full"]) {
+		for (const code of ["", "print(42)", "first\n\nlast\n", "long\n".repeat(50)]) {
+			const display = createReplSubmissionDisplay({ entryId: "spacing", code, mode });
+			assert.deepEqual(display.prefixLines, [display.beginMarker, ...display.previewLines, "", display.outputMarker]);
+			assert.match(display.prefixLines.join("\n"), /│[^\n]*\n\n── output ──$/);
+			const output = "\n42\n\n";
+			const capture = display.prefixLines.join("\n") + "\n" + output + display.endMarker;
+			assert.equal(stripReplSubmissionDisplay(capture, display), output);
+		}
+	}
 });
 
 test("display markers have a strict machine-readable form", () => {
@@ -197,6 +210,8 @@ test("incomplete prefixes are removed without swallowing following error text", 
 		"display encoding failed",
 	].join("\n");
 	assert.equal(stripReplSubmissionDisplay(capture, display), "loader\ndisplay encoding failed");
+	const afterGap = ["loader", display.beginMarker, ...display.previewLines, "", "display encoding failed"].join("\n");
+	assert.equal(stripReplSubmissionDisplay(afterGap, display), "loader\ndisplay encoding failed");
 });
 
 test("malformed marker prefixes neither hang cleanup nor hide later exact markers", () => {

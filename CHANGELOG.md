@@ -16,6 +16,8 @@ All notable changes to `pi-repl` are documented here.
 - Restore isolated test launchers after login-shell profile initialization so their runtime flags and temporary-home settings are applied on macOS too.
 
 ### Changed
+- Add one display-only blank line between the source preview and output divider in Summary and Full modes across all runtimes. Keep Off and clean captured output unchanged.
+- Retain GHCi's separate completion command: an unfinished `:{ … :}` block in a nested script can skip an outer driver's completion. Add malformed-input/recovery coverage so this cannot regress into a held send lease.
 - Show only one Java `/open` command in the raw pane by loading source and signalling completion through a single outer driver. Keep the user source in its own file so compilation errors and incomplete input cannot absorb the completion step.
 
 ## [0.4.2] — 2026-09-09

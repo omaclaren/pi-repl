@@ -121,7 +121,7 @@ export function createReplSubmissionDisplay(details = {}) {
 		outputMarker,
 		endMarker,
 		previewLines,
-		prefixLines: enabled ? [beginMarker, ...previewLines, outputMarker] : [],
+		prefixLines: enabled ? [beginMarker, ...previewLines, "", outputMarker] : [],
 	};
 }
 
