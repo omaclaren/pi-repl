@@ -1,12 +1,13 @@
 import { after, test } from "node:test";
 import assert from "node:assert/strict";
 import { execFile, spawnSync } from "node:child_process";
-import { mkdirSync, mkdtempSync, readFileSync, readdirSync, rmSync, statSync, writeFileSync } from "node:fs";
+import { mkdirSync, mkdtempSync, readFileSync, readdirSync, realpathSync, rmSync, statSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { dirname, join } from "node:path";
 import { promisify } from "node:util";
 import { randomUUID } from "node:crypto";
 import { acquireReplSessionSendLease, readReplSessionRecord, upsertReplSessionRecordEntry } from "../shared/repl-session-record.js";
+import { createTestTmux, readProcessTable } from "./helpers/repl-test-tmux.js";
 
 const exec = promisify(execFile);
 const originalEnv = { TMPDIR: process.env.TMPDIR, PI_REPL_CONTROL_ROOT: process.env.PI_REPL_CONTROL_ROOT, SHELL: process.env.SHELL, PI_REPL_ECHO_MODE: process.env.PI_REPL_ECHO_MODE };
@@ -40,7 +41,7 @@ async function eventually(check, timeout = 15000) {
 	throw new Error("Timed out waiting for isolated REPL test condition");
 }
 
-async function fixture(t, { index = 0, runtime = "python", controlName } = {}) {
+async function fixture(t, { index = 0, runtime = "python", controlName, startWithTool = false, concurrentStart = false } = {}) {
 	if (!available) { t.skip("tmux is required for local integration tests"); return null; }
 	const command = runtime === "r" ? "R" : runtime === "python" ? "python3" : runtime === "ruby" ? "irb" : runtime === "java" ? "jshell" : runtime;
 	let executable = binary(command);
@@ -66,9 +67,7 @@ async function fixture(t, { index = 0, runtime = "python", controlName } = {}) {
 		ruby: "-f --noreadline", java: `-J-Duser.home=${quote(home)} -J-Djava.util.prefs.userRoot=${quote(join(home, "java-prefs"))}`,
 	}[runtime];
 	const launcher = runtime === "r" ? "R" : runtime === "ruby" ? "irb" : runtime === "java" ? "jshell" : runtime;
-	writeFileSync(join(bin, launcher), `#!/bin/sh\nexec ${quote(executable)} ${flags} "$@"\n`, { mode: 0o700 });
 	// A distinct socket/server and empty config: never target the user's tmux.
-	const socket = `pi-repl-test-${process.pid}-${randomUUID()}`;
 	const config = join(cwd, "tmux.conf");
 	writeFileSync(config, `set -g base-index ${index}\nset -g pane-base-index ${index}\nset -g history-limit 10000\nset -g default-shell /bin/sh\n`);
 	const env = { ...process.env, HOME: home, SHELL: "/bin/sh", PATH: `${bin}:${process.env.PATH}`, IPYTHONDIR: join(home, ".ipython") };
@@ -82,21 +81,23 @@ async function fixture(t, { index = 0, runtime = "python", controlName } = {}) {
 	delete env.JAVA_TOOL_OPTIONS;
 	delete env.JDK_JAVA_OPTIONS;
 	delete env._JAVA_OPTIONS;
-	const tmuxArgs = ["-L", socket, "-f", config];
+	const tmuxHarness = createTestTmux(t, { cwd, env, config });
+	writeFileSync(join(bin, launcher), `#!/bin/sh\n${tmuxHarness.launcherPrologue}exec ${quote(executable)} ${flags} "$@"\n`, { mode: 0o700 });
 	const calls = [];
 	const tools = new Map();
 	const commands = new Map();
 	const notifications = [];
 	let afterEnter;
+	let beforeStop;
 	const pi = {
 		registerTool: (tool) => tools.set(tool.name, tool),
 		registerCommand: (name, definition) => commands.set(name, definition),
 		async exec(command, args, options) {
 			calls.push({ command, args: [...args] });
 			try {
-				const result = await exec(command, command === "tmux" ? [...tmuxArgs, ...args] : args, {
-					cwd: options.cwd, env, timeout: options.timeout, maxBuffer: 8 * 1024 * 1024,
-				});
+				if (command === "tmux" && args[0] === "if-shell" && beforeStop) await beforeStop();
+				const execOptions = { cwd: options.cwd, env, timeout: options.timeout, maxBuffer: 8 * 1024 * 1024 };
+				const result = command === "tmux" ? await tmuxHarness.run(args, execOptions) : await exec(command, args, execOptions);
 				if (command === "tmux" && args[0] === "send-keys" && afterEnter) await afterEnter();
 				return { ...result, code: 0, killed: false };
 			} catch (error) {
@@ -110,19 +111,31 @@ async function fixture(t, { index = 0, runtime = "python", controlName } = {}) {
 	const { default: register } = await import(`../index.ts?fixture=${randomUUID()}`);
 	register(pi);
 	async function tmux(...args) {
-		return (await exec("tmux", [...tmuxArgs, ...args], { env, cwd, timeout: 10000 })).stdout.trim();
+		return (await tmuxHarness.run(args)).stdout.trim();
 	}
-	t.after(async () => {
-		await tmux("kill-server").catch(() => undefined);
-		const result = spawnSync("tmux", ["-L", socket, "list-sessions"]);
-		assert.notEqual(result.status, 0, "isolated test server must be stopped");
-	});
 	const sessionName = `pi-repl-${runtime === "ipython" ? "python" : runtime}`;
 	const target = runtime === "ipython" ? "python" : runtime;
 	const repl = (args) => commands.get("repl").handler(args, ctx);
 	const send = (code, options = {}, signal) => tools.get("repl_send").execute(randomUUID(), { code, target, ...options }, signal, undefined, ctx);
 	const status = (options = {}) => tools.get("repl_status").execute(randomUUID(), { target, ...options }, undefined, undefined, ctx);
-	await repl(runtime);
+	const start = (options = {}, signal) => tools.get("repl_start").execute(randomUUID(), { runtime, ...options }, signal, undefined, { cwd });
+	if (concurrentStart) {
+		const results = await Promise.all([start(), start()]);
+		assert.equal(results.filter((result) => result.details.created).length, 1);
+		assert.equal(results.filter((result) => result.details.reused).length, 1);
+		assert.equal(results[0].details.session.recordId, results[1].details.session.recordId);
+		assert.equal(results[0].details.session.historyPath, results[1].details.session.historyPath);
+		assert.ok(results.every((result) => result.details.ready));
+	} else if (startWithTool) {
+		const result = await start();
+		assert.equal(result.details.created, true);
+		assert.equal(result.details.ready, true, result.content[0].text);
+		assert.equal(result.details.session.recordEntryCount, 0, "readiness must not execute a probe");
+		assert.equal(realpathSync(result.details.session.currentPath), realpathSync(cwd));
+		assert.equal(result.details.attachCommand, `tmux attach -t ${sessionName}`);
+	} else {
+		await repl(runtime);
+	}
 	assert.equal(notifications.some((n) => n.level === "error" || n.level === "warning"), false, JSON.stringify(notifications));
 	const prompt = { python: />>>/, ipython: /In \[\d+\]:/, julia: /julia>/, r: /(^|\n)>/, ghci: /ghci>/, clojure: /user=>/, ruby: /irb\(.*\).*?>/, java: /jshell>/ }[runtime];
 	let startupOutput = "";
@@ -134,8 +147,111 @@ async function fixture(t, { index = 0, runtime = "python", controlName } = {}) {
 	} catch (error) {
 		throw new Error(`${runtime} startup failed: ${startupOutput}`, { cause: error });
 	}
-	return { cwd, calls, notifications, tmux, sessionName, target, repl, send, status, onEnter: (callback) => { afterEnter = callback; } };
+	return { cwd, calls, notifications, tmux, sessionName, target, repl, send, status, start, onEnter: (callback) => { afterEnter = callback; }, onBeforeStop: (callback) => { beforeStop = callback; } };
 }
+
+async function assertVerifiedStop(f) {
+	const status = (await f.status()).details[f.target];
+	const roots = new Set((await f.tmux("list-panes", "-s", "-t", `=${f.sessionName}`, "-F", "#{pane_pid}")).split("\n").map(Number));
+	const before = await readProcessTable();
+	let changed;
+	do {
+		changed = false;
+		for (const p of before) if (roots.has(p.ppid) && !roots.has(p.pid)) { roots.add(p.pid); changed = true; }
+	} while (changed);
+	const tracked = before.filter((p) => roots.has(p.pid));
+	const history = readFileSync(status.historyPath, "utf8");
+	const callCount = f.calls.length;
+	await f.repl(`stop ${f.target}`);
+	assert.ok(f.calls.slice(callCount).every((call) => !["send-keys", "paste-buffer", "load-buffer", "pipe-pane", "kill-server"].includes(call.args[0])), "stop must not inject runtime input, disable history early, or stop the server");
+	assert.equal(f.notifications.at(-1).level, "info", JSON.stringify(f.notifications.at(-1)));
+	assert.match(f.notifications.at(-1).message, /Verified owned runtime processes exited/);
+	assert.equal((await f.status()).details[f.target].running, false);
+	// Inspect before the independent test teardown runs: it must not mask a
+	// production stop that only closes tmux and leaks its runtime children.
+	const after = await readProcessTable();
+	for (const old of tracked) assert.ok(!after.some((p) => p.pid === old.pid && p.startedAt === old.startedAt && !p.state.startsWith("Z")), `surviving production-stop PID ${old.pid}`);
+	assert.ok(readFileSync(status.historyPath, "utf8").startsWith(history));
+	assert.equal(readReplSessionRecord(status.recordId).entries.length, status.recordEntryCount);
+}
+
+test("production stop reaps resistant runtime children in all selected panes and preserves another session", { timeout: 30000 }, async (t) => {
+	const f = await fixture(t, { index: 1 });
+	if (!f) return;
+	const source = join(f.cwd, "stubborn-stop.mjs");
+	writeFileSync(source, `
+import { spawn } from 'node:child_process';
+import { writeFileSync } from 'node:fs';
+process.on('SIGHUP', () => {}); process.on('SIGTERM', () => {});
+setInterval(() => {}, 1000);
+if (process.argv[2] !== 'child') spawn(process.execPath, [process.argv[1], 'child'], { stdio: 'inherit' });
+writeFileSync(${JSON.stringify(f.cwd)} + '/' + (process.argv[2] || 'parent') + '.ready', String(process.pid));
+`);
+	await f.tmux("new-window", "-t", `${f.sessionName}:7`, `exec ${quote(process.execPath)} ${quote(source)}`);
+	await eventually(() => readdirSync(f.cwd).includes("child.ready"));
+	const other = `${f.sessionName}-other`;
+	await f.tmux("new-session", "-d", "-s", other, "sleep 60");
+	const identity = await f.tmux("display-message", "-p", "-t", `${other}:^`, "#{session_id}|#{pane_id}|#{pane_pid}");
+	await assertVerifiedStop(f);
+	assert.match(f.notifications.at(-1).message, /Cleaned up/);
+	assert.equal(await f.tmux("display-message", "-p", "-t", `${other}:^`, "#{session_id}|#{pane_id}|#{pane_pid}"), identity);
+});
+
+for (const race of [false, true]) {
+	test(`production stop refuses windows linked to another session${race ? " during final stop check" : ""}`, { timeout: 30000 }, async (t) => {
+		const f = await fixture(t);
+		if (!f) return;
+		const other = `${f.sessionName}-other`;
+		await f.tmux("new-session", "-d", "-s", other, "sleep 60");
+		const link = () => f.tmux("link-window", "-s", `${f.sessionName}:^`, "-t", `${other}:8`);
+		if (race) f.onBeforeStop(async () => { f.onBeforeStop(undefined); await link(); });
+		else await link();
+		const original = await f.tmux("display-message", "-p", "-t", `${f.sessionName}:^`, "#{session_id}|#{pane_pid}");
+		await f.repl("stop python");
+		assert.equal(f.notifications.at(-1).level, "error");
+		assert.match(f.notifications.at(-1).message, race ? /tmux refused/ : /linked to another session/);
+		assert.equal(await f.tmux("display-message", "-p", "-t", `${f.sessionName}:^`, "#{session_id}|#{pane_pid}"), original);
+		assert.equal(await f.tmux("has-session", "-t", `=${other}`), "");
+		// Unlink the intentionally shared window before using repl_send: its
+		// separate record protocol does not support ambiguous linked panes.
+		await f.tmux("unlink-window", "-t", `${other}:8`);
+		assert.match((await f.send("print('still here')")).content[0].text, /Output:\nstill here/);
+	});
+}
+
+test("production stop does not kill a same-name replacement created after preflight", { timeout: 30000 }, async (t) => {
+	const f = await fixture(t);
+	if (!f) return;
+	let replacement;
+	f.onBeforeStop(async () => {
+		f.onBeforeStop(undefined);
+		await f.tmux("kill-session", "-t", `=${f.sessionName}`);
+		replacement = await f.start();
+		await f.send("pi_replacement_value = 42");
+	});
+	await f.repl("stop python");
+	assert.equal(f.notifications.at(-1).level, "error");
+	assert.equal((await f.status()).details.python.recordId, replacement.details.session.recordId);
+	assert.match((await f.send("print(pi_replacement_value)")).content[0].text, /Output:\n42/);
+});
+
+test("ghci production stop verifies a busy runtime exits and releases retained controls and lease", {
+	timeout: 30000, skip: !(optionalRuntimes.has("all") || optionalRuntimes.has("ghci")),
+}, async (t) => {
+	const f = await fixture(t, { runtime: "ghci" });
+	if (!f) return;
+	const recordId = (await f.status()).details.ghci.recordId;
+	const abort = new AbortController();
+	f.onEnter(() => abort.abort());
+	await assert.rejects(f.send('Control.Concurrent.threadDelay 30000000 >> print 42', {}, abort.signal), /aborted/);
+	f.onEnter(undefined);
+	await assertVerifiedStop(f);
+	await eventually(async () => {
+		try { const lease = await acquireReplSessionSendLease(recordId, { waitMs: 0 }); await lease.release(); return true; }
+		catch (error) { if (/busy/.test(error.message)) return false; throw error; }
+	});
+	assert.equal(readdirSync(process.env.PI_REPL_CONTROL_ROOT).length, 0);
+});
 
 test("Summary is the default pane display; command and per-send overrides still work", { timeout: 30000 }, async (t) => {
 	const f = await fixture(t);
@@ -170,7 +286,7 @@ test("Summary is the default pane display; command and per-send overrides still 
 
 for (const index of [0, 1]) {
 	test(`Python lifecycle, private history, clean records and export with tmux indexes ${index}`, { timeout: 45000 }, async (t) => {
-		const f = await fixture(t, { index });
+		const f = await fixture(t, { index, startWithTool: index === 1 });
 		if (!f) return;
 		assert.equal(await f.tmux("display-message", "-p", "-t", `${f.sessionName}:^`, "#{window_index}.#{pane_index}"), `${index}.${index}`);
 		let status = (await f.status()).details.python;
@@ -223,6 +339,47 @@ for (const index of [0, 1]) {
 	});
 }
 
+test("concurrent repl_start calls create one session and preserve state when another interpreter is requested", { timeout: 30000 }, async (t) => {
+	const f = await fixture(t, { index: 1, concurrentStart: true });
+	if (!f) return;
+	await f.send("pi_start_value = 41\nprint(pi_start_value)");
+	await f.tmux("send-keys", "-t", `${f.sessionName}:^`, "-l", "pi_direct_start_value = pi_start_value + 1");
+	await f.tmux("send-keys", "-t", `${f.sessionName}:^`, "Enter");
+	await eventually(async () => (await f.tmux("capture-pane", "-p", "-t", `${f.sessionName}:^`)).endsWith(">>>"));
+	const before = (await f.status()).details.python;
+	await eventually(() => readFileSync(before.historyPath, "utf8").includes("pi_direct_start_value ="));
+	const history = readFileSync(before.historyPath, "utf8");
+	const calls = f.calls.length;
+	const result = await f.start({ runtime: "ipython" });
+	assert.equal(result.details.runtime, "python");
+	assert.equal(result.details.ready, true);
+	assert.equal(result.details.session.recordId, before.recordId);
+	assert.equal(result.details.session.historyPath, before.historyPath);
+	assert.equal(result.details.session.recordEntryCount, before.recordEntryCount);
+	assert.equal(readFileSync(before.historyPath, "utf8"), history);
+	assert.ok(f.calls.slice(calls).every((call) => !["new-session", "pipe-pane", "set-option", "send-keys", "load-buffer"].includes(call.args[0])));
+	assert.match((await f.send("print(pi_direct_start_value)")).content[0].text, /Output:\n42/);
+});
+
+test("repl_start leaves unfinished direct input alone and can confirm readiness once the human finishes", { timeout: 30000 }, async (t) => {
+	const f = await fixture(t, { startWithTool: true });
+	if (!f) return;
+	await f.tmux("send-keys", "-t", `${f.sessionName}:^`, "-l", "for pi_start_i in [42]:");
+	await f.tmux("send-keys", "-t", `${f.sessionName}:^`, "Enter");
+	await eventually(async () => (await f.tmux("capture-pane", "-p", "-t", `${f.sessionName}:^`)).endsWith("..."));
+	const before = await f.tmux("capture-pane", "-p", "-t", `${f.sessionName}:^`);
+	const calls = f.calls.length;
+	const result = await f.start({ timeoutMs: 1000 });
+	assert.equal(result.details.ready, false);
+	assert.equal(result.details.reused, true);
+	assert.equal(await f.tmux("capture-pane", "-p", "-t", `${f.sessionName}:^`), before);
+	assert.ok(f.calls.slice(calls).every((call) => !["new-session", "pipe-pane", "set-option", "send-keys", "load-buffer", "kill-session"].includes(call.args[0])));
+	await f.tmux("send-keys", "-t", `${f.sessionName}:^`, "-l", "    print(pi_start_i)");
+	await f.tmux("send-keys", "-t", `${f.sessionName}:^`, "Enter", "Enter");
+	assert.equal((await f.start()).details.ready, true);
+	assert.match((await f.send("print(pi_start_i)")).content[0].text, /Output:\n42/);
+});
+
 test("a send pins its pane ID even if a lower-numbered window appears during execution", { timeout: 30000 }, async (t) => {
 	const f = await fixture(t, { index: 1 });
 	if (!f) return;
@@ -258,6 +415,11 @@ test("default-session lookup and stop never match a longer session-name prefix",
 	assert.equal((await f.status()).details.python.running, false);
 	await f.repl("stop python");
 	assert.equal(await f.tmux("has-session", "-t", other), "");
+	const otherIdentity = await f.tmux("display-message", "-p", "-t", `${other}:^`, "#{session_id}");
+	const started = await f.start();
+	assert.equal(started.details.created, true);
+	assert.equal(started.details.ready, true);
+	assert.equal(await f.tmux("display-message", "-p", "-t", `${other}:^`, "#{session_id}"), otherIdentity);
 });
 
 for (const mode of ["timeout", "abort", "session-ended"]) {
@@ -310,7 +472,7 @@ for (const [runtime, code, errorCode] of runtimeCases) {
 		timeout: 60000,
 		skip: !(optionalRuntimes.has("all") || optionalRuntimes.has(runtime)) && "set PI_REPL_TEST_RUNTIMES=all to include installed optional runtimes",
 	}, async (t) => {
-		const f = await fixture(t, { index: 1, runtime });
+		const f = await fixture(t, { index: 1, runtime, startWithTool: true });
 		if (!f) return;
 		for (const echoMode of ["off", "summary", "full"]) {
 			// Exercise both wrapped and unwrapped R loader echoes.
@@ -333,6 +495,16 @@ for (const [runtime, code, errorCode] of runtimeCases) {
 				assert.doesNotMatch(pane, /── pi-repl|── output ──|── done/);
 			}
 		}
+		const beforeReuse = (await f.status()).details[f.target];
+		const callCount = f.calls.length;
+		const reused = await f.start();
+		assert.equal(reused.details.created, false);
+		assert.equal(reused.details.reused, true);
+		assert.equal(reused.details.ready, true, reused.content[0].text);
+		assert.equal(reused.details.session.recordId, beforeReuse.recordId);
+		assert.equal(reused.details.session.historyPath, beforeReuse.historyPath);
+		assert.equal(reused.details.session.recordEntryCount, beforeReuse.recordEntryCount);
+		assert.ok(f.calls.slice(callCount).every((call) => !["new-session", "pipe-pane", "set-option", "send-keys", "load-buffer"].includes(call.args[0])));
 		if (runtime === "julia") {
 			const literal = await f.send('println(raw"literal $value and λ")', { echoMode: "full" });
 			assert.match(literal.content[0].text.split("Output:\n")[1], /literal \$value and λ/);
@@ -342,6 +514,7 @@ for (const [runtime, code, errorCode] of runtimeCases) {
 		assert.match(result.content[0].text.split("Output:\n")[1], /runtime-test-error/);
 		assert.doesNotMatch(result.content[0].text, /──|│/);
 		assert.equal(readdirSync(process.env.PI_REPL_CONTROL_ROOT).length, 0);
+		await assertVerifiedStop(f);
 	});
 }
 

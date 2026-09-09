@@ -37,6 +37,7 @@ import {
 } from "./shared/repl-control-files.js";
 
 import { createPrivateReplHistoryFile } from "./shared/repl-history.js";
+import { stopVerifiedReplSession } from "./shared/repl-session-stop.js";
 
 const SUPPORTED_RUNTIMES = ["julia", "python", "ipython", "r", "ghci", "clojure", "clj", "ruby", "java", "bun"] as const;
 const DEFAULT_PYTHON_SESSION = "pi-repl-python";
@@ -47,7 +48,8 @@ const DEFAULT_CLOJURE_SESSION = "pi-repl-clojure";
 const DEFAULT_RUBY_SESSION = "pi-repl-ruby";
 const DEFAULT_JAVA_SESSION = "pi-repl-java";
 const DEFAULT_CAPTURE_LINES = 20;
-const DEFAULT_STARTUP_WAIT_MS = 5_000;
+const DEFAULT_STARTUP_WAIT_MS = 20_000;
+const MAX_STARTUP_WAIT_MS = 120_000;
 const DEFAULT_STARTUP_POLL_MS = 250;
 const DEFAULT_REPL_SEND_TIMEOUT_MS = 20_000;
 const MAX_REPL_SEND_TIMEOUT_MS = 120_000;
@@ -251,6 +253,7 @@ type SessionInfo = {
 	currentCommand: string;
 	currentPath: string;
 	tail: string;
+	promptLine?: string;
 };
 
 type ReplSendDetails = {
@@ -297,6 +300,18 @@ let replSubmissionEchoMode = normalizeReplSubmissionEchoMode(process.env.PI_REPL
 function resolveReplSubmissionEchoMode(value?: string): ReplSubmissionEchoMode {
 	return normalizeReplSubmissionEchoMode(value, replSubmissionEchoMode) as ReplSubmissionEchoMode;
 }
+
+const REPL_START_RUNTIMES = ["python", "ipython", "julia", "r", "ghci", "clojure", "ruby", "java"] as const;
+const REPL_START_PARAMS = Type.Object({
+	runtime: StringEnum(REPL_START_RUNTIMES, {
+		description: "Runtime to start explicitly. Python and IPython share one session; an existing session is reused without switching its interpreter.",
+	}),
+	timeoutMs: Type.Optional(Type.Number({
+		description: "How long to wait for a normal prompt in milliseconds (default 20000). Timeout leaves the session running and reports ready=false.",
+		minimum: 1000,
+		maximum: MAX_STARTUP_WAIT_MS,
+	})),
+});
 
 const REPL_STATUS_PARAMS = Type.Object({
 	target: Type.Optional(
@@ -409,6 +424,7 @@ function formatUsage(): string {
 		"  - /repl ruby manages the shared tmux session pi-repl-ruby",
 		"  - /repl java manages the shared tmux session pi-repl-java",
 		"  - /repl status, /repl attach, /repl export, and /repl stop can target Python/IPython, Julia, R, GHCi, Clojure, Ruby, or Java",
+		"  - repl_start lets pi start or reuse a session with an explicit runtime; repl_send never auto-starts one",
 		"  - /repl echo controls the bounded submitted-code display in the raw pane; PI_REPL_ECHO_MODE sets the startup default",
 		"  - /repl export writes the selected session's canonical clean record as Markdown",
 		"  - /repl env inspects the shared Python/IPython session",
@@ -734,11 +750,12 @@ async function enableSessionHistoryLogging(
 	pi: ExtensionAPI,
 	sessionName: string,
 	cwd: string,
+	sessionTarget = sessionName,
 ): Promise<{ historyPath?: string; warning?: string }> {
 	let historyPath: string;
 	let paneTarget: string;
 	try {
-		paneTarget = await getPaneTarget(pi, sessionName, cwd);
+		paneTarget = await getPaneTarget(pi, sessionTarget, cwd);
 		historyPath = createPrivateReplHistoryFile(sessionName);
 	} catch (error) {
 		return { warning: `History logging could not be enabled for ${sessionName}: ${error instanceof Error ? error.message : String(error)}` };
@@ -753,7 +770,7 @@ async function enableSessionHistoryLogging(
 		};
 	}
 
-	const stored = await setTmuxSessionOption(pi, sessionName, REPL_HISTORY_OPTION, historyPath, cwd);
+	const stored = await setTmuxSessionOption(pi, sessionTarget, REPL_HISTORY_OPTION, historyPath, cwd);
 	if (!stored) {
 		return {
 			historyPath,
@@ -764,16 +781,7 @@ async function enableSessionHistoryLogging(
 	return { historyPath };
 }
 
-async function disableSessionHistoryLogging(pi: ExtensionAPI, sessionName: string, cwd: string): Promise<void> {
-	try {
-		const target = await getPaneTarget(pi, sessionName, cwd);
-		await execTmux(pi, ["pipe-pane", "-t", target], cwd, 3_000);
-	} catch {
-		// The pane may already have ended.
-	}
-}
-
-async function readSessionInfo(pi: ExtensionAPI, sessionName: string, cwd: string): Promise<SessionInfo | null> {
+async function readSessionInfo(pi: ExtensionAPI, sessionName: string, cwd: string, inspectPrompt = false): Promise<SessionInfo | null> {
 	if (!(await tmuxSessionExists(pi, sessionName, cwd))) return null;
 
 	const target = await getPaneTarget(pi, sessionName, cwd);
@@ -794,6 +802,17 @@ async function readSessionInfo(pi: ExtensionAPI, sessionName: string, cwd: strin
 	const tmuxSessionCreatedAt = Math.max(0, Math.floor(Number(tmuxSessionCreatedRaw) || 0));
 
 	const tailResult = await execTmux(pi, ["capture-pane", "-p", "-t", target, "-S", `-${DEFAULT_CAPTURE_LINES}`], cwd, 3_000);
+	let promptLine: string | undefined;
+	if (inspectPrompt) {
+		// Inspect the physical cursor row, not the last nonblank history line:
+		// an old prompt/banner above a blank current row is not readiness.
+		const cursor = await execTmux(pi, ["display-message", "-p", "-t", target, "#{cursor_y}"], cwd, 3_000);
+		const row = cursor.stdout.trim();
+		if (cursor.code === 0 && /^\d+$/.test(row)) {
+			const prompt = await execTmux(pi, ["capture-pane", "-p", "-t", target, "-S", row, "-E", row], cwd, 3_000);
+			if (prompt.code === 0) promptLine = prompt.stdout.trimEnd();
+		}
+	}
 	const runtime = await readTmuxSessionOption(pi, tmuxSessionId, REPL_RUNTIME_OPTION, cwd);
 	const historyPath = await readTmuxSessionOption(pi, tmuxSessionId, REPL_HISTORY_OPTION, cwd);
 	const record = await ensureTmuxSessionRecord(pi, {
@@ -817,6 +836,7 @@ async function readSessionInfo(pi: ExtensionAPI, sessionName: string, cwd: strin
 		currentCommand: currentCommand || "unknown",
 		currentPath: currentPath || cwd,
 		tail: tailResult.stdout.trim(),
+		...(inspectPrompt ? { promptLine } : {}),
 	};
 }
 
@@ -886,148 +906,59 @@ function sleep(ms: number): Promise<void> {
 	return new Promise((resolve) => setTimeout(resolve, ms));
 }
 
-async function waitForPythonSessionInfo(
+function hasNormalReplPrompt(info: SessionInfo, requested: ImplementedRuntime): boolean {
+	// Observe only: never send a probe, Enter or Ctrl-C into shared user state.
+	// A running process or startup banner alone does not establish readiness.
+	const runtime = info.runtime || requested;
+	const prompts: Record<ImplementedRuntime, RegExp> = {
+		python: /(?:^|\n)>>>[ \t]*$/,
+		ipython: /(?:^|\n)In \[\d+\]:[ \t]*$/,
+		julia: /(?:^|\n)julia>[ \t]*$/,
+		r: /(?:^|\n)>[ \t]*$/,
+		ghci: /(?:^|\n)(?:\*?[A-Za-z0-9_.:]+)(?: \*?[A-Za-z0-9_.:]+)*>[ \t]*$/,
+		clojure: /(?:^|\n)[^\s>]+=>[ \t]*$/,
+		ruby: /(?:^|\n)irb\([^\n]*\):\d+(?::0)?>[ \t]*$/,
+		java: /(?:^|\n)jshell>[ \t]*$/,
+	};
+	if (!REPL_START_RUNTIMES.includes(runtime as ImplementedRuntime)) return false;
+	if (toSessionSelector(runtime as ImplementedRuntime) !== toSessionSelector(requested)) return false;
+	const line = info.promptLine ?? "";
+	// Shell aliases and legacy metadata can label either Python frontend as
+	// the other. They intentionally share one session and execution protocol.
+	if (runtime === "python" || runtime === "ipython") return prompts.python.test(line) || prompts.ipython.test(line);
+	return prompts[runtime as ImplementedRuntime].test(line);
+}
+
+function checkStartAborted(signal: AbortSignal | undefined, sessionName: string): void {
+	if (signal?.aborted) {
+		throw new Error(`REPL start aborted for ${sessionName}. Any session already created is left running; inspect it with repl_status.`);
+	}
+}
+
+async function waitForReplSessionInfo(
 	pi: ExtensionAPI,
 	cwd: string,
-	shellPath: string,
-	runtime: PythonRuntime,
-): Promise<SessionInfo | null> {
-	const deadline = Date.now() + DEFAULT_STARTUP_WAIT_MS;
-	const shellName = shellPath.split("/").pop() ?? shellPath;
-	let latestInfo: SessionInfo | null = null;
-
-	while (Date.now() < deadline) {
-		latestInfo = await readSessionInfo(pi, DEFAULT_PYTHON_SESSION, cwd);
-		if (!latestInfo) return null;
-		if (latestInfo.currentCommand !== shellName) return latestInfo;
-		if (latestInfo.tail.includes(">>>")) return latestInfo;
-		if (runtime === "ipython" && (latestInfo.tail.includes("IPython") || latestInfo.tail.includes("In ["))) {
-			return latestInfo;
+	sessionTarget: string,
+	sessionName: string,
+	runtime: ImplementedRuntime,
+	timeoutMs: number,
+	signal?: AbortSignal,
+): Promise<{ info: SessionInfo; ready: boolean }> {
+	const deadline = Date.now() + timeoutMs;
+	let identity: SessionInfo | undefined;
+	while (true) {
+		checkStartAborted(signal, sessionName);
+		const info = await readSessionInfo(pi, identity?.tmuxSessionId || sessionTarget, cwd, true);
+		checkStartAborted(signal, sessionName);
+		if (!info) throw new Error(`REPL session ended while waiting for ${sessionName}. Check the runtime and your login-shell configuration before retrying.`);
+		if (identity && (info.tmuxSessionId !== identity.tmuxSessionId || info.tmuxSessionCreatedAt !== identity.tmuxSessionCreatedAt || info.recordId !== identity.recordId)) {
+			throw new Error(`REPL session ${sessionName} changed while waiting for its prompt. No replacement was started; inspect it with repl_status.`);
 		}
-		await sleep(DEFAULT_STARTUP_POLL_MS);
+		identity = info;
+		if (hasNormalReplPrompt(info, runtime)) return { info, ready: true };
+		if (Date.now() >= deadline) return { info, ready: false };
+		await sleep(Math.min(DEFAULT_STARTUP_POLL_MS, deadline - Date.now()));
 	}
-
-	return latestInfo;
-}
-
-async function waitForJuliaSessionInfo(
-	pi: ExtensionAPI,
-	cwd: string,
-	shellPath: string,
-): Promise<SessionInfo | null> {
-	const deadline = Date.now() + DEFAULT_STARTUP_WAIT_MS;
-	const shellName = shellPath.split("/").pop() ?? shellPath;
-	let latestInfo: SessionInfo | null = null;
-
-	while (Date.now() < deadline) {
-		latestInfo = await readSessionInfo(pi, DEFAULT_JULIA_SESSION, cwd);
-		if (!latestInfo) return null;
-		if (latestInfo.currentCommand !== shellName) return latestInfo;
-		if (latestInfo.tail.includes("julia>")) return latestInfo;
-		await sleep(DEFAULT_STARTUP_POLL_MS);
-	}
-
-	return latestInfo;
-}
-
-async function waitForRSessionInfo(
-	pi: ExtensionAPI,
-	cwd: string,
-	shellPath: string,
-): Promise<SessionInfo | null> {
-	const deadline = Date.now() + DEFAULT_STARTUP_WAIT_MS;
-	const shellName = shellPath.split("/").pop() ?? shellPath;
-	let latestInfo: SessionInfo | null = null;
-
-	while (Date.now() < deadline) {
-		latestInfo = await readSessionInfo(pi, DEFAULT_R_SESSION, cwd);
-		if (!latestInfo) return null;
-		if (latestInfo.currentCommand !== shellName) return latestInfo;
-		if (/(^|\n)>\s*$/.test(latestInfo.tail)) return latestInfo;
-		await sleep(DEFAULT_STARTUP_POLL_MS);
-	}
-
-	return latestInfo;
-}
-
-async function waitForGhciSessionInfo(
-	pi: ExtensionAPI,
-	cwd: string,
-	shellPath: string,
-): Promise<SessionInfo | null> {
-	const deadline = Date.now() + DEFAULT_STARTUP_WAIT_MS;
-	const shellName = shellPath.split("/").pop() ?? shellPath;
-	let latestInfo: SessionInfo | null = null;
-
-	while (Date.now() < deadline) {
-		latestInfo = await readSessionInfo(pi, DEFAULT_GHCI_SESSION, cwd);
-		if (!latestInfo) return null;
-		if (latestInfo.currentCommand !== shellName) return latestInfo;
-		if (/(^|\n)(ghci>|Prelude>|\*?[A-Za-z0-9_.:]+>)\s*$/.test(latestInfo.tail)) return latestInfo;
-		await sleep(DEFAULT_STARTUP_POLL_MS);
-	}
-
-	return latestInfo;
-}
-
-async function waitForClojureSessionInfo(
-	pi: ExtensionAPI,
-	cwd: string,
-	shellPath: string,
-): Promise<SessionInfo | null> {
-	const deadline = Date.now() + DEFAULT_STARTUP_WAIT_MS;
-	const shellName = shellPath.split("/").pop() ?? shellPath;
-	let latestInfo: SessionInfo | null = null;
-
-	while (Date.now() < deadline) {
-		latestInfo = await readSessionInfo(pi, DEFAULT_CLOJURE_SESSION, cwd);
-		if (!latestInfo) return null;
-		if (latestInfo.currentCommand !== shellName) return latestInfo;
-		if (/(^|\n)[^\s>]+=>\s*$/.test(latestInfo.tail)) return latestInfo;
-		await sleep(DEFAULT_STARTUP_POLL_MS);
-	}
-
-	return latestInfo;
-}
-
-async function waitForRubySessionInfo(
-	pi: ExtensionAPI,
-	cwd: string,
-	shellPath: string,
-): Promise<SessionInfo | null> {
-	const deadline = Date.now() + DEFAULT_STARTUP_WAIT_MS;
-	const shellName = shellPath.split("/").pop() ?? shellPath;
-	let latestInfo: SessionInfo | null = null;
-
-	while (Date.now() < deadline) {
-		latestInfo = await readSessionInfo(pi, DEFAULT_RUBY_SESSION, cwd);
-		if (!latestInfo) return null;
-		if (latestInfo.currentCommand !== shellName) return latestInfo;
-		if (/irb\(.*\)[:\d]+[>*]\s*$/.test(latestInfo.tail)) return latestInfo;
-		await sleep(DEFAULT_STARTUP_POLL_MS);
-	}
-
-	return latestInfo;
-}
-
-async function waitForJavaSessionInfo(
-	pi: ExtensionAPI,
-	cwd: string,
-	shellPath: string,
-): Promise<SessionInfo | null> {
-	const deadline = Date.now() + DEFAULT_STARTUP_WAIT_MS;
-	const shellName = shellPath.split("/").pop() ?? shellPath;
-	let latestInfo: SessionInfo | null = null;
-
-	while (Date.now() < deadline) {
-		latestInfo = await readSessionInfo(pi, DEFAULT_JAVA_SESSION, cwd);
-		if (!latestInfo) return null;
-		if (latestInfo.currentCommand !== shellName) return latestInfo;
-		if (/jshell>\s*$/.test(latestInfo.tail)) return latestInfo;
-		await sleep(DEFAULT_STARTUP_POLL_MS);
-	}
-
-	return latestInfo;
 }
 
 type ReplControlPaths = {
@@ -2110,68 +2041,93 @@ async function showDefaultPythonEnv(pi: ExtensionAPI, ctx: ExtensionCommandConte
 	}
 }
 
-async function startDefaultPythonSession(
+async function startDefaultReplSession(
 	pi: ExtensionAPI,
-	ctx: ExtensionCommandContext,
-	runtime: PythonRuntime,
-): Promise<void> {
-	const exists = await tmuxSessionExists(pi, DEFAULT_PYTHON_SESSION, ctx.cwd);
-	if (exists) {
-		const info = await readSessionInfo(pi, DEFAULT_PYTHON_SESSION, ctx.cwd);
-		const requestedLabel = runtime === "ipython" ? "IPython" : "Python";
-		notify(
-			ctx,
-			info
-				? `Default Python/IPython REPL session is already running (requested: ${requestedLabel}).\n\n${formatSessionInfo(info)}`
-				: [
-					"Default Python/IPython REPL session is already running.",
-					"",
-					"To use the REPL directly, open a new terminal window and run:",
-					formatAttachCommand(DEFAULT_PYTHON_SESSION),
-				].join("\n"),
-			"info",
-		);
-		return;
+	cwd: string,
+	requested: ManagedRuntime,
+	timeoutMs = DEFAULT_STARTUP_WAIT_MS,
+	signal?: AbortSignal,
+) {
+	const runtime: ImplementedRuntime = requested === "clj" ? "clojure" : requested;
+	const target = toSessionSelector(runtime);
+	const sessionName = getSessionNameForSelector(target);
+	checkStartAborted(signal, sessionName);
+	if (!(await commandExists(pi, "tmux", cwd))) {
+		throw new Error("tmux was not found on PATH. pi-repl requires tmux.");
 	}
-
+	checkStartAborted(signal, sessionName);
+	const exists = await tmuxSessionExists(pi, sessionName, cwd);
+	checkStartAborted(signal, sessionName);
 	const shellLaunch = buildDefaultShellRuntimeCommand(runtime);
-	const createResult = await execTmux(
-		pi,
-		["new-session", "-d", "-s", DEFAULT_PYTHON_SESSION, "-c", ctx.cwd, shellLaunch.command],
-		ctx.cwd,
-		10_000,
-	);
-	if (createResult.code !== 0) {
-		const reason = createResult.stderr.trim() || createResult.stdout.trim() || `exit code ${createResult.code}`;
-		notify(ctx, `Failed to create tmux session ${DEFAULT_PYTHON_SESSION}: ${reason}`, "error");
-		return;
+	let created = false;
+	let sessionTarget = sessionName;
+	const warnings: string[] = [];
+	if (!exists) {
+		// tmux atomically creates the name. Do not use -A, respawn or kill: a
+		// concurrent winner must be reused without rewriting its metadata/log.
+		const result = await execTmux(pi, [
+			"new-session", "-d", "-P", "-F", "#{session_id}", "-s", sessionName, "-c", cwd, shellLaunch.command,
+		], cwd, 10_000);
+		if (result.code !== 0) {
+			if (!(await tmuxSessionExists(pi, sessionName, cwd))) {
+				const reason = result.stderr.trim() || result.stdout.trim() || `exit code ${result.code}`;
+				throw new Error(`Failed to create tmux session ${sessionName}: ${reason}`);
+			}
+		} else {
+			created = true;
+			sessionTarget = result.stdout.trim();
+			if (!/^\$\d+$/.test(sessionTarget)) throw new Error(`Could not identify newly created session ${sessionName}; inspect it with repl_status. It has not been stopped.`);
+			// Finish initial metadata even if the caller cancels during creation.
+			// Pin the returned ID so an external same-name replacement is untouched.
+			if (!(await setTmuxSessionOption(pi, sessionTarget, REPL_RUNTIME_OPTION, runtime, cwd))) {
+				warnings.push(`Could not record the runtime for ${sessionName}.`);
+			}
+			const history = await enableSessionHistoryLogging(pi, sessionName, cwd, sessionTarget);
+			if (history.warning) warnings.push(history.warning);
+		}
 	}
+	const { info, ready } = await waitForReplSessionInfo(pi, cwd, sessionTarget, sessionName, runtime, timeoutMs, signal);
+	if (!ready) warnings.push(`No normal prompt was confirmed within ${timeoutMs}ms. The session is left running; it may be busy, awaiting input, or using a custom prompt. Inspect it before sending code.`);
+	if (info.runtime && info.runtime !== runtime) warnings.push(`Requested ${runtime}, but the existing session reports ${info.runtime}. Its interpreter and state were preserved.`);
+	const text = [
+		created
+			? `Started default ${getSessionDisplayName(target)} REPL session: ${sessionName}`
+			: `Default ${getSessionDisplayName(target)} REPL session is already running; reused without restarting (requested: ${runtime}).`,
+		...(created ? [
+			`Launch method: ${shellLaunch.shell} -i -l -c '${buildRuntimeLaunchCommand(runtime)}' inside tmux.`,
+			...(target === "python" ? ["This respects your normal shell-level Python setup (aliases, pyenv/virtualenv/conda activation, shell init, etc.)."] : []),
+			...(target === "clojure" ? ["`clojure` is used without rlwrap; `/repl clj` remains an alias."] : []),
+		] : []),
+		ready ? "Readiness: normal prompt observed (snapshot only, not a reservation)." : "Readiness: unconfirmed.",
+		...warnings.map((warning) => `Warning: ${warning}`),
+		"",
+		formatSessionInfo(info),
+	].join("\n");
+	return {
+		text,
+		details: {
+			requestedRuntime: runtime,
+			runtime: info.runtime,
+			target,
+			sessionName: info.sessionName,
+			created,
+			reused: !created,
+			ready,
+			timeoutMs,
+			attachCommand: formatAttachCommand(info.sessionName),
+			warnings,
+			session: buildReplStatusDetails([{ selector: target, info }])[target],
+		},
+	};
+}
 
-	const history = await enableSessionHistoryLogging(pi, DEFAULT_PYTHON_SESSION, ctx.cwd);
-	await setTmuxSessionOption(pi, DEFAULT_PYTHON_SESSION, REPL_RUNTIME_OPTION, runtime, ctx.cwd);
-	const info = await waitForPythonSessionInfo(pi, ctx.cwd, shellLaunch.shell, runtime);
-	const replLabel = runtime === "ipython" ? "IPython" : "Python";
-
-	if (history.warning) {
-		notify(ctx, history.warning, "warning");
+async function startReplCommand(pi: ExtensionAPI, ctx: ExtensionCommandContext, runtime: ManagedRuntime): Promise<void> {
+	try {
+		const result = await startDefaultReplSession(pi, ctx.cwd, runtime);
+		notify(ctx, result.text, result.details.warnings.length ? "warning" : "info");
+	} catch (error) {
+		notify(ctx, error instanceof Error ? error.message : String(error), "error");
 	}
-
-	notify(
-		ctx,
-		[
-			`Started default ${replLabel} REPL session: ${DEFAULT_PYTHON_SESSION}`,
-			`Launch method: ${shellLaunch.shell} -i -l -c '${runtime}' inside tmux.`,
-			"This is intended to respect your normal shell-level Python setup (aliases, pyenv/virtualenv/conda activation, shell init, etc.).",
-			info
-				? `\n${formatSessionInfo(info)}`
-				: [
-					"",
-					"To use the REPL directly, open a new terminal window and run:",
-					formatAttachCommand(DEFAULT_PYTHON_SESSION),
-				].join("\n"),
-		].join("\n"),
-		"info",
-	);
 }
 
 function formatNoSessionRunning(selector: SessionSelector): string {
@@ -2358,248 +2314,6 @@ function buildReplStatusDetails(
 	};
 }
 
-async function startDefaultJuliaSession(pi: ExtensionAPI, ctx: ExtensionCommandContext): Promise<void> {
-	const exists = await tmuxSessionExists(pi, DEFAULT_JULIA_SESSION, ctx.cwd);
-	if (exists) {
-		const info = await readSessionInfo(pi, DEFAULT_JULIA_SESSION, ctx.cwd);
-		notify(
-			ctx,
-			info
-				? `Default Julia REPL session is already running.\n\n${formatSessionInfo(info)}`
-				: ["Default Julia REPL session is already running.", "", formatAttachInstructions(DEFAULT_JULIA_SESSION)].join("\n"),
-			"info",
-		);
-		return;
-	}
-
-	const shellLaunch = buildDefaultShellRuntimeCommand("julia");
-	const createResult = await execTmux(
-		pi,
-		["new-session", "-d", "-s", DEFAULT_JULIA_SESSION, "-c", ctx.cwd, shellLaunch.command],
-		ctx.cwd,
-		10_000,
-	);
-	if (createResult.code !== 0) {
-		const reason = createResult.stderr.trim() || createResult.stdout.trim() || `exit code ${createResult.code}`;
-		notify(ctx, `Failed to create tmux session ${DEFAULT_JULIA_SESSION}: ${reason}`, "error");
-		return;
-	}
-
-	const history = await enableSessionHistoryLogging(pi, DEFAULT_JULIA_SESSION, ctx.cwd);
-	await setTmuxSessionOption(pi, DEFAULT_JULIA_SESSION, REPL_RUNTIME_OPTION, "julia", ctx.cwd);
-	const info = await waitForJuliaSessionInfo(pi, ctx.cwd, shellLaunch.shell);
-
-	if (history.warning) {
-		notify(ctx, history.warning, "warning");
-	}
-
-	notify(
-		ctx,
-		[
-			`Started default Julia REPL session: ${DEFAULT_JULIA_SESSION}`,
-			`Launch method: ${shellLaunch.shell} -i -l -c 'julia' inside tmux.`,
-			info ? `\n${formatSessionInfo(info)}` : ["", formatAttachInstructions(DEFAULT_JULIA_SESSION)].join("\n"),
-		].join("\n"),
-		"info",
-	);
-}
-
-async function startDefaultRSession(pi: ExtensionAPI, ctx: ExtensionCommandContext): Promise<void> {
-	const exists = await tmuxSessionExists(pi, DEFAULT_R_SESSION, ctx.cwd);
-	if (exists) {
-		const info = await readSessionInfo(pi, DEFAULT_R_SESSION, ctx.cwd);
-		notify(
-			ctx,
-			info ? `Default R REPL session is already running.\n\n${formatSessionInfo(info)}` : ["Default R REPL session is already running.", "", formatAttachInstructions(DEFAULT_R_SESSION)].join("\n"),
-			"info",
-		);
-		return;
-	}
-
-	const shellLaunch = buildDefaultShellRuntimeCommand("r");
-	const createResult = await execTmux(pi, ["new-session", "-d", "-s", DEFAULT_R_SESSION, "-c", ctx.cwd, shellLaunch.command], ctx.cwd, 10_000);
-	if (createResult.code !== 0) {
-		const reason = createResult.stderr.trim() || createResult.stdout.trim() || `exit code ${createResult.code}`;
-		notify(ctx, `Failed to create tmux session ${DEFAULT_R_SESSION}: ${reason}`, "error");
-		return;
-	}
-
-	const history = await enableSessionHistoryLogging(pi, DEFAULT_R_SESSION, ctx.cwd);
-	await setTmuxSessionOption(pi, DEFAULT_R_SESSION, REPL_RUNTIME_OPTION, "r", ctx.cwd);
-	const info = await waitForRSessionInfo(pi, ctx.cwd, shellLaunch.shell);
-
-	if (history.warning) {
-		notify(ctx, history.warning, "warning");
-	}
-
-	notify(
-		ctx,
-		[
-			`Started default R REPL session: ${DEFAULT_R_SESSION}`,
-			`Launch method: ${shellLaunch.shell} -i -l -c 'R' inside tmux.`,
-			info ? `\n${formatSessionInfo(info)}` : ["", formatAttachInstructions(DEFAULT_R_SESSION)].join("\n"),
-		].join("\n"),
-		"info",
-	);
-}
-
-async function startDefaultGhciSession(pi: ExtensionAPI, ctx: ExtensionCommandContext): Promise<void> {
-	const exists = await tmuxSessionExists(pi, DEFAULT_GHCI_SESSION, ctx.cwd);
-	if (exists) {
-		const info = await readSessionInfo(pi, DEFAULT_GHCI_SESSION, ctx.cwd);
-		notify(
-			ctx,
-			info ? `Default Haskell (GHCi) REPL session is already running.\n\n${formatSessionInfo(info)}` : ["Default Haskell (GHCi) REPL session is already running.", "", formatAttachInstructions(DEFAULT_GHCI_SESSION)].join("\n"),
-			"info",
-		);
-		return;
-	}
-
-	const shellLaunch = buildDefaultShellRuntimeCommand("ghci");
-	const createResult = await execTmux(pi, ["new-session", "-d", "-s", DEFAULT_GHCI_SESSION, "-c", ctx.cwd, shellLaunch.command], ctx.cwd, 10_000);
-	if (createResult.code !== 0) {
-		const reason = createResult.stderr.trim() || createResult.stdout.trim() || `exit code ${createResult.code}`;
-		notify(ctx, `Failed to create tmux session ${DEFAULT_GHCI_SESSION}: ${reason}`, "error");
-		return;
-	}
-
-	const history = await enableSessionHistoryLogging(pi, DEFAULT_GHCI_SESSION, ctx.cwd);
-	await setTmuxSessionOption(pi, DEFAULT_GHCI_SESSION, REPL_RUNTIME_OPTION, "ghci", ctx.cwd);
-	const info = await waitForGhciSessionInfo(pi, ctx.cwd, shellLaunch.shell);
-
-	if (history.warning) {
-		notify(ctx, history.warning, "warning");
-	}
-
-	notify(
-		ctx,
-		[
-			`Started default Haskell (GHCi) REPL session: ${DEFAULT_GHCI_SESSION}`,
-			`Launch method: ${shellLaunch.shell} -i -l -c 'ghci' inside tmux.`,
-			info ? `\n${formatSessionInfo(info)}` : ["", formatAttachInstructions(DEFAULT_GHCI_SESSION)].join("\n"),
-		].join("\n"),
-		"info",
-	);
-}
-
-async function startDefaultClojureSession(pi: ExtensionAPI, ctx: ExtensionCommandContext, requested: ClojureRuntime): Promise<void> {
-	const exists = await tmuxSessionExists(pi, DEFAULT_CLOJURE_SESSION, ctx.cwd);
-	if (exists) {
-		const info = await readSessionInfo(pi, DEFAULT_CLOJURE_SESSION, ctx.cwd);
-		notify(
-			ctx,
-			info ? `Default Clojure REPL session is already running (requested: ${requested}).\n\n${formatSessionInfo(info)}` : ["Default Clojure REPL session is already running.", "", formatAttachInstructions(DEFAULT_CLOJURE_SESSION)].join("\n"),
-			"info",
-		);
-		return;
-	}
-
-	const shellLaunch = buildDefaultShellRuntimeCommand(requested);
-	const createResult = await execTmux(pi, ["new-session", "-d", "-s", DEFAULT_CLOJURE_SESSION, "-c", ctx.cwd, shellLaunch.command], ctx.cwd, 10_000);
-	if (createResult.code !== 0) {
-		const reason = createResult.stderr.trim() || createResult.stdout.trim() || `exit code ${createResult.code}`;
-		notify(ctx, `Failed to create tmux session ${DEFAULT_CLOJURE_SESSION}: ${reason}`, "error");
-		return;
-	}
-
-	const history = await enableSessionHistoryLogging(pi, DEFAULT_CLOJURE_SESSION, ctx.cwd);
-	await setTmuxSessionOption(pi, DEFAULT_CLOJURE_SESSION, REPL_RUNTIME_OPTION, "clojure", ctx.cwd);
-	const info = await waitForClojureSessionInfo(pi, ctx.cwd, shellLaunch.shell);
-
-	if (history.warning) {
-		notify(ctx, history.warning, "warning");
-	}
-
-	notify(
-		ctx,
-		[
-			`Started default Clojure REPL session: ${DEFAULT_CLOJURE_SESSION}`,
-			`Launch method: ${shellLaunch.shell} -i -l -c 'clojure' inside tmux.`,
-			"`clojure` is used under the hood because it is a cleaner non-rlwrap launcher for a shared tmux REPL. `/repl clj` is still accepted as an alias.",
-			info ? `\n${formatSessionInfo(info)}` : ["", formatAttachInstructions(DEFAULT_CLOJURE_SESSION)].join("\n"),
-		].join("\n"),
-		"info",
-	);
-}
-
-async function startDefaultRubySession(pi: ExtensionAPI, ctx: ExtensionCommandContext): Promise<void> {
-	const exists = await tmuxSessionExists(pi, DEFAULT_RUBY_SESSION, ctx.cwd);
-	if (exists) {
-		const info = await readSessionInfo(pi, DEFAULT_RUBY_SESSION, ctx.cwd);
-		notify(
-			ctx,
-			info ? `Default Ruby REPL session is already running.\n\n${formatSessionInfo(info)}` : ["Default Ruby REPL session is already running.", "", formatAttachInstructions(DEFAULT_RUBY_SESSION)].join("\n"),
-			"info",
-		);
-		return;
-	}
-
-	const shellLaunch = buildDefaultShellRuntimeCommand("ruby");
-	const createResult = await execTmux(pi, ["new-session", "-d", "-s", DEFAULT_RUBY_SESSION, "-c", ctx.cwd, shellLaunch.command], ctx.cwd, 10_000);
-	if (createResult.code !== 0) {
-		const reason = createResult.stderr.trim() || createResult.stdout.trim() || `exit code ${createResult.code}`;
-		notify(ctx, `Failed to create tmux session ${DEFAULT_RUBY_SESSION}: ${reason}`, "error");
-		return;
-	}
-
-	const history = await enableSessionHistoryLogging(pi, DEFAULT_RUBY_SESSION, ctx.cwd);
-	await setTmuxSessionOption(pi, DEFAULT_RUBY_SESSION, REPL_RUNTIME_OPTION, "ruby", ctx.cwd);
-	const info = await waitForRubySessionInfo(pi, ctx.cwd, shellLaunch.shell);
-
-	if (history.warning) {
-		notify(ctx, history.warning, "warning");
-	}
-
-	notify(
-		ctx,
-		[
-			`Started default Ruby REPL session: ${DEFAULT_RUBY_SESSION}`,
-			`Launch method: ${shellLaunch.shell} -i -l -c 'irb' inside tmux.`,
-			info ? `\n${formatSessionInfo(info)}` : ["", formatAttachInstructions(DEFAULT_RUBY_SESSION)].join("\n"),
-		].join("\n"),
-		"info",
-	);
-}
-
-async function startDefaultJavaSession(pi: ExtensionAPI, ctx: ExtensionCommandContext): Promise<void> {
-	const exists = await tmuxSessionExists(pi, DEFAULT_JAVA_SESSION, ctx.cwd);
-	if (exists) {
-		const info = await readSessionInfo(pi, DEFAULT_JAVA_SESSION, ctx.cwd);
-		notify(
-			ctx,
-			info ? `Default Java REPL session is already running.\n\n${formatSessionInfo(info)}` : ["Default Java REPL session is already running.", "", formatAttachInstructions(DEFAULT_JAVA_SESSION)].join("\n"),
-			"info",
-		);
-		return;
-	}
-
-	const shellLaunch = buildDefaultShellRuntimeCommand("java");
-	const createResult = await execTmux(pi, ["new-session", "-d", "-s", DEFAULT_JAVA_SESSION, "-c", ctx.cwd, shellLaunch.command], ctx.cwd, 10_000);
-	if (createResult.code !== 0) {
-		const reason = createResult.stderr.trim() || createResult.stdout.trim() || `exit code ${createResult.code}`;
-		notify(ctx, `Failed to create tmux session ${DEFAULT_JAVA_SESSION}: ${reason}`, "error");
-		return;
-	}
-
-	const history = await enableSessionHistoryLogging(pi, DEFAULT_JAVA_SESSION, ctx.cwd);
-	await setTmuxSessionOption(pi, DEFAULT_JAVA_SESSION, REPL_RUNTIME_OPTION, "java", ctx.cwd);
-	const info = await waitForJavaSessionInfo(pi, ctx.cwd, shellLaunch.shell);
-
-	if (history.warning) {
-		notify(ctx, history.warning, "warning");
-	}
-
-	notify(
-		ctx,
-		[
-			`Started default Java REPL session: ${DEFAULT_JAVA_SESSION}`,
-			`Launch method: ${shellLaunch.shell} -i -l -c 'jshell' inside tmux.`,
-			info ? `\n${formatSessionInfo(info)}` : ["", formatAttachInstructions(DEFAULT_JAVA_SESSION)].join("\n"),
-		].join("\n"),
-		"info",
-	);
-}
-
 async function showReplStatus(
 	pi: ExtensionAPI,
 	ctx: ExtensionCommandContext,
@@ -2688,16 +2402,16 @@ async function stopReplSession(
 		return;
 	}
 
-	await disableSessionHistoryLogging(pi, sessionName, ctx.cwd);
-	const result = await execTmux(pi, ["kill-session", "-t", getSessionTarget(sessionName)], ctx.cwd, 5_000);
-	if (result.code !== 0) {
-		const reason = result.stderr.trim() || result.stdout.trim() || `exit code ${result.code}`;
-		notify(ctx, `Failed to stop ${sessionName}: ${reason}`, "error");
-		return;
+	try {
+		const result = await stopVerifiedReplSession({
+			tmux: (args: string[]) => execTmux(pi, args, ctx.cwd, 3_000),
+			sessionName,
+		});
+		const escalated = result.signals.length ? ` Cleaned up ${new Set(result.signals.map((entry) => entry.pid)).size} surviving process(es).` : "";
+		notify(ctx, `Stopped default ${getSessionDisplayName(selector)} REPL session: ${sessionName}. Verified owned runtime processes exited.${escalated}`, "info");
+	} catch (error) {
+		notify(ctx, `Could not fully stop ${sessionName}: ${error instanceof Error ? error.message : String(error)}`, "error");
 	}
-
-	const label = selector === "julia" ? "Julia" : selector === "r" ? "R" : selector === "ghci" ? "Haskell (GHCi)" : selector === "clojure" ? "Clojure" : selector === "ruby" ? "Ruby (irb)" : selector === "java" ? "Java (jshell)" : "Python/IPython";
-	notify(ctx, `Stopped default ${label} REPL session: ${sessionName}`, "info");
 }
 
 async function attachReplSession(
@@ -2879,7 +2593,7 @@ async function handleRepl(pi: ExtensionAPI, args: string, ctx: ExtensionCommandC
 					return;
 				}
 
-				await startDefaultPythonSession(pi, ctx, parsed.runtime);
+				await startReplCommand(pi, ctx, parsed.runtime);
 				return;
 			}
 
@@ -2893,7 +2607,7 @@ async function handleRepl(pi: ExtensionAPI, args: string, ctx: ExtensionCommandC
 					return;
 				}
 
-				await startDefaultJuliaSession(pi, ctx);
+				await startReplCommand(pi, ctx, parsed.runtime);
 				return;
 			}
 
@@ -2903,7 +2617,7 @@ async function handleRepl(pi: ExtensionAPI, args: string, ctx: ExtensionCommandC
 					return;
 				}
 
-				await startDefaultRSession(pi, ctx);
+				await startReplCommand(pi, ctx, parsed.runtime);
 				return;
 			}
 
@@ -2913,7 +2627,7 @@ async function handleRepl(pi: ExtensionAPI, args: string, ctx: ExtensionCommandC
 					return;
 				}
 
-				await startDefaultGhciSession(pi, ctx);
+				await startReplCommand(pi, ctx, parsed.runtime);
 				return;
 			}
 
@@ -2923,7 +2637,7 @@ async function handleRepl(pi: ExtensionAPI, args: string, ctx: ExtensionCommandC
 					return;
 				}
 
-				await startDefaultClojureSession(pi, ctx, parsed.runtime);
+				await startReplCommand(pi, ctx, parsed.runtime);
 				return;
 			}
 
@@ -2933,7 +2647,7 @@ async function handleRepl(pi: ExtensionAPI, args: string, ctx: ExtensionCommandC
 					return;
 				}
 
-				await startDefaultRubySession(pi, ctx);
+				await startReplCommand(pi, ctx, parsed.runtime);
 				return;
 			}
 
@@ -2943,7 +2657,7 @@ async function handleRepl(pi: ExtensionAPI, args: string, ctx: ExtensionCommandC
 					return;
 				}
 
-				await startDefaultJavaSession(pi, ctx);
+				await startReplCommand(pi, ctx, parsed.runtime);
 				return;
 			}
 
@@ -2976,6 +2690,30 @@ export default function (pi: ExtensionAPI) {
 		description: "Alias for /repl",
 		handler: async (args, ctx) => {
 			await handleRepl(pi, args, ctx);
+		},
+	});
+
+	pi.registerTool({
+		name: "repl_start",
+		label: "REPL Start",
+		description: `Start or reuse a shared tmux REPL with an explicit runtime. Never resets existing sessions, switches interpreters, or sends probe code. Waits for a normal prompt and returns created/reused, ready, session status and attach instructions. Readiness timeout leaves the session running with ready=false. Response text is bounded to ${DEFAULT_MAX_LINES} lines or ${formatSize(DEFAULT_MAX_BYTES)}.`,
+		promptSnippet: "Start a shared REPL, or reuse it without resetting its state, and wait for a normal prompt.",
+		promptGuidelines: [
+			"Use repl_start when the user wants to start a shared REPL, choosing runtime explicitly. It uses the same startup path as /repl and /lab; Python and IPython share one session and an existing interpreter is never switched.",
+			"Check repl_start's ready result before repl_send. ready=false means inspect the pane or repl_status first; do not reset, interrupt, or send input to force readiness. A detected prompt is a snapshot, not a reservation against direct terminal input.",
+			"repl_start leaves sessions running after readiness timeout or cancellation. Stopping or restarting remains an explicit user action; repl_send never auto-starts sessions.",
+		],
+		parameters: REPL_START_PARAMS,
+		async execute(_toolCallId, params, signal, _onUpdate, ctx) {
+			if (!REPL_START_RUNTIMES.includes(params.runtime)) throw new Error("repl_start requires an explicit supported runtime: python, ipython, julia, r, ghci, clojure, ruby, or java.");
+			const timeoutMs = typeof params.timeoutMs === "number" && Number.isFinite(params.timeoutMs)
+				? Math.max(1_000, Math.min(MAX_STARTUP_WAIT_MS, Math.round(params.timeoutMs))) : DEFAULT_STARTUP_WAIT_MS;
+			const result = await startDefaultReplSession(pi, ctx.cwd, params.runtime, timeoutMs, signal);
+			const truncation = truncateHead(result.text, { maxLines: DEFAULT_MAX_LINES - 2, maxBytes: DEFAULT_MAX_BYTES - 256 });
+			return {
+				content: [{ type: "text", text: truncation.content + (truncation.truncated ? "\n\n[Status text truncated; inspect repl_status or the session's raw history for more context.]" : "") }],
+				details: { ...result.details, ...(truncation.truncated ? { truncation } : {}) },
+			};
 		},
 	});
 
@@ -3061,7 +2799,7 @@ export default function (pi: ExtensionAPI) {
 		description: `Execute code in the shared default Python/IPython, Julia, R, Haskell (GHCi), Clojure, Ruby, or Java tmux REPL sessions (${DEFAULT_PYTHON_SESSION}, ${DEFAULT_JULIA_SESSION}, ${DEFAULT_R_SESSION}, ${DEFAULT_GHCI_SESSION}, ${DEFAULT_CLOJURE_SESSION}, ${DEFAULT_RUBY_SESSION}, ${DEFAULT_JAVA_SESSION}). The complete response (submitted code and output) is truncated to ${DEFAULT_MAX_LINES} lines or ${formatSize(DEFAULT_MAX_BYTES)} (whichever is hit first); the full response is saved privately when truncated.`,
 		promptSnippet: "Execute a small snippet in the shared Python/IPython, Julia, R, Haskell (GHCi), Clojure, Ruby, or Java REPL and return its output.",
 		promptGuidelines: [
-			"Use repl_send only after a /repl python, /repl ipython, /repl julia, /repl R, /repl ghci, /repl clojure, /repl ruby, or /repl java session has been started.",
+			"Use repl_send only after the relevant session has been started with repl_start, /repl, or /lab and is at a normal prompt. repl_send never auto-starts a missing session.",
 			"If the user asks to run code in Julia or in the shared Julia REPL, use target='julia'. If they ask to run code in R or in the shared R REPL, use target='r'. If they ask to run code in GHCi, Haskell, or the shared Haskell REPL, use target='ghci'. If they ask to run code in Clojure or in the shared Clojure REPL, use target='clojure'. If they ask to run code in Ruby or IRB or the shared Ruby REPL, use target='ruby'. If they ask to run code in Java or jshell or the shared Java REPL, use target='java'. Otherwise use the shared Python/IPython session.",
 			"Use repl_status before claiming whether the shared REPL is active if there has been a prior failure or a possible state change.",
 			"If you need context about prior direct REPL interaction, inspect repl_status details and read the session history file listed there.",

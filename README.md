@@ -112,10 +112,11 @@ For Clojure, `/repl clojure` is canonical and `/repl clj` also works. The same a
 
 ## Tools used by pi
 
-`pi-repl` also exposes tools that pi can use internally. In normal use, you can just ask pi to run code in the shared REPL or use the `/repl` commands directly.
+`pi-repl` also exposes tools that pi can use internally. In normal use, you can ask pi to start a shared REPL or run code there, or use the `/repl` commands directly.
 
 | Tool | Description |
 |------|-------------|
+| `repl_start` | Start or reuse a shared session with an explicit runtime; wait for a normal prompt and return status/attach details |
 | `repl_status` | Inspect the state of supported shared REPL sessions |
 | `repl_send` | Execute code in a running supported shared REPL session |
 
@@ -124,15 +125,31 @@ Notes:
 - `repl_status` is what pi uses to check which shared REPL sessions are currently running
 - while a shared REPL is running, `repl_status` exposes the versioned clean-record ID/path/count/tail and the separate raw session history path
 - pi can use the clean entries when it needs compatible-client code/output boundaries, or read the raw history for context about direct pane interaction
-- the relevant shared session must already be running before `repl_send`
+- the relevant shared session must already be running and at a normal prompt before `repl_send`; it never auto-starts a missing session
 - you can ask pi naturally to run code in Python, IPython, Julia, R, Haskell, Clojure, Ruby, or Java; pi chooses the tool parameters internally
-- the tools accept `target: ruby` or `target: irb`, and `target: java` or `target: jshell`; use the canonical `ruby` and `java` names in `/repl` commands
+- `repl_status` and `repl_send` accept `target: ruby` or `target: irb`, and `target: java` or `target: jshell`; use the canonical `ruby` and `java` names in `/repl` commands and `repl_start`
 - for plain Python, `print(...)` is the safest way to get values back reliably
 - in Haskell (GHCi), use normal interactive syntax such as `let` bindings or `:{ ... :}` blocks for multiline declarations
 - in Clojure, use normal interactive syntax such as `let`, `def`/`defn`, or `do` forms for multiline code
 - tool output includes both the submitted code and the captured output; the complete response is limited to 2,000 lines or 50 KiB, with the full response saved to a private file when truncated
 - `repl_send` accepts `echoMode: off|summary|full` for a single send; otherwise it uses `/repl echo`, initialized from `PI_REPL_ECHO_MODE` or Summary
 - Full echo mode writes bounded submitted source code into persistent raw terminal history; Summary shows short submissions in full and truncates after 6 lines or 600 source characters
+
+### Starting a session through pi
+
+Ask, for example, “Start a shared Ruby REPL.” Pi can call:
+
+```json
+{ "runtime": "ruby", "timeoutMs": 20000 }
+```
+
+`repl_start` requires `runtime`: `python`, `ipython`, `julia`, `r`, `ghci`, `clojure`, `ruby`, or `java`. It shares the `/repl` and `/lab` startup implementation: a detached tmux session, launched from Pi's working directory through your normal interactive login shell. It returns `created`/`reused`, `ready`, the requested and recorded runtimes, session status (including record/history paths), and an `attachCommand`. It does not open a terminal or attach a client automatically.
+
+An existing session is reused without resetting variables, changing its working directory, replacing its history logger, or sending input. Python and IPython share `pi-repl-python`: requesting the other interpreter preserves the one already running and reports the difference. As with status inspection, legacy sessions can lazily acquire clean-record metadata; existing metadata is preserved.
+
+Startup waits for a recognised normal prompt on the physical cursor row, not merely a running process, an old prompt in scrollback, or a startup banner. No probe code, Enter, Ctrl-C, or prompt-setting changes are sent. The default wait is 20 seconds; `timeoutMs` accepts 1,000–120,000 milliseconds for prompt polling, in addition to bounded tmux setup/inspection calls. If the prompt cannot be confirmed, the tool returns `ready: false` with status and a warning, leaving the session running. Busy sessions, unfinished direct input, and customised prompts can all produce this result; inspect the pane before sending code. Prompt detection is a snapshot, not a guarantee that another person cannot begin typing afterwards.
+
+Missing tmux, failed creation, early runtime exit, and cancellation are reported as tool errors. Cancellation after creation leaves the session running too; inspect it with `repl_status`. Stopping or restarting remains an explicit user action. `repl_send` does not silently start, restart, or switch a REPL.
 
 ### Ruby and Java submissions
 
@@ -196,6 +213,14 @@ The Python/IPython session can currently be launched in either:
 - `python` mode
 - `ipython` mode
 
+## Stopping safely
+
+`/repl stop [target]` and `/lab stop [target]` verify shutdown, rather than assuming that closing tmux also terminates its runtimes. The command snapshots the selected session's pane processes and descendants, checks local owner/start-time/terminal identities, and guards the final tmux operation against session replacement or changed pane topology. Linked windows are refused because another session still uses them.
+
+After closing the selected session, it waits briefly for normal exit, sends TERM to confirmed survivors, and uses KILL only if those same owned processes still survive. Each signal rechecks process identity and protects live panes, Pi itself, and the tmux server. It never kills by runtime name or signals an entire process group. Success is reported only after verification; uncertain ownership, inspection failures or surviving processes produce an error requiring manual inspection. Dead/detached panes whose ownership cannot be established are refused before shutdown.
+
+This is an explicit, state-discarding stop: save anything needed first. It sends no runtime exit command, Ctrl-C or other input into the pane, and leaves raw logs and clean records on disk. Other sessions are not stopped. No process cleanup runs automatically on startup, send, Pi reload or Pi exit. The checks require local Unix process inspection (macOS/Linux); missing inspection support fails closed. It is not a general orphan collector: processes already detached before inspection, or descendants that cannot be safely attributed after their parent exits, may require manual cleanup.
+
 ## Attaching
 
 After running `/repl attach`, open a new terminal window and run the tmux command shown by pi. For example:
@@ -255,6 +280,7 @@ Example requests once the REPL is running:
 ## Notes
 
 - `tmux` is required.
+- Mainly tested on macOS. On Windows, use WSL, with Pi, tmux and the interpreters all running inside it.
 - While a shared REPL is running, `pi-repl` keeps both the compatible-client clean record and a raw transcript log of the tmux pane output for that session.
 - The raw transcript is plain text and may include prompts, echoed input, request-specific display anchors, output, direct pane interaction, and errors; it is not parsed into clean entries.
 - Newly started sessions use unique mode-`0600` raw logs in the current-user-owned mode-`0700` directory `<os temporary directory>/pi-repl-history-<uid>/`. Restarting a session or using another tmux server does not truncate a previous log. Symlinked, foreign-owned, or permissive history roots are refused.
@@ -271,7 +297,7 @@ npm run typecheck
 npm test
 ```
 
-`npm test` runs unit tests plus local Python/tmux integration tests. Integration tests use dedicated tmux servers with empty configuration, temporary homes and private test files, and stop those servers afterward. They do not attach to or send code to your existing REPLs. Tests requiring tmux or Python skip when those executables are unavailable; no CI service is required.
+`npm test` runs unit tests plus local Python/tmux integration tests. Integration tests use dedicated tmux servers with empty configuration, temporary homes and private test files. Test sockets live in short, private temporary directories, not the user's tmux socket directory. Teardown verifies that both the servers and their owned runtime processes exit; it does not treat a vanished tmux session as sufficient. Tests do not attach to or send code to your existing REPLs. Tests requiring tmux or Python skip when those executables are unavailable; no CI service is required.
 
 To exercise all installed runtimes, or just a selected subset:
 
@@ -281,7 +307,9 @@ PI_REPL_TEST_RUNTIMES=julia,r npm run test:integration
 PI_REPL_TEST_RUNTIMES=ruby,java npm run test:integration
 ```
 
-The integration tests cover nonzero indexes, pane selection, session restarts, raw-log permissions, clean records and exports, concurrent sends, timeout/abort leases, and runtime wrappers. Ruby/Java checks also cover shared direct input, interpolation, Unicode and quoted control paths, persistent declarations, malformed input and error recovery. Optional runtime tests are opt-in and skip missing executables. Julia tests resolve the existing juliaup-selected binary before isolating the test home.
+The integration tests cover command/tool startup across runtimes, concurrent starts, state-preserving reuse, readiness timeout on unfinished direct input, nonzero indexes, pane selection, session restarts, raw-log permissions, clean records and exports, concurrent sends, timeout/abort leases, and runtime wrappers. Portable startup tests also cover explicit runtime validation, failures, cancellation, custom/continuation prompts, and bounded status output. Ruby/Java checks also cover shared direct input, interpolation, Unicode and quoted control paths, persistent declarations, malformed input and error recovery. Optional runtime tests are opt-in and skip missing executables. Julia tests resolve the existing juliaup-selected binary before isolating the test home.
+
+Test launchers record PID/owner/start-time identities before executing a runtime. The test harness tracks server descendants and pane process groups across session replacement, then individually revalidates survivors before TERM/KILL cleanup. It never kills by executable name or signals a whole process group. The teardown hook is registered before launch, runs after setup failures too, verifies no owned runtime is still running, and removes its private socket directory only after successful cleanup. Regression tests cover ignored hangup/TERM, orphaned children, PID reuse, failed setup, and preservation of unrelated sessions. Production `/repl stop` tests independently verify runtime exit before test teardown, across all supported runtimes, including a busy GHCi session, resistant child processes, linked windows and same-name replacement races.
 
 `PI_REPL_CONTROL_ROOT` optionally overrides the private runtime-control directory; it must be current-user-owned mode `0700`. Tests set it to their temporary directory so even stale-file cleanup stays isolated. This does not change the shared-record protocol or Studio's control-file location.
 

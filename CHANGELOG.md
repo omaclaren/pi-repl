@@ -4,11 +4,18 @@ All notable changes to `pi-repl` are documented here.
 
 ## [Unreleased]
 
+## [0.5.0] — 2026-09-09
+
 ### Added
+- Add `repl_start` with an explicit runtime, idempotent reuse, prompt-readiness polling, and structured status/attach details. Share startup with `/repl` and `/lab`; preserve existing interpreters, variables, working directories and history. Do not auto-start from `repl_send` or add destructive lifecycle tools.
+- Add portable startup/failure/cancellation tests and isolated cross-runtime tool-start, concurrent-start and unfinished-direct-input checks.
 - Add Ruby/irb and Java/JShell sessions, adapting Ifiht's contribution in [PR #2](https://github.com/omaclaren/pi-repl/pull/2). Include start/status/attach/stop commands, clean records and exports, and Summary/Off/Full displays.
 - Add isolated Ruby/Java integration coverage for persistence across agent and direct terminal input, interpolation and Unicode, private paths, failed compilation, incomplete snippets, and timeout/abort cleanup. Add portable command/schema routing tests; no CI workflow.
 
 ### Fixed
+- Verify runtime-process exit on explicit `/repl stop` and `/lab stop`. Snapshot only the selected session's owned panes/descendants; guard session identity and topology before tmux shutdown; revalidate survivors before individual TERM/KILL escalation. Refuse linked or unconfirmed panes, protect other sessions and the tmux server, preserve logs/records, and report incomplete cleanup instead of claiming success.
+- Reap and verify owned integration-test runtime processes after tmux shutdown, including GHCi children surviving session replacement and ignoring hangup/TERM. Track pre-exec process identities and descendants, revalidate before individual TERM/KILL signals, and exercise failure-path cleanup without touching unrelated sessions. Allocate test sockets in private temporary directories and remove them after verified teardown.
+- Require a recognised normal prompt on the cursor row before confirming startup readiness, rather than treating a running process or banner as ready. Wait up to 20 seconds by default; unconfirmed readiness leaves sessions running with a warning, while early runtime exit reports an error.
 - Encode Ruby source and paths without premature interpolation, and evaluate in the active IRB workspace so agent sends share variables with direct input.
 - Preserve JShell top-level declarations with native `/open` submissions and a separate completion file. Compilation failures no longer prevent completion; use `System.out.println(...)` for visible values because `/open` does not echo expression results.
 - Escape literal `#` characters in tmux `load-buffer` paths instead of treating parts of a custom private control root as tmux formats.
