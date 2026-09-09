@@ -405,12 +405,14 @@ test("ghci completes malformed source, including unterminated multiline blocks, 
 		["let broken =", /parse error/],
 		["print (", /parse error/],
 		[":{\nlet unfinished = 1", /unterminated multiline command/],
+		["let pi_before_bad = 17\n:{\nlet unfinished = 1", /unterminated multiline command/],
+		[':cmd Prelude.return ":{\\nlet unfinished = 1"', /unterminated multiline command/],
 		["{- unfinished comment", /unterminated/],
 	];
 	for (const echoMode of ["off", "summary", "full"]) {
 		for (const [code, expected] of malformed) {
-			// An outer :script driver would skip completion on the unclosed :{
-			// case. Completion must survive without changing the user's code.
+			// A driver without the intermediate guard skips completion on :{.
+			// Preserve native errors and partial execution, not repaired source.
 			const result = await f.send(code, { echoMode, timeoutMs: 3000 });
 			assert.match(result.content[0].text.split("Output:\n")[1], expected);
 			assert.doesNotMatch(result.content[0].text, /──|│/);
@@ -421,6 +423,9 @@ test("ghci completes malformed source, including unterminated multiline blocks, 
 		const recovered = await f.send(":{\nlet pi_ghci_twice x =\n      2 * x\n:}\nprint (pi_ghci_twice (pi_ghci_value - 20))", { echoMode });
 		assert.equal(recovered.content[0].text.split("Output:\n")[1], "42");
 	}
+	assert.equal((await f.send("print pi_before_bad")).content[0].text.split("Output:\n")[1], "17");
+	const queued = await f.send(':cmd Prelude.return "Control.Concurrent.threadDelay 300000 >> putStrLn \\"queued result\\""');
+	assert.equal(queued.content[0].text.split("Output:\n")[1], "queued result");
 	const status = (await f.status()).details.ghci;
 	assert.equal(status.running, true);
 	assert.ok(status.recordEntries.every((entry) => entry.status === "captured"));
@@ -437,6 +442,7 @@ test("ruby preserves interpolation, literal hashes, Unicode, escapes and error r
 		['@pi_ivar = "instance"\n$pi_gvar = "global"\nputs "#@pi_ivar #$pi_gvar"', "instance global"],
 		['puts "λ 🧪 \\"quoted\\" \\\\path"', 'λ 🧪 "quoted" \\path'],
 		['print "no newline"', "no newline"],
+		['puts "=> nil"', "=> nil"],
 	];
 	for (const echoMode of ["off", "summary", "full"]) {
 		for (const [code, expected] of cases) {
@@ -450,24 +456,24 @@ test("ruby preserves interpolation, literal hashes, Unicode, escapes and error r
 	assert.equal(readdirSync(process.env.PI_REPL_CONTROL_ROOT).length, 0);
 });
 
-for (const runtime of ["ruby", "java"]) {
+for (const runtime of ["ghci", "ruby", "java"]) {
 	test(`${runtime} compact display preserves non-newline output and user blank lines`, {
 		timeout: 60000, skip: !(optionalRuntimes.has("all") || optionalRuntimes.has(runtime)),
 	}, async (t) => {
 		const f = await fixture(t, { runtime, index: 1 });
 		if (!f) return;
 		const cases = [
-			['puts "42"', 'System.out.println("42");', "42\n"],
-			['print "no newline"', 'System.out.print("no newline");', "no newline\n"],
-			['$stderr.print "stderr tail"', 'System.err.print("stderr tail");', "stderr tail\n"],
-			['print "λ 🧪"', 'System.out.print("λ 🧪");', "λ 🧪\n"],
-			[`print "${"x".repeat(80)}"`, `System.out.print("${"x".repeat(80)}");`, "x".repeat(80) + "\n"],
-			['print "first\\n\\nlast\\n\\n"', 'System.out.print("first\\n\\nlast\\n\\n");', "first\n\nlast\n\n"],
-			['nil', ';', ""],
+			['puts "42"', 'System.out.println("42");', "42\n", 'putStrLn "42"'],
+			['print "no newline"', 'System.out.print("no newline");', "no newline\n", 'putStr "no newline"'],
+			['$stderr.print "stderr tail"', 'System.err.print("stderr tail");', "stderr tail\n", 'System.IO.hPutStr System.IO.stderr "stderr tail"'],
+			['print "λ 🧪"', 'System.out.print("λ 🧪");', "λ 🧪\n", 'putStr "λ 🧪"'],
+			[`print "${"x".repeat(80)}"`, `System.out.print("${"x".repeat(80)}");`, "x".repeat(80) + "\n", `putStr "${"x".repeat(80)}"`],
+			['print "first\\n\\nlast\\n\\n"', 'System.out.print("first\\n\\nlast\\n\\n");', "first\n\nlast\n\n", 'putStr "first\\n\\nlast\\n\\n"'],
+			['nil', ';', "", 'let pi_quiet = 1'],
 		];
 		for (const echoMode of ["summary", "full"]) {
-			for (const [ruby, java, expected] of cases) {
-				const result = await f.send(runtime === "ruby" ? ruby : java, { echoMode });
+			for (const [ruby, java, expected, ghci] of cases) {
+				const result = await f.send({ ruby, java, ghci }[runtime], { echoMode });
 				assert.equal(result.content[0].text.split("Output:\n")[1], expected.trim() || "(no output)");
 				const pane = await f.tmux("capture-pane", "-p", "-J", "-t", `${f.sessionName}:^`, "-S", "-1000");
 				const begin = `── pi-repl · ${result.details.submissionAnchorId} ·`;
@@ -497,7 +503,8 @@ for (const runtime of ["ruby", "java"]) {
 			// Only the runtime's own query sees TMUX_PANE. Harness calls still
 			// reach the real tmux on this fixture's isolated server.
 			writeFileSync(join(f.cwd, "bin", "tmux"), `#!/bin/sh\nif [ -n "\${TMUX_PANE:-}" ]; then\n  echo $$ > ${quote(pidPath)}\n  ${failure === "timeout" ? 'exec /bin/sleep 10' : 'exit 23'}\nfi\nexec ${quote(realTmux)} "$@"\n`, { mode: 0o700 });
-			const result = await f.send(runtime === "ruby" ? 'print "query fallback"' : 'System.out.print("query fallback");', { timeoutMs: 4000 });
+			const code = { ruby: 'print "query fallback"', java: 'System.out.print("query fallback");', ghci: 'putStr "query fallback"' }[runtime];
+			const result = await f.send(code, { timeoutMs: 4000 });
 			assert.equal(result.content[0].text.split("Output:\n")[1], "query fallback");
 			const pane = await f.tmux("capture-pane", "-p", "-J", "-t", `${f.sessionName}:^`, "-S", "-80");
 			assert.match(pane, /── output ──\nquery fallback\n── done/);
@@ -511,6 +518,74 @@ for (const runtime of ["ruby", "java"]) {
 		});
 	}
 }
+
+test("ruby suppresses only its loader result and restores manual echo and custom predicates", {
+	timeout: 60000, skip: !(optionalRuntimes.has("all") || optionalRuntimes.has("ruby")),
+}, async (t) => {
+	const f = await fixture(t, { runtime: "ruby", index: 1 });
+	if (!f) return;
+	const capture = () => f.tmux("capture-pane", "-p", "-J", "-t", `${f.sessionName}:^`, "-S", "-1000");
+	for (const echoMode of ["off", "summary", "full"]) {
+		assert.equal((await f.send("40 + 2", { echoMode })).content[0].text.split("Output:\n")[1], "42");
+		await f.send("nil", { echoMode });
+	}
+	await f.send("def broken(");
+	await f.send('raise "intentional echo test"');
+	assert.doesNotMatch(await capture(), /^=>\s*nil$/m);
+	assert.equal((await f.send('puts IRB.CurrentContext.singleton_class.instance_methods(false).include?(:echo?)')).content[0].text.split("Output:\n")[1], "false");
+	async function direct(code) {
+		const before = await capture();
+		const start = before.lastIndexOf("\n") + 1;
+		await f.tmux("send-keys", "-t", `${f.sessionName}:^`, "-l", code);
+		await f.tmux("send-keys", "-t", `${f.sessionName}:^`, "C-m");
+		let tail;
+		await eventually(async () => {
+			tail = (await capture()).slice(start);
+			return tail.includes(code) && /^irb\(.*\)[:\d]+>\s*$/.test(tail.split("\n").at(-1));
+		});
+		return tail;
+	}
+	assert.match(await direct("4321 + 1"), /=> 4322/);
+	assert.match(await direct("nil"), /=> nil/);
+	await f.send("IRB.CurrentContext.echo = false");
+	assert.doesNotMatch(await direct("7654 + 1"), /=> 7655/);
+	assert.equal((await f.send("puts IRB.CurrentContext.echo?")).content[0].text.split("Output:\n")[1], "false");
+	await f.send("IRB.CurrentContext.echo = true");
+	await f.send("echo_owner = IRB.CurrentContext\ndef echo_owner.echo?; @echo; end\npi_echo_original = echo_owner.method(:echo?)\nnil");
+	assert.equal((await f.send("puts(pi_echo_original == IRB.CurrentContext.method(:echo?))")).content[0].text.split("Output:\n")[1], "true");
+	assert.match(await direct("8765 + 1"), /=> 8766/);
+});
+
+test("ghci echoes one loader only and completes after queued code", {
+	timeout: 60000, skip: !(optionalRuntimes.has("all") || optionalRuntimes.has("ghci")),
+}, async (t) => {
+	const f = await fixture(t, { runtime: "ghci", index: 1 });
+	if (!f) return;
+	const historyPath = (await f.status()).details.ghci.historyPath;
+	let sends = 0;
+	for (const echoMode of ["off", "summary", "full"]) {
+		const result = await f.send('let pi_quiet_value = 41\nprint (pi_quiet_value + 1)', { echoMode });
+		sends++;
+		assert.equal(result.content[0].text.split("Output:\n")[1], "42");
+		const pane = await f.tmux("capture-pane", "-p", "-J", "-t", `${f.sessionName}:^`, "-S", "-1000");
+		assert.equal((pane.match(/^ghci> :script /gm) || []).length, sends, pane);
+		assert.doesNotMatch(pane, /^ghci> :!|^ghci> :cmd/m);
+		if (echoMode !== "off") await eventually(() => readFileSync(historyPath, "utf8").includes(`── done · ${result.details.submissionAnchorId} ──`));
+	}
+	assert.equal((readFileSync(historyPath, "utf8").match(/^ghci> :script /gm) || []).length, sends);
+	// Normal queued commands must finish before completion; a :cmd queue
+	// containing both source and completion would complete too early.
+	const queued = await f.send(':cmd Prelude.return "Control.Concurrent.threadDelay 300000 >> print (pi_quiet_value + 2)"');
+	assert.equal(queued.content[0].text.split("Output:\n")[1], "43");
+	// :quit stops the current source script, as in native :script; it must
+	// neither execute the remaining source nor prevent driver completion.
+	await f.send("let pi_before_quit = 11\n:quit\nlet pi_after_quit = 12");
+	assert.equal((await f.send("print pi_before_quit")).content[0].text.split("Output:\n")[1], "11");
+	assert.match((await f.send("print pi_after_quit")).content[0].text.split("Output:\n")[1], /not in scope/);
+	assert.equal((await f.send(":set +m\nlet pi_auto =\n      17\n\nprint pi_auto")).content[0].text.split("Output:\n")[1], "17");
+	assert.equal((await f.send("print pi_auto")).content[0].text.split("Output:\n")[1], "17");
+	assert.equal(readdirSync(process.env.PI_REPL_CONTROL_ROOT).length, 0);
+});
 
 test("java echoes only one loader command per send in every display mode", {
 	timeout: 60000, skip: !(optionalRuntimes.has("all") || optionalRuntimes.has("java")),
@@ -591,22 +666,24 @@ test("java driver stops with an explicit /exit and releases both files and its l
 	assert.equal((await f.status()).details.java.running, false);
 });
 
-test("java refuses line breaks in command paths before submission and releases its lease", {
-	timeout: 30000, skip: !(optionalRuntimes.has("all") || optionalRuntimes.has("java")),
-}, async (t) => {
-	const f = await fixture(t, { runtime: "java", controlName: "controls\ninvalid" });
-	if (!f) return;
-	const recordId = (await f.status()).details.java.recordId;
-	const callsBefore = f.calls.length;
-	await assert.rejects(f.send("System.out.println(42);"), /JShell control paths cannot contain line breaks/);
-	assert.equal(f.calls.slice(callsBefore).some((call) => call.args[0] === "paste-buffer"), false);
-	assert.equal(readdirSync(process.env.PI_REPL_CONTROL_ROOT).length, 0);
-	const lease = await acquireReplSessionSendLease(recordId, { waitMs: 0 });
-	await lease.release();
-});
+for (const runtime of ["ghci", "java"]) {
+	test(`${runtime} refuses line breaks in command paths before submission and releases its lease`, {
+		timeout: 30000, skip: !(optionalRuntimes.has("all") || optionalRuntimes.has(runtime)),
+	}, async (t) => {
+		const f = await fixture(t, { runtime, controlName: "controls\ninvalid" });
+		if (!f) return;
+		const recordId = (await f.status()).details[runtime].recordId;
+		const callsBefore = f.calls.length;
+		await assert.rejects(f.send(runtime === "java" ? "System.out.println(42);" : "print 42"), /control paths cannot contain line breaks/);
+		assert.equal(f.calls.slice(callsBefore).some((call) => call.args[0] === "paste-buffer"), false);
+		assert.equal(readdirSync(process.env.PI_REPL_CONTROL_ROOT).length, 0);
+		const lease = await acquireReplSessionSendLease(recordId, { waitMs: 0 });
+		await lease.release();
+	});
+}
 
-for (const runtime of ["ruby", "java"]) {
-	for (const mode of ["timeout", "abort"]) {
+for (const runtime of ["ghci", "ruby", "java"]) {
+	for (const mode of (runtime === "ghci" ? ["timeout", "abort", "session-ended"] : ["timeout", "abort"])) {
 		test(`${runtime} ${mode} holds the lease until code actually finishes`, {
 			timeout: 60000, skip: !(optionalRuntimes.has("all") || optionalRuntimes.has(runtime)),
 		}, async (t) => {
@@ -614,14 +691,18 @@ for (const runtime of ["ruby", "java"]) {
 			if (!f) return;
 			const recordId = (await f.status()).details[runtime].recordId;
 			const abort = new AbortController();
-			if (mode === "abort") f.onEnter(() => abort.abort());
-			const slow = runtime === "ruby" ? 'sleep 2.5\nputs "late result"' : 'Thread.sleep(2500);\nSystem.out.println("late result");';
-			await assert.rejects(f.send(slow, { timeoutMs: 1000 }, abort.signal), mode === "abort" ? /aborted/ : /Timed out waiting/);
+			if (mode !== "timeout") f.onEnter(() => abort.abort());
+			const slow = { ruby: 'sleep 2.5\nputs "late result"', java: 'Thread.sleep(2500);\nSystem.out.println("late result");', ghci: `Control.Concurrent.threadDelay ${mode === "session-ended" ? 30000000 : 2500000} >> putStrLn "late result"` }[runtime];
+			await assert.rejects(f.send(slow, { timeoutMs: 1000 }, abort.signal), mode !== "timeout" ? /aborted/ : /Timed out waiting/);
 			f.onEnter(undefined);
 			await assert.rejects(acquireReplSessionSendLease(recordId, { waitMs: 0 }), /busy/);
-			const retained = readdirSync(process.env.PI_REPL_CONTROL_ROOT).filter((file) => file.endsWith(runtime === "ruby" ? ".rb" : ".java"));
-			assert.equal(retained.length, runtime === "java" ? 2 : 1);
+			const retained = readdirSync(process.env.PI_REPL_CONTROL_ROOT).filter((file) => file.endsWith({ ruby: ".rb", java: ".java", ghci: ".ghci" }[runtime]));
+			assert.equal(retained.length, { ruby: 1, java: 2, ghci: 3 }[runtime]);
 			for (const file of retained) assert.equal(statSync(join(process.env.PI_REPL_CONTROL_ROOT, file)).mode & 0o777, 0o600);
+			if (mode === "session-ended") {
+				await f.tmux("kill-session", "-t", f.sessionName);
+				await f.tmux("new-session", "-d", "-s", f.sessionName, "sleep 60");
+			}
 			await eventually(async () => {
 				try {
 					const lease = await acquireReplSessionSendLease(recordId, { waitMs: 0 });
@@ -633,9 +714,11 @@ for (const runtime of ["ruby", "java"]) {
 				}
 			});
 			assert.equal(readdirSync(process.env.PI_REPL_CONTROL_ROOT).length, 0);
-			const next = await f.send(runtime === "ruby" ? 'puts "next request"' : 'System.out.println("next request");');
-			assert.match(next.content[0].text, /next request/);
-			assert.doesNotMatch(next.content[0].text, /late result/);
+			if (mode !== "session-ended") {
+				const next = await f.send({ ruby: 'puts "next request"', java: 'System.out.println("next request");', ghci: 'putStrLn "next request"' }[runtime]);
+				assert.match(next.content[0].text, /next request/);
+				assert.doesNotMatch(next.content[0].text, /late result/);
+			}
 		});
 	}
 }

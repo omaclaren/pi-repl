@@ -1173,7 +1173,8 @@ function buildRControlSource(code: string, doneFile: string, display: ReplSubmis
 	].join("\n");
 }
 
-function buildGhciControlSource(code: string, display: ReplSubmissionDisplay): string {
+function buildGhciControlSource(code: string, doneFile: string, display: ReplSubmissionDisplay): string {
+	if (/[\r\n]/.test(doneFile)) throw new Error("GHCi control paths cannot contain line breaks.");
 	const prefix = display.enabled
 		? display.prefixLines.map((line) => `:! command printf '%s\\n' ${shellQuote(line)}`)
 		: [];
@@ -1236,6 +1237,26 @@ function buildRubyControlSource(code: string, doneFile: string, display: ReplSub
 		"ensure",
 		...completion,
 		`  File.write(${rubyStringLiteral(doneFile)}, "done\\n")`,
+		// IRB checks echo? immediately after evaluating the loader. Suppress
+		// just that result, restoring the original method before returning.
+		"  begin",
+		"    if __pi_repl_context && __pi_repl_context.respond_to?(:echo?)",
+		"      __pi_repl_echo_owner = __pi_repl_context.singleton_class",
+		"      __pi_repl_echo_owned = __pi_repl_echo_owner.instance_methods(false).include?(:echo?)",
+		"      __pi_repl_echo_original = __pi_repl_context.method(:echo?)",
+		"      __pi_repl_context.define_singleton_method(:echo?) do",
+		"        if __pi_repl_echo_owned",
+		"          __pi_repl_echo_owner.send(:define_method, :echo?, __pi_repl_echo_original)",
+		"        else",
+		"          __pi_repl_echo_owner.send(:remove_method, :echo?)",
+		"        end",
+		"        false",
+		"      end",
+		"    end",
+		"  rescue StandardError",
+		// If a customised/frozen context refuses the hook, keep normal IRB
+		// behaviour rather than fail the already completed submission.
+		"  end",
 		"end",
 	].join("\n");
 }
@@ -1271,7 +1292,7 @@ function buildClojureControlSource(code: string, doneFile: string, display: Repl
 function buildReplControlSource(runtime: ImplementedRuntime, code: string, doneFile: string, display: ReplSubmissionDisplay): string {
 	if (runtime === "julia") return buildJuliaControlSource(code, doneFile, display);
 	if (runtime === "r") return buildRControlSource(code, doneFile, display);
-	if (runtime === "ghci") return buildGhciControlSource(code, display);
+	if (runtime === "ghci") return buildGhciControlSource(code, doneFile, display);
 	if (runtime === "clojure") return buildClojureControlSource(code, doneFile, display);
 	if (runtime === "ruby") return buildRubyControlSource(code, doneFile, display);
 	if (runtime === "java") return buildJavaControlSource(code, doneFile, display);
@@ -1338,10 +1359,16 @@ function buildJavaDriverSource(sourceFile: string, doneFile: string, display: Re
 
 function buildReplCompletionLine(runtime: ImplementedRuntime, doneFile: string, display: ReplSubmissionDisplay): string | undefined {
 	if (runtime === "ghci") {
-		// Keep this at the interactive top level: unlike JShell, an unfinished
-		// :{ block in a nested :script can abort the outer script too, skipping
-		// its completion command and leaving a live session's send lease held.
-		const displayCommand = display.enabled ? `command printf '%s\\n' ${shellQuote(display.endMarker)}; ` : "";
+		// Run from the outer driver, after the guard has absorbed a source
+		// script failure. Node is already used by the raw-history pipe; its
+		// bounded cursor query avoids both blank padding and inline footers.
+		const footerScript = [
+			'let column = "";',
+			'try { column = require("node:child_process").execFileSync("tmux", ["-N", "display-message", "-p", "-t", process.env.TMUX_PANE, "#{cursor_x}"], { encoding: "utf8", timeout: 500, killSignal: "SIGKILL", maxBuffer: 128, stdio: ["ignore", "pipe", "ignore"] }).trim(); } catch {}',
+			`process.stdout.write((column === "0" ? "" : "\\n") + ${JSON.stringify(`${display.endMarker}\n`)});`,
+		].join(" ");
+		const fallback = `command printf '\\n%s\\n' ${shellQuote(display.endMarker)}`;
+		const displayCommand = display.enabled ? `${shellQuote(process.execPath)} -e ${shellQuote(footerScript)} 2>/dev/null || ${fallback}; ` : "";
 		return `:! ${displayCommand}touch ${shellQuote(doneFile)}`;
 	}
 	return undefined;
@@ -1355,7 +1382,7 @@ function prepareReplControlFiles(
 	runtime: ImplementedRuntime,
 	code: string,
 	details: { submissionId: string; echoMode: ReplSubmissionEchoMode },
-): { controlPaths: ReplControlPaths; driverPaths?: ReplControlPaths; submissionLine: string; completionLine?: string; previewComment?: string; submissionText: string; display: ReplSubmissionDisplay } {
+): { controlPaths: ReplControlPaths; guardPaths?: ReplControlPaths; driverPaths?: ReplControlPaths; submissionLine: string; completionLine?: string; previewComment?: string; submissionText: string; display: ReplSubmissionDisplay } {
 	const display = createReplSubmissionDisplay({
 		entryId: details.submissionId,
 		origin: "pi-repl",
@@ -1367,8 +1394,25 @@ function prepareReplControlFiles(
 		extension: getReplControlExtension(runtime),
 		buildSource: ({ doneFile }: ReplControlPaths) => buildReplControlSource(runtime, code, doneFile, display),
 	});
+	let guardPaths: ReplControlPaths | undefined;
 	let driverPaths: ReplControlPaths | undefined;
 	try {
+		if (runtime === "ghci") {
+			// An unclosed :{ throws out of source collection. The guard's
+			// command handler catches it and its script stops normally, letting
+			// the OUTER driver continue to completion. Two levels alone fail.
+			const guard = createPrivateReplControlFiles({
+				...REPL_CONTROL_OPTIONS,
+				extension: "ghci",
+				buildSource: () => buildReplSubmissionLine("ghci", controlPaths.sourceFile) + "\n",
+			});
+			guardPaths = guard;
+			driverPaths = createPrivateReplControlFiles({
+				...REPL_CONTROL_OPTIONS,
+				extension: "ghci",
+				buildSource: () => [buildReplSubmissionLine("ghci", guard.sourceFile), buildReplCompletionLine("ghci", controlPaths.doneFile, display), ""].join("\n"),
+			});
+		}
 		// JShell echoes only the outer /open. Its nested source load returns
 		// before completion, even if user source is rejected or unfinished.
 		if (runtime === "java") {
@@ -1379,10 +1423,11 @@ function prepareReplControlFiles(
 			});
 		}
 		const submissionLine = buildReplSubmissionLine(runtime, driverPaths?.sourceFile ?? controlPaths.sourceFile);
-		const completionLine = buildReplCompletionLine(runtime, controlPaths.doneFile, display);
+		const completionLine = driverPaths ? undefined : buildReplCompletionLine(runtime, controlPaths.doneFile, display);
 		const previewComment = undefined;
 		return {
 			controlPaths,
+			guardPaths,
 			driverPaths,
 			submissionLine,
 			completionLine,
@@ -1392,6 +1437,7 @@ function prepareReplControlFiles(
 		};
 	} catch (error) {
 		cleanupPrivateReplControlFiles(controlPaths);
+		cleanupPrivateReplControlFiles(guardPaths);
 		cleanupPrivateReplControlFiles(driverPaths);
 		throw error;
 	}
@@ -1526,7 +1572,6 @@ function cleanupReplDelta(delta: string, submissionLine: string, previewComment?
 		if (
 			!last ||
 			(completionLine ? last.includes(completionLine) : false) ||
-			(submissionLine.startsWith("load ") && /^=>\s*nil$/.test(last)) ||
 			/^>>>\s*$/.test(last) ||
 			/^In \[\d+\]:\s*$/.test(last) ||
 			/^\s*\.\.\.:\s*$/.test(last) ||
@@ -1772,6 +1817,7 @@ async function runReplCode(
 		const delta = extractPaneDelta(beforeCapture, afterCapture);
 		const output = cleanupReplDelta(delta, prepared.submissionLine, prepared.previewComment, prepared.completionLine, prepared.display);
 		cleanupPrivateReplControlFiles(prepared.controlPaths);
+		cleanupPrivateReplControlFiles(prepared.guardPaths);
 		cleanupPrivateReplControlFiles(prepared.driverPaths);
 
 		return {
@@ -1791,6 +1837,7 @@ async function runReplCode(
 		if (existsSync(prepared.controlPaths.doneFile)) submissionState.completionObserved = true;
 		if (!submissionStarted || submissionState.completionObserved) {
 			cleanupPrivateReplControlFiles(prepared.controlPaths);
+			cleanupPrivateReplControlFiles(prepared.guardPaths);
 			cleanupPrivateReplControlFiles(prepared.driverPaths);
 		} else if (!options.onSubmissionStarted) {
 			retainReplSubmissionUntilSettled(pi, submissionState, null);
@@ -1840,6 +1887,7 @@ function retainReplSubmissionUntilSettled(
 			}
 		} finally {
 			cleanupPrivateReplControlFiles(state.prepared.controlPaths);
+			cleanupPrivateReplControlFiles(state.prepared.guardPaths);
 			cleanupPrivateReplControlFiles(state.prepared.driverPaths);
 			await lease?.release().catch(() => undefined);
 		}
@@ -1965,6 +2013,7 @@ async function runRecordedReplCode(
 			retainReplSubmissionUntilSettled(pi, submissionState, lease);
 		} else {
 			cleanupPrivateReplControlFiles(submissionState?.prepared.controlPaths);
+			cleanupPrivateReplControlFiles(submissionState?.prepared.guardPaths);
 			cleanupPrivateReplControlFiles(submissionState?.prepared.driverPaths);
 			await lease.release().catch(() => undefined);
 		}

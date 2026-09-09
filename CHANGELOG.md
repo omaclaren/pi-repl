@@ -18,7 +18,8 @@ All notable changes to `pi-repl` are documented here.
 ### Changed
 - Separate the loader command from a compact Summary/Full block with one leading blank line, rather than padding between input and output. Keep Off, program-printed blank lines, clean captured output and existing markers unchanged.
 - Remove unconditional Ruby/Java footer padding using a bounded, read-only tmux cursor query. Preserve newline separation for unterminated stdout/stderr, fall back safely if the query fails, and leave output streams and Ruby's last child-process status intact.
-- Retain GHCi's separate completion command: an unfinished `:{ … :}` block in a nested script can skip an outer driver's completion. Add malformed-input/recovery coverage so this cannot regress into a held send lease.
+- Hide GHCi's separate completion echo behind a source/guard/driver arrangement. The intermediate guard handles unfinished multiline input without skipping completion or running it ahead of queued user code. Retain all three private scripts through timeout/abort and clean them up on settlement or session exit.
+- Suppress only Ruby's redundant loader-result echo with a one-use IRB predicate, restoring normal manual echo and custom predicates immediately. Preserve legitimate user-printed `=> nil` output instead of stripping it as control noise.
 - Show only one Java `/open` command in the raw pane by loading source and signalling completion through a single outer driver. Keep the user source in its own file so compilation errors and incomplete input cannot absorb the completion step.
 
 ## [0.4.2] — 2026-09-09

@@ -136,7 +136,7 @@ Notes:
 
 ### Ruby and Java submissions
 
-Ruby requires `irb` on PATH. Submissions evaluate in the active IRB workspace, so variables and definitions are shared between agent sends and code you type directly. The last non-`nil` result is printed. Source, paths and previews are encoded without prematurely expanding Ruby interpolation.
+Ruby requires `irb` on PATH. Submissions evaluate in the active IRB workspace, so variables and definitions are shared between agent sends and code you type directly. The last non-`nil` result is printed. A one-use IRB echo check suppresses only the loader's redundant `nil` result, restoring the original check before returning; manual expressions, manual `nil`, and the configured echo preference behave normally. User-printed `=> nil` text remains output. Source, paths and previews are encoded without prematurely expanding Ruby interpolation.
 
 Java requires a JDK with `jshell` on PATH. Submissions use JShell's native `/open` command: imports, variables, methods and classes remain available across sends and direct terminal input. **Use `System.out.println(...)` for visible results**; `/open` executes bare expressions but does not echo their values. For example:
 
@@ -165,13 +165,15 @@ Pane echo, enabled in Summary mode by default, places one blank line before the 
 
 Use `/repl echo off|summary|full` to change the default for the current Pi process, or set `PI_REPL_ECHO_MODE` before startup. A per-send `echoMode` overrides that default without changing it. **Summary** is the startup default: it shows short submissions in full, truncates after 6 lines or 600 source characters, and puts a plain output divider before runtime output. **Off** disables the optional display and alignment anchors for quiet output, although the REPL can still echo its unavoidable temporary-file control command. **Full** is an explicit opt-in that raises the bounds to 40 lines or 4,000 source characters. Terminal, line-separator, and bidirectional control characters are escaped in all visible previews.
 
-Ruby and Java use a read-only tmux cursor-column query, with a short timeout, to avoid adding an empty row before `done` while still separating it from output that has no trailing newline. If that query is unavailable, they fall back to the safe newline guard. Output streams and interactive echo settings are not replaced.
+GHCi, Ruby and Java use a read-only tmux cursor-column query, with a short timeout, to avoid adding an empty row before `done` while still separating it from output that has no trailing newline. If that query is unavailable, they fall back to the safe newline guard. Output streams and interactive echo settings are not replaced.
 
 Both Summary and Full persist the displayed source in raw terminal history. Off suppresses this extra copy, not the submitted code already retained in tool results and the clean record. Explicit `PI_REPL_ECHO_MODE=off` settings are still honoured.
 
 Runtime wrappers use compact request-unique paths such as `/tmp/pi-rc-<user-key>/<token>.py` instead of fixed global files such as `/tmp/pr.py`. The per-user root is current-user-owned mode `0700`, source files are mode `0600`, and files are removed after capture or by the timeout/abort watcher once execution settles. The short command remains readable while separate Pi processes, tmux servers, runtimes, and Studio sends cannot overwrite one another's control files.
 
-GHCi retains a separate `:! … touch …` completion command. Unlike JShell, a nested GHCi `:script` with an unfinished `:{ … :}` block can abort an outer driver too, skipping its completion step. Keeping completion at the interactive top level lets malformed submissions report their error and release the send lease.
+GHCi shows only the initial `:script` command. Three private scripts separate user source, an intermediate guard, and the outer completion driver. An unfinished `:{ … :}` block can stop a single nested driver; the guard absorbs that script failure so the outer driver still reaches completion. User source is not repaired or rewritten, queued user commands still finish first, and all three files remain private and retained until execution settles. GHCi control paths cannot contain line breaks.
+
+Ruby's one-use echo check preserves an existing singleton `echo?` method as well as ordinary IRB settings. If an unusual customised or frozen context refuses the hook, the wrapper keeps normal IRB behaviour rather than failing the submission.
 
 These anchors are presentation and alignment evidence only. They do not make direct attached-pane input authoritative and never promote inferred raw history into protocol-v1 entries.
 
