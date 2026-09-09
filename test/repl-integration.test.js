@@ -150,7 +150,7 @@ test("Summary is the default pane display; command and per-send overrides still 
 	assert.doesNotMatch(result.content[0].text, /──|│/);
 	const historyPath = (await f.status()).details.python.historyPath;
 	await eventually(() => readFileSync(historyPath, "utf8").includes(`── done · ${result.details.submissionAnchorId} ──`));
-	assert.match(readFileSync(historyPath, "utf8"), /│ for i in range\(1, 6\):\n│     print\(i\)\n\n── output ──\n1\n2\n3\n4\n5/);
+	assert.match(readFileSync(historyPath, "utf8"), /\n\n── pi-repl · [a-f0-9]{12} · 2 lines ──\n│ for i in range\(1, 6\):\n│     print\(i\)\n── output ──\n1\n2\n3\n4\n5\n── done/);
 
 	const quiet = await f.send("print('quiet')", { echoMode: "off" });
 	assert.equal(quiet.details.echoMode, "off");
@@ -313,6 +313,8 @@ for (const [runtime, code, errorCode] of runtimeCases) {
 		const f = await fixture(t, { index: 1, runtime });
 		if (!f) return;
 		for (const echoMode of ["off", "summary", "full"]) {
+			// Exercise both wrapped and unwrapped R loader echoes.
+			if (runtime === "r" && echoMode === "full") await f.tmux("resize-window", "-t", `${f.sessionName}:^`, "-x", "320");
 			const result = await f.send(code, { echoMode });
 			const pane = await f.tmux("capture-pane", "-p", "-J", "-t", `${f.sessionName}:^`, "-S", "-80");
 			assert.match(result.content[0].text.split("Output:\n")[1], /42/, pane);
@@ -321,7 +323,12 @@ for (const [runtime, code, errorCode] of runtimeCases) {
 				const begin = `── pi-repl · ${result.details.submissionAnchorId} ·`;
 				assert.ok(pane.includes(begin), pane);
 				const latest = pane.slice(pane.lastIndexOf(begin));
-				assert.match(latest, /│[^\n]*\n\n── output ──\n/, latest);
+				assert.match(latest, /│[^\n]*\n── output ──\n/, latest);
+				// -J joins soft-wrapped rows, including an empty row after a
+				// wrapped R loader. Check physical rows for visual spacing.
+				const physical = await f.tmux("capture-pane", "-p", "-t", `${f.sessionName}:^`, "-S", "-150");
+				assert.match(physical.slice(0, physical.lastIndexOf(begin)), /\n\n$/, physical);
+				if (runtime !== "ghci") assert.doesNotMatch(latest, /\n\n── done/, latest);
 			} else {
 				assert.doesNotMatch(pane, /── pi-repl|── output ──|── done/);
 			}
@@ -442,6 +449,68 @@ test("ruby preserves interpolation, literal hashes, Unicode, escapes and error r
 	assert.match((await f.send('puts "recovered"')).content[0].text, /Output:\nrecovered/);
 	assert.equal(readdirSync(process.env.PI_REPL_CONTROL_ROOT).length, 0);
 });
+
+for (const runtime of ["ruby", "java"]) {
+	test(`${runtime} compact display preserves non-newline output and user blank lines`, {
+		timeout: 60000, skip: !(optionalRuntimes.has("all") || optionalRuntimes.has(runtime)),
+	}, async (t) => {
+		const f = await fixture(t, { runtime, index: 1 });
+		if (!f) return;
+		const cases = [
+			['puts "42"', 'System.out.println("42");', "42\n"],
+			['print "no newline"', 'System.out.print("no newline");', "no newline\n"],
+			['$stderr.print "stderr tail"', 'System.err.print("stderr tail");', "stderr tail\n"],
+			['print "λ 🧪"', 'System.out.print("λ 🧪");', "λ 🧪\n"],
+			[`print "${"x".repeat(80)}"`, `System.out.print("${"x".repeat(80)}");`, "x".repeat(80) + "\n"],
+			['print "first\\n\\nlast\\n\\n"', 'System.out.print("first\\n\\nlast\\n\\n");', "first\n\nlast\n\n"],
+			['nil', ';', ""],
+		];
+		for (const echoMode of ["summary", "full"]) {
+			for (const [ruby, java, expected] of cases) {
+				const result = await f.send(runtime === "ruby" ? ruby : java, { echoMode });
+				assert.equal(result.content[0].text.split("Output:\n")[1], expected.trim() || "(no output)");
+				const pane = await f.tmux("capture-pane", "-p", "-J", "-t", `${f.sessionName}:^`, "-S", "-1000");
+				const begin = `── pi-repl · ${result.details.submissionAnchorId} ·`;
+				const latest = pane.slice(pane.lastIndexOf(begin));
+				assert.match(pane.slice(0, pane.lastIndexOf(begin)), /\n\n$/, pane);
+				const bodyStart = latest.indexOf("── output ──\n") + "── output ──\n".length;
+				const bodyEnd = latest.lastIndexOf(`── done · ${result.details.submissionAnchorId} ──`);
+				assert.equal(latest.slice(bodyStart, bodyEnd), expected, latest);
+			}
+		}
+		if (runtime === "ruby") {
+			await f.send('system("sh", "-c", "exit 7")');
+			const status = await f.send('puts "child status: #{$?.exitstatus}"');
+			assert.equal(status.content[0].text.split("Output:\n")[1], "child status: 7");
+		}
+		assert.equal(readdirSync(process.env.PI_REPL_CONTROL_ROOT).length, 0);
+	});
+
+	for (const failure of ["unavailable", "timeout"]) {
+		test(`${runtime} footer falls back safely when its cursor query is ${failure}`, {
+			timeout: 30000, skip: !(optionalRuntimes.has("all") || optionalRuntimes.has(runtime)),
+		}, async (t) => {
+			const f = await fixture(t, { runtime });
+			if (!f) return;
+			const realTmux = binary("tmux");
+			const pidPath = join(f.cwd, "query.pid");
+			// Only the runtime's own query sees TMUX_PANE. Harness calls still
+			// reach the real tmux on this fixture's isolated server.
+			writeFileSync(join(f.cwd, "bin", "tmux"), `#!/bin/sh\nif [ -n "\${TMUX_PANE:-}" ]; then\n  echo $$ > ${quote(pidPath)}\n  ${failure === "timeout" ? 'exec /bin/sleep 10' : 'exit 23'}\nfi\nexec ${quote(realTmux)} "$@"\n`, { mode: 0o700 });
+			const result = await f.send(runtime === "ruby" ? 'print "query fallback"' : 'System.out.print("query fallback");', { timeoutMs: 4000 });
+			assert.equal(result.content[0].text.split("Output:\n")[1], "query fallback");
+			const pane = await f.tmux("capture-pane", "-p", "-J", "-t", `${f.sessionName}:^`, "-S", "-80");
+			assert.match(pane, /── output ──\nquery fallback\n── done/);
+			const pid = Number(readFileSync(pidPath, "utf8").trim());
+			assert.ok(Number.isSafeInteger(pid) && pid > 0);
+			await eventually(() => {
+				try { process.kill(pid, 0); return false; }
+				catch (error) { if (error.code === "ESRCH") return true; throw error; }
+			});
+			assert.equal(readdirSync(process.env.PI_REPL_CONTROL_ROOT).length, 0);
+		});
+	}
+}
 
 test("java echoes only one loader command per send in every display mode", {
 	timeout: 60000, skip: !(optionalRuntimes.has("all") || optionalRuntimes.has("java")),

@@ -121,7 +121,7 @@ export function createReplSubmissionDisplay(details = {}) {
 		outputMarker,
 		endMarker,
 		previewLines,
-		prefixLines: enabled ? [beginMarker, ...previewLines, "", outputMarker] : [],
+		prefixLines: enabled ? ["", beginMarker, ...previewLines, outputMarker] : [],
 	};
 }
 
@@ -200,7 +200,11 @@ export function stripReplSubmissionDisplay(output, display) {
 	if (!display || display.enabled !== true) return value;
 	const begin = findExactDisplayLine(value, display.beginMarker);
 	if (begin) {
-		const beginIndex = begin.index;
+		// Remove only our single leading blank line, not the loader's newline
+		// or any additional output whitespace. Older unpadded captures still work.
+		const leadingGap = display.prefixLines[0] === "" && begin.index > 0 &&
+			value[begin.index - 1] === "\n" && (begin.index === 1 || value[begin.index - 2] === "\n");
+		const beginIndex = begin.index - (leadingGap ? 1 : 0);
 		const afterBegin = value.slice(begin.end);
 		const outputDivider = display.outputMarker
 			? findExactDisplayLine(afterBegin, display.outputMarker)
@@ -214,8 +218,9 @@ export function stripReplSubmissionDisplay(output, display) {
 		} else {
 			// If the runtime disappears mid-prefix, remove only contiguous exact
 			// request lines and preserve any different error text after them.
-			let suffixStart = beginIndex;
-			for (const line of display.prefixLines) {
+			let suffixStart = begin.index;
+			const prefixLines = display.prefixLines[0] === "" ? display.prefixLines.slice(1) : display.prefixLines;
+			for (const line of prefixLines) {
 				const next = consumeExactDisplayLine(value, suffixStart, line);
 				if (next === null) break;
 				suffixStart = next;

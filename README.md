@@ -161,9 +161,11 @@ Existing sessions attach lazily. Unsupported versions and invalid or stale sessi
 
 ### Submission display and alignment anchors
 
-Pane echo, enabled in Summary mode by default, places submitted code after a compact begin anchor, followed by one blank line, a plain `── output ──` divider and a completion anchor. Output starts directly below its divider; the extra spacing is display-only and does not change submitted code or captured output. The anchors contain a stable 12-character hash derived from the Shared REPL Record entry ID, allowing known sends to be aligned in future derived transcripts without exposing the entry ID itself. `repl_send` removes the exact header, source preview, divider, and footer from captured output and the clean record, while they remain in raw pane history.
+Pane echo, enabled in Summary mode by default, places one blank line before the compact begin anchor, separating the runtime loader command from the readable block. Submitted code, the plain `── output ──` divider, output and the completion anchor then follow without added internal padding. Blank lines printed by user code remain in the raw pane; display spacing does not change submitted code or clean captured output. The anchors contain a stable 12-character hash derived from the Shared REPL Record entry ID, allowing known sends to be aligned in future derived transcripts without exposing the entry ID itself. `repl_send` removes the exact header, source preview, divider, and footer from captured output and the clean record, while they remain in raw pane history.
 
 Use `/repl echo off|summary|full` to change the default for the current Pi process, or set `PI_REPL_ECHO_MODE` before startup. A per-send `echoMode` overrides that default without changing it. **Summary** is the startup default: it shows short submissions in full, truncates after 6 lines or 600 source characters, and puts a plain output divider before runtime output. **Off** disables the optional display and alignment anchors for quiet output, although the REPL can still echo its unavoidable temporary-file control command. **Full** is an explicit opt-in that raises the bounds to 40 lines or 4,000 source characters. Terminal, line-separator, and bidirectional control characters are escaped in all visible previews.
+
+Ruby and Java use a read-only tmux cursor-column query, with a short timeout, to avoid adding an empty row before `done` while still separating it from output that has no trailing newline. If that query is unavailable, they fall back to the safe newline guard. Output streams and interactive echo settings are not replaced.
 
 Both Summary and Full persist the displayed source in raw terminal history. Off suppresses this extra copy, not the submitted code already retained in tool results and the clean record. Explicit `PI_REPL_ECHO_MODE=off` settings are still honoured.
 
@@ -281,7 +283,7 @@ The integration tests cover nonzero indexes, pane selection, session restarts, r
 
 `PI_REPL_CONTROL_ROOT` optionally overrides the private runtime-control directory; it must be current-user-owned mode `0700`. Tests set it to their temporary directory so even stale-file cleanup stays isolated. This does not change the shared-record protocol or Studio's control-file location.
 
-Before testing the checkout interactively, replace the npm package source with the absolute local repo path and restart Pi. Avoid loading both copies.
+Before testing the checkout interactively, replace the npm package source with the absolute local repo path and restart Pi. Avoid loading both copies. Restart Pi after changing imported shared JavaScript helpers too: `/reload` can retain those modules in the current Pi/Jiti loader. Leave tmux REPLs running to preserve their state.
 
 ## Acknowledgements
 

@@ -1189,7 +1189,40 @@ function rubyStringLiteral(value: string): string {
 
 function buildRubyControlSource(code: string, doneFile: string, display: ReplSubmissionDisplay): string {
 	const prefix = display.enabled ? display.prefixLines.map((line) => `  puts ${rubyStringLiteral(line)}`) : [];
-	const completion = display.enabled ? [`  puts ${rubyStringLiteral(`\n${display.endMarker}`)}`] : ["  puts"];
+	// Query the actual terminal column rather than intercepting user stdout.
+	// Keep the old newline guard if the bounded, read-only query is unavailable.
+	const completion = display.enabled ? [
+		'  __pi_repl_column = ""',
+		"  begin",
+		"    $stdout.flush",
+		"    $stderr.flush",
+		// Ruby's $? is thread-local: do not replace the user's last child status.
+		"    __pi_repl_column = Thread.new do",
+		"      begin",
+		`        IO.popen(["tmux", "-N", "display-message", "-p", "-t", ENV.fetch("TMUX_PANE"), ${rubyStringLiteral("#{cursor_x}")}], err: File::NULL) do |__pi_repl_query|`,
+		"          begin",
+		"            if IO.select([__pi_repl_query], nil, nil, 0.5)",
+		"              __pi_repl_bytes = __pi_repl_query.read_nonblock(32, exception: false)",
+		'              __pi_repl_bytes.is_a?(String) ? __pi_repl_bytes.strip : ""',
+		"            else",
+		'              ""',
+		"            end",
+		"          ensure",
+		// Reap only our own query process, including on timeout; never leave an
+		// IO.popen close waiting indefinitely for a stuck tmux client to exit.
+		"            Process.kill('KILL', __pi_repl_query.pid) rescue nil",
+		"          end",
+		"        end",
+		"      rescue StandardError",
+		'        ""',
+		"      end",
+		"    end.value",
+		"  rescue StandardError",
+		'    __pi_repl_column = ""',
+		"  end",
+		'  puts unless __pi_repl_column == "0"',
+		`  puts ${rubyStringLiteral(display.endMarker)}`,
+	] : ["  puts"];
 	return [
 		"begin",
 		...prefix,
@@ -1269,7 +1302,31 @@ function buildReplSubmissionLine(runtime: ImplementedRuntime, sourceFile: string
 }
 
 function buildJavaDriverSource(sourceFile: string, doneFile: string, display: ReplSubmissionDisplay): string {
-	const completion = display.enabled ? [`  java.lang.System.out.println(${JSON.stringify(`\n${display.endMarker}`)});`] : [];
+	// Only add a newline when the terminal is mid-line. The scoped query does
+	// not replace System.out/err, change user declarations, or emit another /open.
+	const completion = display.enabled ? [
+		'  String __pi_repl_column = "";',
+		"  java.lang.Process __pi_repl_query = null;",
+		"  try {",
+		"    java.lang.System.out.flush();",
+		"    java.lang.System.err.flush();",
+		`    __pi_repl_query = new java.lang.ProcessBuilder("tmux", "-N", "display-message", "-p", "-t", java.lang.System.getenv("TMUX_PANE"), ${JSON.stringify("#{cursor_x}")}).redirectError(java.lang.ProcessBuilder.Redirect.DISCARD).start();`,
+		"    if (__pi_repl_query.waitFor(500, java.util.concurrent.TimeUnit.MILLISECONDS) && __pi_repl_query.exitValue() == 0) {",
+		// Do not wait for EOF if an unexpected descendant inherits the pipe.
+		"      byte[] __pi_repl_bytes = new byte[32];",
+		"      int __pi_repl_count = __pi_repl_query.getInputStream().read(__pi_repl_bytes, 0, Math.min(32, __pi_repl_query.getInputStream().available()));",
+		"      __pi_repl_column = new String(__pi_repl_bytes, 0, Math.max(0, __pi_repl_count), java.nio.charset.StandardCharsets.UTF_8).trim();",
+		"    }",
+		"  } catch (Exception __pi_repl_ignored) {",
+		'    __pi_repl_column = "";',
+		"  } finally {",
+		"    if (__pi_repl_query != null) {",
+		"      try { __pi_repl_query.destroyForcibly(); } catch (Exception __pi_repl_ignored) {}",
+		"    }",
+		"  }",
+		'  if (!"0".equals(__pi_repl_column)) java.lang.System.out.println();',
+		`  java.lang.System.out.println(${JSON.stringify(display.endMarker)});`,
+	] : [];
 	return [
 		buildReplSubmissionLine("java", sourceFile),
 		"{",
