@@ -158,7 +158,7 @@ async function fixture(t, { index = 0, runtime = "python", controlName, startWit
 }
 
 async function assertCompletionGap(f, result) {
-	const marker = `── done · ${result.details.submissionAnchorId} ──`;
+	const marker = `── done · id: ${result.details.submissionAnchorId} ──`;
 	let physical = "";
 	await eventually(async () => {
 		physical = await f.tmux("capture-pane", "-p", "-t", `${f.sessionName}:^`, "-S", "-150");
@@ -270,6 +270,23 @@ test("ghci production stop verifies a busy runtime exits and releases retained c
 	assert.equal(readdirSync(process.env.PI_REPL_CONTROL_ROOT).length, 0);
 });
 
+test("plain source containing the output divider survives narrow-pane display cleanup", { timeout: 30000 }, async (t) => {
+	const f = await fixture(t);
+	if (!f) return;
+	await f.tmux("resize-window", "-t", `${f.sessionName}:^`, "-x", "48");
+	const code = 'pi_literal = """first\n── output ──\n│ literal pipe\nlast"""\nprint(pi_literal)';
+	const expected = "first\n── output ──\n│ literal pipe\nlast";
+	for (const echoMode of ["summary", "full"]) {
+		const result = await f.send(code, { echoMode });
+		assert.equal(result.content[0].text.split("Output:\n")[1], expected);
+		const record = readReplSessionRecord((await f.status()).details.python.recordId);
+		assert.equal(record.entries.at(-1).output, expected);
+		const pane = await f.tmux("capture-pane", "-p", "-J", "-t", `${f.sessionName}:^`, "-S", "-150");
+		assert.ok(pane.includes(`── pi-repl · input · 5 lines · id: ${result.details.submissionAnchorId} ──\n${code}\n── output ──`), pane);
+		await assertCompletionGap(f, result);
+	}
+});
+
 test("Summary is the default pane display; command and per-send overrides still work", { timeout: 30000 }, async (t) => {
 	const f = await fixture(t);
 	if (!f) return;
@@ -283,8 +300,8 @@ test("Summary is the default pane display; command and per-send overrides still 
 	assert.match(result.content[0].text, /Output:\n1\n2\n3\n4\n5/);
 	assert.doesNotMatch(result.content[0].text, /──|│/);
 	const historyPath = (await f.status()).details.python.historyPath;
-	await eventually(() => readFileSync(historyPath, "utf8").includes(`── done · ${result.details.submissionAnchorId} ──`));
-	assert.match(readFileSync(historyPath, "utf8"), /\n\n── pi-repl · [a-f0-9]{12} · 2 lines ──\n│ for i in range\(1, 6\):\n│     print\(i\)\n── output ──\n1\n2\n3\n4\n5\n── done/);
+	await eventually(() => readFileSync(historyPath, "utf8").includes(`── done · id: ${result.details.submissionAnchorId} ──`));
+	assert.match(readFileSync(historyPath, "utf8"), /\n\n── pi-repl · input · 2 lines · id: [a-f0-9]{12} ──\nfor i in range\(1, 6\):\n    print\(i\)\n── output ──\n1\n2\n3\n4\n5\n── done/);
 
 	const quiet = await f.send("print('quiet')", { echoMode: "off" });
 	assert.equal(quiet.details.echoMode, "off");
@@ -606,10 +623,10 @@ for (const [runtime, code, errorCode] of runtimeCases) {
 			assert.match(result.content[0].text.split("Output:\n")[1], /42/, pane);
 			assert.doesNotMatch(result.content[0].text, /──|│/);
 			if (echoMode !== "off") {
-				const begin = `── pi-repl · ${result.details.submissionAnchorId} ·`;
+				const begin = `── pi-repl · input · 2 lines · id: ${result.details.submissionAnchorId} ──`;
 				assert.ok(pane.includes(begin), pane);
 				const latest = pane.slice(pane.lastIndexOf(begin));
-				assert.match(latest, /│[^\n]*\n── output ──\n/, latest);
+				assert.ok(latest.startsWith(`${begin}\n${code}\n── output ──\n`), latest);
 				// -J joins soft-wrapped rows, including an empty row after a
 				// wrapped R loader. Check physical rows for visual spacing.
 				const physical = await f.tmux("capture-pane", "-p", "-t", `${f.sessionName}:^`, "-S", "-150");
@@ -674,7 +691,7 @@ for (const runtime of ["ruby", "java"]) {
 			assert.equal(status.recordEntries.length, 3);
 			assert.equal(status.recordEntries.at(-1).status, "captured");
 			assert.match(status.recordEntries.at(-1).output, /51/);
-			await eventually(() => readFileSync(firstHistory, "utf8").includes(`── done · ${shared.details.submissionAnchorId} ──`));
+			await eventually(() => readFileSync(firstHistory, "utf8").includes(`── done · id: ${shared.details.submissionAnchorId} ──`));
 			await f.repl(`status ${runtime}`);
 			assert.match(f.notifications.at(-1).message, /session is running/);
 			await f.repl(`attach ${runtime}`);
@@ -776,11 +793,11 @@ for (const runtime of ["ghci", "ruby", "java"]) {
 				const result = await f.send({ ruby, java, ghci }[runtime], { echoMode });
 				assert.equal(result.content[0].text.split("Output:\n")[1], expected.trim() || "(no output)");
 				const pane = await f.tmux("capture-pane", "-p", "-J", "-t", `${f.sessionName}:^`, "-S", "-1000");
-				const begin = `── pi-repl · ${result.details.submissionAnchorId} ·`;
+				const begin = `── pi-repl · input · 1 line · id: ${result.details.submissionAnchorId} ──`;
 				const latest = pane.slice(pane.lastIndexOf(begin));
 				assert.match(pane.slice(0, pane.lastIndexOf(begin)), /\n\n$/, pane);
 				const bodyStart = latest.indexOf("── output ──\n") + "── output ──\n".length;
-				const bodyEnd = latest.lastIndexOf(`── done · ${result.details.submissionAnchorId} ──`);
+				const bodyEnd = latest.lastIndexOf(`── done · id: ${result.details.submissionAnchorId} ──`);
 				assert.equal(latest.slice(bodyStart, bodyEnd), expected, latest);
 			}
 		}
@@ -883,7 +900,7 @@ test("ghci echoes one loader only and completes after queued code", {
 		const pane = await f.tmux("capture-pane", "-p", "-J", "-t", `${f.sessionName}:^`, "-S", "-1000");
 		assert.equal((pane.match(/^ghci> :script /gm) || []).length, sends, pane);
 		assert.doesNotMatch(pane, /^ghci> :!|^ghci> :cmd/m);
-		if (echoMode !== "off") await eventually(() => readFileSync(historyPath, "utf8").includes(`── done · ${result.details.submissionAnchorId} ──`));
+		if (echoMode !== "off") await eventually(() => readFileSync(historyPath, "utf8").includes(`── done · id: ${result.details.submissionAnchorId} ──`));
 	}
 	assert.equal((readFileSync(historyPath, "utf8").match(/^ghci> :script /gm) || []).length, sends);
 	// Normal queued commands must finish before completion; a :cmd queue
@@ -914,8 +931,8 @@ test("java echoes only one loader command per send in every display mode", {
 		const pane = await f.tmux("capture-pane", "-p", "-J", "-t", `${f.sessionName}:^`, "-S", "-1000");
 		assert.equal((pane.match(/^jshell> \/open /gm) || []).length, sends, pane);
 		if (echoMode !== "off") {
-			assert.ok(pane.includes(`── done · ${result.details.submissionAnchorId} ──`));
-			await eventually(() => readFileSync(historyPath, "utf8").includes(`── done · ${result.details.submissionAnchorId} ──`));
+			assert.ok(pane.includes(`── done · id: ${result.details.submissionAnchorId} ──`));
+			await eventually(() => readFileSync(historyPath, "utf8").includes(`── done · id: ${result.details.submissionAnchorId} ──`));
 		} else {
 			assert.doesNotMatch(pane, /── pi-repl|── done/);
 		}

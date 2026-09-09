@@ -67,24 +67,24 @@ Canonical Markdown exports identify origin, mode, status, runtime, and timestamp
 
 ## Optional raw-history display and alignment anchors
 
-Compatible clients may add protocol-independent submission displays to the raw pane while retaining the same clean record. Display version 1 derives a non-secret 12-hex-character anchor as the first 12 characters of SHA-256 over `pi-repl-submission-display-v1`, a NUL byte, and the stable clean-record entry ID. The entry ID itself is not written to the pane.
+Compatible clients may add protocol-independent submission displays to the raw pane while retaining the same clean record. Display version 1 derives a non-secret 12-hex-character anchor as the first 12 characters of SHA-256 over `pi-repl-submission-display-v1`, a NUL byte, and the stable clean-record entry ID. The entry ID itself is not written to the pane. The short hash is labelled `id:` in both the input and completion markers; it is a correlation aid, not an execution signal. The hash derivation and record protocol remain unchanged.
 
 Echo defaults are client preferences, not protocol requirements. `pi-repl` defaults to **Summary**, which shows a short submission in full, truncating after 6 source lines or 600 source characters. **Off** writes no optional display or alignment anchors. Explicit opt-in **Full** raises the bounds to 40 lines or 4,000 characters. Both Summary and Full persist their source preview in raw terminal history; Off does not remove code from the clean record. Other clients, including older installations, may default to Off without affecting interoperability. Display text normalizes newlines and tabs, removes trailing display whitespace, and escapes terminal, line-separator, and bidirectional control characters.
 
 ```text
 <runtime loader command>
 
-── pi-repl · a1b2c3d4e5f6 · 2 lines ──
-│ x = 1
-│ x + 1
+── pi-repl · input · 2 lines · id: a1b2c3d4e5f6 ──
+x = 1
+x + 1
 ── output ──
 2
-── done · a1b2c3d4e5f6 ──
+── done · id: a1b2c3d4e5f6 ──
 
 <runtime prompt>
 ```
 
-The compact submitted and completion anchors remain in raw tmux history for human readability and deterministic future alignment. A plain unanchored `── output ──` divider separates the source preview from runtime output without repeating the ID or other metadata. `pi-repl` inserts one display-only blank line before the begin anchor and after the completion anchor in Summary and Full modes, with no internal padding. The trailing gap is removed from clean output along with the exact final anchor; additional user whitespace is preserved. Native prompt spacing is not changed. Existing histories with different display spacing remain compatible. Clients remove the exact request-specific header, source preview, divider, and footer from captured tool output and clean-record output. These markers are presentation metadata, not clean-record authority: missing, malformed, duplicated, or user-produced marker-like text must never cause inferred raw activity to be promoted silently into protocol-v1 entries.
+The compact submitted and completion anchors remain in raw tmux history for human readability and deterministic future alignment. A plain unanchored `── output ──` divider separates the source preview from runtime output without repeating the ID or other metadata. `pi-repl` inserts one display-only blank line before the begin anchor and after the completion anchor in Summary and Full modes, with no internal padding. The trailing gap is removed from clean output along with the exact final anchor; additional user whitespace is preserved. Native prompt spacing is not changed. Input previews are plain code without an added vertical bar. Cleanup matches the known preview before its output divider, including retained line wraps, so marker-looking lines inside source are not mistaken for real boundaries. Existing histories with different spacing, bar-prefixed source, unlabelled compact IDs or earlier three-marker displays remain readable. Clients remove the exact request-specific header, source preview, divider, and footer from captured tool output and clean-record output. These markers are presentation metadata, not clean-record authority: missing, malformed, duplicated, or user-produced marker-like text must never cause inferred raw activity to be promoted silently into protocol-v1 entries.
 
 ## Runtime control files (outside protocol v1)
 

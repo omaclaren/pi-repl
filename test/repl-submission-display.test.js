@@ -28,7 +28,7 @@ test("submission displays default to summary and preserve explicit modes and fal
 	const display = createReplSubmissionDisplay({ entryId: "default", origin: "pi-repl", code: "print(42)" });
 	assert.equal(display.mode, "summary");
 	assert.equal(display.enabled, true);
-	assert.deepEqual(display.previewLines, ["│ print(42)"]);
+	assert.deepEqual(display.previewLines, ["print(42)"]);
 	assert.deepEqual(display.prefixLines, ["", display.beginMarker, ...display.previewLines, display.outputMarker]);
 });
 
@@ -56,9 +56,9 @@ test("summary displays use stable compact anchors, a plain output divider, and f
 	assert.equal(first.anchorId, "206df80d2327");
 	assert.equal(first.anchorId, same.anchorId);
 	assert.notEqual(first.anchorId, other.anchorId);
-	assert.match(first.beginMarker, /^── pi-studio · [a-f0-9]{12} · 2 lines ──$/);
-	assert.equal(first.endMarker, `── done · ${first.anchorId} ──`);
-	assert.deepEqual(first.previewLines, ["│ x = 1", "│ print(x)"]);
+	assert.match(first.beginMarker, /^── pi-studio · input · 2 lines · id: [a-f0-9]{12} ──$/);
+	assert.equal(first.endMarker, `── done · id: ${first.anchorId} ──`);
+	assert.deepEqual(first.previewLines, ["x = 1", "print(x)"]);
 	assert.equal(first.outputMarker, "── output ──");
 	assert.deepEqual(first.prefixLines, ["", first.beginMarker, ...first.previewLines, first.outputMarker]);
 });
@@ -70,7 +70,7 @@ test("visible displays have one leading and trailing blank line with no internal
 			assert.deepEqual(display.prefixLines, ["", display.beginMarker, ...display.previewLines, display.outputMarker]);
 			assert.deepEqual(display.suffixLines, [display.endMarker, ""]);
 			assert.match(display.prefixLines.join("\n"), /^\n── pi ·/);
-			assert.match(display.prefixLines.join("\n"), /│[^\n]*\n── output ──$/);
+			assert.match(display.prefixLines.join("\n"), /[^\n]*\n── output ──$/);
 			const output = "\n42\n\n";
 			const capture = display.prefixLines.join("\n") + "\n" + output + display.endMarker;
 			assert.equal(stripReplSubmissionDisplay(capture, display), output);
@@ -132,6 +132,11 @@ test("display markers have a strict machine-readable form", () => {
 		anchorId: display.anchorId,
 		legacy: true,
 	});
+	assert.deepEqual(parseReplSubmissionDisplayMarker(`── pi-studio · ${display.anchorId} · 2 lines ──`), parseReplSubmissionDisplayMarker(display.beginMarker));
+	assert.deepEqual(parseReplSubmissionDisplayMarker(`── done · ${display.anchorId} ──`), parseReplSubmissionDisplayMarker(display.endMarker));
+	assert.equal(parseReplSubmissionDisplayMarker(`── pi-studio · input · 2 line · id: ${display.anchorId} ──`), null);
+	assert.equal(parseReplSubmissionDisplayMarker(`── pi-studio · input · 99999999999999999999 lines · id: ${display.anchorId} ──`), null);
+	assert.equal(parseReplSubmissionDisplayMarker(`── pi-studio · input · 2 lines · id: not-hex ──`), null);
 	assert.equal(parseReplSubmissionDisplayMarker(`prompt> ${display.endMarker}`), null);
 	assert.equal(parseReplSubmissionDisplayMarker(`── pi-studio · ${display.anchorId} · 2 line ──`), null);
 	assert.equal(parseReplSubmissionDisplayMarker(`── pi-studio · ${display.anchorId} · 99999999999999999999 lines ──`), null);
@@ -144,9 +149,9 @@ test("summary previews are adaptive but bounded by lines and code points", () =>
 		code: `${"😀".repeat(REPL_SUBMISSION_SUMMARY_MAX_CHARS + 50)}\nsecond`,
 		mode: "summary",
 	});
-	assert.equal(Array.from(longLine.previewLines[0].slice(2)).length, REPL_SUBMISSION_SUMMARY_MAX_CHARS);
+	assert.equal(Array.from(longLine.previewLines[0]).length, REPL_SUBMISSION_SUMMARY_MAX_CHARS);
 	assert.match(longLine.previewLines[0], /…$/);
-	assert.equal(longLine.previewLines[1], "│ … preview truncated; 2 lines total");
+	assert.equal(longLine.previewLines[1], "… preview truncated; 2 lines total");
 
 	const manyLines = createReplSubmissionDisplay({
 		entryId: "many-summary-lines",
@@ -155,18 +160,18 @@ test("summary previews are adaptive but bounded by lines and code points", () =>
 		mode: "summary",
 	});
 	assert.equal(manyLines.previewLines.length, REPL_SUBMISSION_SUMMARY_MAX_LINES + 1);
-	assert.equal(manyLines.previewLines[0], "│ line_1");
+	assert.equal(manyLines.previewLines[0], "line_1");
 	assert.match(manyLines.previewLines.at(-1), /preview truncated; 9 lines total/);
 });
 
-test("display previews normalize trailing whitespace and blank lines", () => {
+test("plain previews preserve indentation and internal blanks without added bars", () => {
 	const display = createReplSubmissionDisplay({
 		entryId: "whitespace",
 		origin: "pi-repl",
-		code: "x = 1   \n   \nprint(x)\n",
+		code: "if True:   \n    x = 1\n   \n\tprint(x)\n",
 		mode: "summary",
 	});
-	assert.deepEqual(display.previewLines, ["│ x = 1", "│", "│ print(x)"]);
+	assert.deepEqual(display.previewLines, ["if True:", "    x = 1", "", "    print(x)"]);
 });
 
 test("full displays escape terminal controls and stay bounded", () => {
@@ -185,7 +190,7 @@ test("full displays escape terminal controls and stay bounded", () => {
 		code: "x".repeat(REPL_SUBMISSION_FULL_MAX_CHARS + 100),
 		mode: "full",
 	});
-	assert.equal(Array.from(longLine.previewLines[0].slice(2)).length, REPL_SUBMISSION_FULL_MAX_CHARS);
+	assert.equal(Array.from(longLine.previewLines[0]).length, REPL_SUBMISSION_FULL_MAX_CHARS);
 	assert.match(longLine.previewLines[0], /…$/);
 	assert.match(longLine.previewLines[1], /preview truncated/);
 });
@@ -215,17 +220,38 @@ test("capture cleanup removes only the compact source display and final anchor",
 	);
 });
 
-test("the output divider makes cleanup resilient to altered source-preview wrapping", () => {
+test("known plain preview text can be cleaned across retained terminal wraps", () => {
 	const display = createReplSubmissionDisplay({ entryId: "wrapped", origin: "pi-repl", code: "print('hello')", mode: "summary" });
 	const capture = [
 		display.beginMarker,
-		"│ print('hel",
+		"print('hel",
 		"lo')",
 		display.outputMarker,
 		"hello",
 		display.endMarker,
 	].join("\n");
 	assert.equal(stripReplSubmissionDisplay(capture, display), "hello\n");
+});
+
+test("marker-looking unprefixed source is not confused with the actual output divider", () => {
+	for (const mode of ["summary", "full"]) {
+		const code = 'text = """first\n── output ──\n│ literal pipe\nlast"""\nprint(text)';
+		const display = createReplSubmissionDisplay({ entryId: "source-marker", code, mode });
+		const output = "first\n── output ──\n│ literal pipe\nlast\n";
+		const capture = [...display.prefixLines, output + display.suffixLines.join("\n"), "prompt>"].join("\n");
+		assert.equal(stripReplSubmissionDisplay(capture, display), output + "prompt>");
+	}
+	const display = createReplSubmissionDisplay({ entryId: "wrapped-marker", code: "before── output ──after" });
+	const capture = [display.beginMarker, "before", display.outputMarker, "after", display.outputMarker, "real output", display.endMarker].join("\n");
+	assert.equal(stripReplSubmissionDisplay(capture, display), "real output\n");
+});
+
+test("old bar-prefixed displays still strip with their original metadata", () => {
+	const current = createReplSubmissionDisplay({ entryId: "old-style", code: "print(42)" });
+	const beginMarker = `── pi · ${current.anchorId} · 1 line ──`;
+	const endMarker = `── done · ${current.anchorId} ──`;
+	const old = { ...current, beginMarker, endMarker, previewLines: ["│ print(42)"], prefixLines: ["", beginMarker, "│ print(42)", current.outputMarker], suffixLines: [endMarker, ""] };
+	assert.equal(stripReplSubmissionDisplay([...old.prefixLines, "42", ...old.suffixLines, "prompt>"].join("\n"), old), "42\nprompt>");
 });
 
 test("incomplete prefixes are removed without swallowing following error text", () => {

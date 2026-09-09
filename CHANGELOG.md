@@ -7,6 +7,7 @@ All notable changes to `pi-repl` are documented here.
 ## [0.6.0] — 2026-09-10
 
 ### Changed
+- Show plain input previews without added vertical bars. Label the header `input`, put the line count before `id: <short hash>`, and label the matching completion ID too. Keep hash derivation and old-marker parsing compatible; match the known preview so marker-looking source lines are not confused with output.
 - Add a blank line after the `done` anchor in Summary/Full mode across all REPLs, balancing the leading loader separator. Leave Off and native prompt settings unchanged; strip only the added display gap from clean output, preserving user whitespace and older captures.
 
 ### Added
