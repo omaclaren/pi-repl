@@ -63,11 +63,12 @@ test("summary displays use stable compact anchors, a plain output divider, and f
 	assert.deepEqual(first.prefixLines, ["", first.beginMarker, ...first.previewLines, first.outputMarker]);
 });
 
-test("visible displays have one leading blank line and no internal padding", () => {
+test("visible displays have one leading and trailing blank line with no internal padding", () => {
 	for (const mode of ["summary", "full"]) {
 		for (const code of ["", "print(42)", "first\n\nlast\n", "long\n".repeat(50)]) {
 			const display = createReplSubmissionDisplay({ entryId: "spacing", code, mode });
 			assert.deepEqual(display.prefixLines, ["", display.beginMarker, ...display.previewLines, display.outputMarker]);
+			assert.deepEqual(display.suffixLines, [display.endMarker, ""]);
 			assert.match(display.prefixLines.join("\n"), /^\n── pi ·/);
 			assert.match(display.prefixLines.join("\n"), /│[^\n]*\n── output ──$/);
 			const output = "\n42\n\n";
@@ -77,6 +78,28 @@ test("visible displays have one leading blank line and no internal padding", () 
 			assert.equal(stripReplSubmissionDisplay("loader\n\n" + capture, display), "loader\n\n" + output);
 		}
 	}
+});
+
+test("cleanup removes exactly the new footer separator and preserves surrounding user whitespace", () => {
+	for (const mode of ["summary", "full"]) {
+		const display = createReplSubmissionDisplay({ entryId: "footer-gap", code: "print(42)", mode });
+		for (const output of ["", "42\n", "\nfirst\n\nlast\n\n", `${display.endMarker}\n\nuser text\n`]) {
+			for (const tail of ["", "prompt>", "\n\nafter completion\n"]) {
+				const capture = display.prefixLines.join("\n") + "\n" + output + display.suffixLines.join("\n") + "\n" + tail;
+				assert.equal(stripReplSubmissionDisplay(capture, display), output + tail);
+				assert.equal(stripReplSubmissionDisplay(capture.replaceAll("\n", "\r\n"), display), output + tail);
+			}
+		}
+	}
+});
+
+test("old captures and display objects without suffix metadata remain compatible", () => {
+	const display = createReplSubmissionDisplay({ entryId: "old-footer", code: "1" });
+	const { suffixLines, ...oldDisplay } = display;
+	assert.equal(stripReplSubmissionDisplay(`42\n${display.endMarker}\nprompt>`, display), "42\nprompt>");
+	assert.equal(stripReplSubmissionDisplay(`42\n${display.endMarker}`, display), "42\n");
+	assert.equal(stripReplSubmissionDisplay(`42\n${display.endMarker}\n\nprompt>`, oldDisplay), "42\n\nprompt>");
+	assert.equal(stripReplSubmissionDisplay("42\n\nprompt>", display), "42\n\nprompt>");
 });
 
 test("display markers have a strict machine-readable form", () => {
@@ -173,6 +196,7 @@ test("off mode emits no optional display and leaves capture text unchanged", () 
 	assert.equal(display.enabled, false);
 	assert.deepEqual(display.previewLines, []);
 	assert.deepEqual(display.prefixLines, []);
+	assert.deepEqual(display.suffixLines, []);
 	assert.equal(stripReplSubmissionDisplay("loader\n2\nprompt", display), "loader\n2\nprompt");
 });
 

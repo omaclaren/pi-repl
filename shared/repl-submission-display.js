@@ -122,6 +122,7 @@ export function createReplSubmissionDisplay(details = {}) {
 		endMarker,
 		previewLines,
 		prefixLines: enabled ? ["", beginMarker, ...previewLines, outputMarker] : [],
+		suffixLines: enabled ? [endMarker, ""] : [],
 	};
 }
 
@@ -190,9 +191,14 @@ function findExactDisplayLine(value, line, useLast = false) {
 	return null;
 }
 
-function removeMarkerLine(value, marker, useLast = false) {
+function removeMarkerLine(value, marker, useLast = false, trailingGap = false) {
 	const found = findExactDisplayLine(value, marker, useLast);
-	return found ? value.slice(0, found.index) + value.slice(found.end) : value;
+	if (!found) return value;
+	// Consume at most our one following blank line. Preserve user whitespace
+	// before the anchor and any additional blank lines after it; older captures
+	// without a separator (or without the new display field) still work.
+	const end = found.end + (trailingGap && value[found.end] === "\n" ? 1 : 0);
+	return value.slice(0, found.index) + value.slice(end);
 }
 
 export function stripReplSubmissionDisplay(output, display) {
@@ -228,5 +234,5 @@ export function stripReplSubmissionDisplay(output, display) {
 			value = value.slice(0, beginIndex) + value.slice(suffixStart);
 		}
 	}
-	return removeMarkerLine(value, display.endMarker, true);
+	return removeMarkerLine(value, display.endMarker, true, display.suffixLines?.at(-1) === "");
 }

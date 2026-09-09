@@ -4,6 +4,19 @@ All notable changes to `pi-repl` are documented here.
 
 ## [Unreleased]
 
+## [0.6.0] — 2026-09-10
+
+### Changed
+- Add a blank line after the `done` anchor in Summary/Full mode across all REPLs, balancing the leading loader separator. Leave Off and native prompt settings unchanged; strip only the added display gap from clean output, preserving user whitespace and older captures.
+
+### Added
+- Add separate Octave (`octave-cli`) and licensed MATLAB terminal sessions, with command/tool routing, prompt readiness, persistent base workspaces, records/exports and verified explicit stop. MATLAB starts without the desktop in Pi's working directory; neither runtime silently substitutes for the other.
+- Add private `.m` source/driver submissions with a function-local completion guard, preserving base variables and native `ans`/semicolon behaviour through error recovery, `clear all`, return and interruption. Keep Summary/Off/Full displays and controls/leases through timeout or abort; leave plotting native with explicit export.
+- Add isolated Octave/MATLAB checks for direct input, Unicode/private paths, scripts/functions, cwd/path changes, clearing, interruption, exit, startup reuse and shutdown, plus optional headless figure export and portable routing/readiness/encoding tests.
+
+### Fixed
+- Record Ruby and Java submissions with their actual runtime instead of incorrectly falling through to the Python runtime label. Use the same explicit runtime selection for all non-Python targets.
+
 ## [0.5.0] — 2026-09-09
 
 ### Added

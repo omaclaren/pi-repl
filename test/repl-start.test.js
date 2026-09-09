@@ -19,6 +19,7 @@ const runtimes = [
 	["python", "python", ">>>"], ["ipython", "ipython", "In [1]:"],
 	["julia", "julia", "julia>"], ["r", "R", ">"], ["ghci", "ghci", "ghci>"],
 	["clojure", "clojure", "user=>"], ["ruby", "irb", "irb(main):001:0>"], ["java", "jshell", "jshell>"],
+	["octave", "octave-cli --quiet --interactive", "octave:1>"], ["matlab", "matlab -nodesktop -nosplash", ">>"],
 ];
 
 function fixture({ runtime = "python", exists = false, prompt = ">>>", ...options } = {}) {
@@ -89,7 +90,7 @@ for (const [runtime, executable, prompt] of runtimes) {
 		const launch = f.calls.find((call) => call.args[0] === "new-session");
 		assert.ok(launch.args.includes(f.state.sessionName));
 		assert.ok(launch.args.includes(root));
-		assert.match(launch.args.at(-1), new RegExp(` -i -l -c '${executable}'$`));
+		assert.match(launch.args.at(-1), new RegExp(` -i -l -c '${executable}${runtime === "matlab" ? " -sd " : "'$"}`));
 		const pipe = f.calls.find((call) => call.args[0] === "pipe-pane");
 		assert.ok(pipe.args.includes("%9"));
 		assert.ok(pipe.args.at(-1).includes(f.state.sessionName));
@@ -186,7 +187,7 @@ test("startup waits through a process/banner/continuation until a normal cursor-
 	assert.equal(f.calls.filter((call) => call.args[0] === "capture-pane" && call.args.includes("-E")).length, 3);
 });
 
-for (const [runtime, prompt] of [["python", ""], ["ruby", "irb(main):001:1>"], ["ruby", "irb(main):001:0*"], ["ghci", "ghci|"], ["java", "   ...>"], ["r", "+"], ["julia", "custom-prompt:"]]) {
+for (const [runtime, prompt] of [["python", ""], ["ruby", "irb(main):001:1>"], ["ruby", "irb(main):001:0*"], ["ghci", "ghci|"], ["java", "   ...>"], ["r", "+"], ["julia", "custom-prompt:"], ["octave", ">"], ["matlab", "K>>"], ["matlab", ">> unfinished"]]) {
 	test(`${runtime} unconfirmed prompt ${JSON.stringify(prompt)} times out without sending input or stopping`, async () => {
 		const f = fixture({ runtime, prompt, exists: true, tail: runtimes.find(([name]) => name === runtime)[2] });
 		const result = await f.start({ runtime, timeoutMs: 1000 });

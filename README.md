@@ -2,7 +2,7 @@
 
 Minimal [pi](https://github.com/badlogic/pi-mono) extension for collaborative REPL sessions using tmux.
 
-`pi-repl` starts a shared Python, IPython, Julia, R, Haskell (GHCi), Clojure, Ruby (irb), or Java (JShell) REPL in tmux that you can attach to from another terminal window. You can work in the REPL directly, or ask pi to send and execute code there.
+`pi-repl` starts a shared Python, IPython, Julia, R, Haskell (GHCi), Clojure, Ruby (irb), Java (JShell), Octave, or MATLAB REPL in tmux that you can attach to from another terminal window. You can work in the REPL directly, or ask pi to send and execute code there.
 
 ![Interacting with a shared Julia REPL](./shared-julia-repl.png)
 
@@ -10,7 +10,7 @@ Minimal [pi](https://github.com/badlogic/pi-mono) extension for collaborative RE
 
 ## Current scope
 
-Currently, `pi-repl` supports **Python/IPython**, **Julia**, **R**, **Haskell (GHCi)**, **Clojure**, **Ruby (irb)**, and **Java (JShell)**.
+Currently, `pi-repl` supports **Python/IPython**, **Julia**, **R**, **Haskell (GHCi)**, **Clojure**, **Ruby (irb)**, **Java (JShell)**, **Octave**, and **MATLAB**.
 
 With `pi-repl` you can:
 
@@ -20,7 +20,7 @@ With `pi-repl` you can:
 - ask pi, in natural language, to run code in any supported shared REPL
 - start, attach to, inspect, and stop a shared R REPL
 - start, attach to, inspect, and stop a shared Haskell (GHCi) REPL
-- start, attach to, inspect, and stop a shared Clojure, Ruby, or Java REPL
+- start, attach to, inspect, and stop a shared Clojure, Ruby, Java, Octave, or MATLAB REPL
 - let pi read the raw shared REPL transcript for extra context when needed
 - keep a bounded clean record of compatible-client submissions and captured output, synchronized automatically with a compatible `pi-studio` using the same tmux session
 - show bounded, request-specific submitted code and compact alignment anchors in the raw pane by default, with Summary previews, Off for quiet output, and Full as an explicit opt-in
@@ -61,6 +61,8 @@ Restart pi after installing.
 | `/repl clojure` | Start the shared Clojure session with `clojure` |
 | `/repl ruby` | Start the shared Ruby session with `irb` |
 | `/repl java` | Start the shared Java session with `jshell` |
+| `/repl octave` | Start the shared Octave session with `octave-cli` |
+| `/repl matlab` | Start the shared MATLAB terminal session |
 | `/lab python` | Same as `/repl python` |
 | `/lab ipython` | Same as `/repl ipython` |
 | `/lab julia` | Same as `/repl julia` |
@@ -69,6 +71,8 @@ Restart pi after installing.
 | `/lab clojure` | Same as `/repl clojure` |
 | `/lab ruby` | Same as `/repl ruby` |
 | `/lab java` | Same as `/repl java` |
+| `/lab octave` | Same as `/repl octave` |
+| `/lab matlab` | Same as `/repl matlab` |
 | `/repl echo` | Show the current submitted-code pane-echo mode |
 | `/repl echo off` | Disable submitted-code displays and raw-history anchors for new sends |
 | `/repl echo summary` | Show short submissions in full, truncating after 6 lines or 600 source characters, with compact anchors (default) |
@@ -81,6 +85,8 @@ Restart pi after installing.
 | `/repl status clojure` | Show status for the shared Clojure session |
 | `/repl status ruby` | Show status for the shared Ruby session |
 | `/repl status java` | Show status for the shared Java session |
+| `/repl status octave` | Show status for the shared Octave session |
+| `/repl status matlab` | Show status for the shared MATLAB session |
 | `/repl env` | Show which interpreter and environment the shared Python/IPython REPL is using |
 | `/repl attach` | Show how to attach from a new terminal window |
 | `/repl attach julia` | Show how to attach to the shared Julia session |
@@ -89,6 +95,8 @@ Restart pi after installing.
 | `/repl attach clojure` | Show how to attach to the shared Clojure session |
 | `/repl attach ruby` | Show how to attach to the shared Ruby session |
 | `/repl attach java` | Show how to attach to the shared Java session |
+| `/repl attach octave` | Show how to attach to the shared Octave session |
+| `/repl attach matlab` | Show how to attach to the shared MATLAB session |
 | `/repl export` | Export the clean record when exactly one shared session is running |
 | `/repl export python` | Export the shared Python/IPython clean record as canonical Markdown |
 | `/repl export julia` | Export the shared Julia clean record as canonical Markdown |
@@ -97,6 +105,8 @@ Restart pi after installing.
 | `/repl export clojure` | Export the shared Clojure clean record as canonical Markdown |
 | `/repl export ruby` | Export the shared Ruby clean record as canonical Markdown |
 | `/repl export java` | Export the shared Java clean record as canonical Markdown |
+| `/repl export octave` | Export the shared Octave clean record as canonical Markdown |
+| `/repl export matlab` | Export the shared MATLAB clean record as canonical Markdown |
 | `/repl stop` | Stop the shared session if only one is running |
 | `/repl stop python` | Stop the shared Python/IPython session |
 | `/repl stop julia` | Stop the shared Julia session |
@@ -105,6 +115,8 @@ Restart pi after installing.
 | `/repl stop clojure` | Stop the shared Clojure session |
 | `/repl stop ruby` | Stop the shared Ruby session |
 | `/repl stop java` | Stop the shared Java session |
+| `/repl stop octave` | Stop the shared Octave session |
+| `/repl stop matlab` | Stop the shared MATLAB session |
 
 For R, both `/repl R` and `/repl r` work. The same applies to `/lab`, `/repl status`, `/repl attach`, `/repl export`, and `/repl stop`.
 
@@ -126,7 +138,8 @@ Notes:
 - while a shared REPL is running, `repl_status` exposes the versioned clean-record ID/path/count/tail and the separate raw session history path
 - pi can use the clean entries when it needs compatible-client code/output boundaries, or read the raw history for context about direct pane interaction
 - the relevant shared session must already be running and at a normal prompt before `repl_send`; it never auto-starts a missing session
-- you can ask pi naturally to run code in Python, IPython, Julia, R, Haskell, Clojure, Ruby, or Java; pi chooses the tool parameters internally
+- you can ask pi naturally to run code in Python, IPython, Julia, R, Haskell, Clojure, Ruby, Java, Octave, or MATLAB; pi chooses the tool parameters internally
+- use `target: octave` or `target: matlab` for their separate sessions; they never substitute for one another
 - `repl_status` and `repl_send` accept `target: ruby` or `target: irb`, and `target: java` or `target: jshell`; use the canonical `ruby` and `java` names in `/repl` commands and `repl_start`
 - for plain Python, `print(...)` is the safest way to get values back reliably
 - in Haskell (GHCi), use normal interactive syntax such as `let` bindings or `:{ ... :}` blocks for multiline declarations
@@ -143,7 +156,7 @@ Ask, for example, “Start a shared Ruby REPL.” Pi can call:
 { "runtime": "ruby", "timeoutMs": 20000 }
 ```
 
-`repl_start` requires `runtime`: `python`, `ipython`, `julia`, `r`, `ghci`, `clojure`, `ruby`, or `java`. It shares the `/repl` and `/lab` startup implementation: a detached tmux session, launched from Pi's working directory through your normal interactive login shell. It returns `created`/`reused`, `ready`, the requested and recorded runtimes, session status (including record/history paths), and an `attachCommand`. It does not open a terminal or attach a client automatically.
+`repl_start` requires `runtime`: `python`, `ipython`, `julia`, `r`, `ghci`, `clojure`, `ruby`, `java`, `octave`, or `matlab`. It shares the `/repl` and `/lab` startup implementation: a detached tmux session, launched from Pi's working directory through your normal interactive login shell. It returns `created`/`reused`, `ready`, the requested and recorded runtimes, session status (including record/history paths), and an `attachCommand`. It does not open a terminal or attach a client automatically.
 
 An existing session is reused without resetting variables, changing its working directory, replacing its history logger, or sending input. Python and IPython share `pi-repl-python`: requesting the other interpreter preserves the one already running and reports the difference. As with status inspection, legacy sessions can lazily acquire clean-record metadata; existing metadata is preserved.
 
@@ -166,6 +179,23 @@ Java uses one outer driver file to load the source and then signal completion. T
 
 Both runtimes support the same private logs, clean records, exports, Summary/Off/Full displays, and timeout/abort lease handling as the existing runtimes. As with the other REPLs, wait for a normal prompt before sending code; do not send while a person is entering an unfinished interactive expression.
 
+### Octave and MATLAB submissions
+
+Octave requires `octave-cli` on PATH and starts with `--quiet --interactive`. MATLAB requires a licensed installation with `matlab` on PATH; it starts with `-nodesktop -nosplash -sd <Pi working directory>`. These are separate persistent terminal sessions, not connections to an existing MATLAB desktop. Startup can take longer for MATLAB: request `repl_start` with `timeoutMs: 120000` if needed, and check `ready` before sending code.
+
+Code evaluates in the **base workspace**, shared with direct terminal input. Variables, native semicolon/`ans` behaviour, working-directory changes and search-path changes persist. For example, either runtime can run:
+
+```matlab
+A = [2 1; 1 2];
+disp(eig(A));
+```
+
+Send complete snippets. Run existing scripts or call functions on the current path; MATLAB function definitions belong in `.m` files rather than an `eval` submission. Syntax/runtime errors are printed and later sends can recover, but execution is not transactional: earlier effects are not undone. The completion guard lives outside the base workspace, so `clear`, `clear all`, `return` and Ctrl-C do not remove it. Clearing variables and ending the runtime with `exit` or `quit` are still deliberate state-changing actions. An exit may complete its guard before the pane closes, or be reported as a session-ended error.
+
+A private `.m` driver loads the code and records completion without adding helper variables or changing `ans` in the base workspace. Unicode, quoting and line breaks are encoded safely. Both runtimes use the existing records, exports, Summary/Off/Full displays, retained timeout/abort controls, and verified explicit stop. They recognise the ordinary `octave:N>` and `>>` prompts; custom/debugger prompts are not treated as ready. This adds runtime support to `pi-repl`, not new MATLAB/Octave controls to `pi-studio`.
+
+Graphics retain the runtime's normal behaviour and installed backends. Figures are not captured automatically. Export explicitly when needed, for example `print(gcf, 'figure.png', '-dpng')`. Headless Octave graphics depend on an appropriate toolkit; `octave-cli` does not repair a missing or broken Qt installation.
+
 ## Shared clean record
 
 `pi-repl` remains independently usable and has no dependency on `pi-studio`. When a compatible `pi-studio` uses the same tmux REPL session, both clients automatically discover one session-owned clean record and see each other's submitted code and captured output.
@@ -178,11 +208,11 @@ Existing sessions attach lazily. Unsupported versions and invalid or stale sessi
 
 ### Submission display and alignment anchors
 
-Pane echo, enabled in Summary mode by default, places one blank line before the compact begin anchor, separating the runtime loader command from the readable block. Submitted code, the plain `── output ──` divider, output and the completion anchor then follow without added internal padding. Blank lines printed by user code remain in the raw pane; display spacing does not change submitted code or clean captured output. The anchors contain a stable 12-character hash derived from the Shared REPL Record entry ID, allowing known sends to be aligned in future derived transcripts without exposing the entry ID itself. `repl_send` removes the exact header, source preview, divider, and footer from captured output and the clean record, while they remain in raw pane history.
+Pane echo, enabled in Summary mode by default, places one blank line before the compact begin anchor, separating the runtime loader command from the readable block. Submitted code, the plain `── output ──` divider, output and the completion anchor then follow without added internal padding. All runtimes add one display-only blank line after `done` too, separating the block from the returning prompt. Native prompt spacing is left unchanged. Blank lines printed by user code remain in the raw pane; display spacing does not change submitted code or clean captured output. The anchors contain a stable 12-character hash derived from the Shared REPL Record entry ID, allowing known sends to be aligned in future derived transcripts without exposing the entry ID itself. `repl_send` removes the exact header, source preview, divider, and footer from captured output and the clean record, while they remain in raw pane history.
 
 Use `/repl echo off|summary|full` to change the default for the current Pi process, or set `PI_REPL_ECHO_MODE` before startup. A per-send `echoMode` overrides that default without changing it. **Summary** is the startup default: it shows short submissions in full, truncates after 6 lines or 600 source characters, and puts a plain output divider before runtime output. **Off** disables the optional display and alignment anchors for quiet output, although the REPL can still echo its unavoidable temporary-file control command. **Full** is an explicit opt-in that raises the bounds to 40 lines or 4,000 source characters. Terminal, line-separator, and bidirectional control characters are escaped in all visible previews.
 
-GHCi, Ruby and Java use a read-only tmux cursor-column query, with a short timeout, to avoid adding an empty row before `done` while still separating it from output that has no trailing newline. If that query is unavailable, they fall back to the safe newline guard. Output streams and interactive echo settings are not replaced.
+GHCi, Ruby, Java, Octave and MATLAB use a read-only tmux cursor-column query, with a short timeout, to avoid adding an empty row before `done` while still separating it from output that has no trailing newline. If that query is unavailable, they fall back to the safe newline guard. Output streams and interactive echo settings are not replaced.
 
 Both Summary and Full persist the displayed source in raw terminal history. Off suppresses this extra copy, not the submitted code already retained in tool results and the clean record. Explicit `PI_REPL_ECHO_MODE=off` settings are still honoured.
 
@@ -205,6 +235,8 @@ The default shared tmux session names are:
 - `pi-repl-clojure` for Clojure
 - `pi-repl-ruby` for Ruby/irb
 - `pi-repl-java` for Java/JShell
+- `pi-repl-octave` for Octave
+- `pi-repl-matlab` for MATLAB
 
 Nonzero tmux `base-index` and `pane-base-index` settings are supported. `pi-repl` selects the lowest-indexed pane in the lowest-indexed window, then pins that pane's stable ID for each send so switching active windows cannot redirect its output capture.
 
@@ -305,9 +337,10 @@ To exercise all installed runtimes, or just a selected subset:
 PI_REPL_TEST_RUNTIMES=all npm test
 PI_REPL_TEST_RUNTIMES=julia,r npm run test:integration
 PI_REPL_TEST_RUNTIMES=ruby,java npm run test:integration
+PI_REPL_TEST_RUNTIMES=octave,matlab npm run test:integration
 ```
 
-The integration tests cover command/tool startup across runtimes, concurrent starts, state-preserving reuse, readiness timeout on unfinished direct input, nonzero indexes, pane selection, session restarts, raw-log permissions, clean records and exports, concurrent sends, timeout/abort leases, and runtime wrappers. Portable startup tests also cover explicit runtime validation, failures, cancellation, custom/continuation prompts, and bounded status output. Ruby/Java checks also cover shared direct input, interpolation, Unicode and quoted control paths, persistent declarations, malformed input and error recovery. Optional runtime tests are opt-in and skip missing executables. Julia tests resolve the existing juliaup-selected binary before isolating the test home.
+The integration tests cover command/tool startup across runtimes, concurrent starts, state-preserving reuse, readiness timeout on unfinished direct input, nonzero indexes, pane selection, session restarts, raw-log permissions, clean records and exports, concurrent sends, timeout/abort leases, and runtime wrappers. Portable startup tests also cover explicit runtime validation, failures, cancellation, custom/continuation prompts, and bounded status output. Ruby/Java checks also cover shared direct input, interpolation, Unicode and quoted control paths, persistent declarations, malformed input and error recovery. Octave/MATLAB checks cover base-workspace and direct-input persistence, `ans`, scripts/functions, cwd/path changes, Unicode, syntax/runtime errors, clearing, return, interruption, exit, retained controls and figure-file export where a non-windowed backend is available. MATLAB tests need a working licence; they isolate preferences and startup files without changing the installed licence. Optional runtime tests are opt-in and skip missing executables. Julia tests resolve the existing juliaup-selected binary before isolating the test home.
 
 Test launchers record PID/owner/start-time identities before executing a runtime. The test harness tracks server descendants and pane process groups across session replacement, then individually revalidates survivors before TERM/KILL cleanup. It never kills by executable name or signals a whole process group. The teardown hook is registered before launch, runs after setup failures too, verifies no owned runtime is still running, and removes its private socket directory only after successful cleanup. Regression tests cover ignored hangup/TERM, orphaned children, PID reuse, failed setup, and preservation of unrelated sessions. Production `/repl stop` tests independently verify runtime exit before test teardown, across all supported runtimes, including a busy GHCi session, resistant child processes, linked windows and same-name replacement races.
 

@@ -43,7 +43,7 @@ async function eventually(check, timeout = 15000) {
 
 async function fixture(t, { index = 0, runtime = "python", controlName, startWithTool = false, concurrentStart = false } = {}) {
 	if (!available) { t.skip("tmux is required for local integration tests"); return null; }
-	const command = runtime === "r" ? "R" : runtime === "python" ? "python3" : runtime === "ruby" ? "irb" : runtime === "java" ? "jshell" : runtime;
+	const command = runtime === "r" ? "R" : runtime === "python" ? "python3" : runtime === "ruby" ? "irb" : runtime === "java" ? "jshell" : runtime === "octave" ? "octave-cli" : runtime;
 	let executable = binary(command);
 	if (!executable) { t.skip(`${command} is not installed`); return null; }
 	if (runtime === "julia") {
@@ -65,8 +65,9 @@ async function fixture(t, { index = 0, runtime = "python", controlName, startWit
 		python: "-I -q -i", ipython: "--no-banner --no-confirm-exit --simple-prompt --HistoryManager.enabled=False",
 		julia: "--startup-file=no --history-file=no -i", r: "--vanilla --quiet", ghci: "-ignore-dot-ghci -v0", clojure: "",
 		ruby: "-f --noreadline", java: `-J-Duser.home=${quote(home)} -J-Djava.util.prefs.userRoot=${quote(join(home, "java-prefs"))}`,
+		octave: "--no-init-file --no-history --no-line-editing", matlab: "",
 	}[runtime];
-	const launcher = runtime === "r" ? "R" : runtime === "ruby" ? "irb" : runtime === "java" ? "jshell" : runtime;
+	const launcher = runtime === "r" ? "R" : runtime === "ruby" ? "irb" : runtime === "java" ? "jshell" : runtime === "octave" ? "octave-cli" : runtime;
 	// A distinct socket/server and empty config: never target the user's tmux.
 	const config = join(cwd, "tmux.conf");
 	writeFileSync(config, `set -g base-index ${index}\nset -g pane-base-index ${index}\nset -g history-limit 10000\nset -g default-shell /bin/sh\n`);
@@ -81,6 +82,12 @@ async function fixture(t, { index = 0, runtime = "python", controlName, startWit
 	delete env.JAVA_TOOL_OPTIONS;
 	delete env.JDK_JAVA_OPTIONS;
 	delete env._JAVA_OPTIONS;
+	if (runtime === "matlab") {
+		env.MATLAB_PREFDIR = join(home, "matlab-prefs");
+		delete env.MATLABPATH;
+		// Shadow a user startup script in this isolated working directory.
+		writeFileSync(join(cwd, "startup.m"), "");
+	}
 	const tmuxHarness = createTestTmux(t, { cwd, env, config });
 	writeFileSync(join(bin, launcher), `#!/bin/sh\n${tmuxHarness.launcherPrologue}exec ${quote(executable)} ${flags} "$@"\n`, { mode: 0o700 });
 	const calls = [];
@@ -137,7 +144,7 @@ async function fixture(t, { index = 0, runtime = "python", controlName, startWit
 		await repl(runtime);
 	}
 	assert.equal(notifications.some((n) => n.level === "error" || n.level === "warning"), false, JSON.stringify(notifications));
-	const prompt = { python: />>>/, ipython: /In \[\d+\]:/, julia: /julia>/, r: /(^|\n)>/, ghci: /ghci>/, clojure: /user=>/, ruby: /irb\(.*\).*?>/, java: /jshell>/ }[runtime];
+	const prompt = { python: />>>/, ipython: /In \[\d+\]:/, julia: /julia>/, r: /(^|\n)>/, ghci: /ghci>/, clojure: /user=>/, ruby: /irb\(.*\).*?>/, java: /jshell>/, octave: /octave:\d+>/, matlab: /(^|\n)>>/ }[runtime];
 	let startupOutput = "";
 	try {
 		await eventually(async () => {
@@ -148,6 +155,16 @@ async function fixture(t, { index = 0, runtime = "python", controlName, startWit
 		throw new Error(`${runtime} startup failed: ${startupOutput}`, { cause: error });
 	}
 	return { cwd, calls, notifications, tmux, sessionName, target, repl, send, status, start, onEnter: (callback) => { afterEnter = callback; }, onBeforeStop: (callback) => { beforeStop = callback; } };
+}
+
+async function assertCompletionGap(f, result) {
+	const marker = `── done · ${result.details.submissionAnchorId} ──`;
+	let physical = "";
+	await eventually(async () => {
+		physical = await f.tmux("capture-pane", "-p", "-t", `${f.sessionName}:^`, "-S", "-150");
+		const index = physical.lastIndexOf(marker);
+		return index >= 0 && physical.slice(index + marker.length).startsWith("\n\n");
+	}, 5000).catch((error) => { throw new Error(`Missing trailing display gap:\n${physical}`, { cause: error }); });
 }
 
 async function assertVerifiedStop(f) {
@@ -262,6 +279,7 @@ test("Summary is the default pane display; command and per-send overrides still 
 	const result = await f.send(code);
 	assert.equal(result.details.echoMode, "summary");
 	assert.ok(result.details.submissionAnchorId);
+	await assertCompletionGap(f, result);
 	assert.match(result.content[0].text, /Output:\n1\n2\n3\n4\n5/);
 	assert.doesNotMatch(result.content[0].text, /──|│/);
 	const historyPath = (await f.status()).details.python.historyPath;
@@ -278,7 +296,12 @@ test("Summary is the default pane display; command and per-send overrides still 
 		assert.equal((await f.send("print('one summary')", { echoMode: "summary" })).details.echoMode, "summary");
 		assert.equal((await f.send("print('still quiet')")).details.echoMode, "off");
 		await f.repl("echo full");
-		assert.equal((await f.send("print('explicit full')")).details.echoMode, "full");
+		const full = await f.send("print('explicit full')");
+		assert.equal(full.details.echoMode, "full");
+		await assertCompletionGap(f, full);
+		const failure = await f.send("raise ValueError('footer gap error')");
+		assert.match(failure.content[0].text, /ValueError: footer gap error/);
+		await assertCompletionGap(f, failure);
 	} finally {
 		await f.repl("echo summary");
 	}
@@ -458,6 +481,105 @@ for (const mode of ["timeout", "abort", "session-ended"]) {
 	});
 }
 
+for (const runtime of ["octave", "matlab"]) {
+	const options = { timeout: 90000, skip: !(optionalRuntimes.has("all") || optionalRuntimes.has(runtime)) };
+	test(`${runtime} preserves base workspace, ans, direct input, cwd/path and script/function semantics`, options, async (t) => {
+		const f = await fixture(t, { runtime, startWithTool: true, controlName: "m controls 'quotes' \\\u03bb" });
+		if (!f) return;
+		const output = async (code, extra = {}) => (await f.send(code, extra)).content[0].text.split("Output:\n")[1];
+		assert.equal((await output("pi_value=40; ans=123; pi_repl_error=17; pi_repl_guard=18; pi_repl_status=19; pi_repl_column='user';", { echoMode: "off" })).trim(), "(no output)");
+		await f.tmux("send-keys", "-t", `${f.sessionName}:^`, "-l", "pi_value=pi_value+2;");
+		await f.tmux("send-keys", "-t", `${f.sessionName}:^`, "Enter");
+		await eventually(async () => /(?:octave:\d+>|>>)\s*$/.test(await f.tmux("capture-pane", "-p", "-t", `${f.sessionName}:^`)));
+		assert.match(await output("fprintf('%d %d %d %d %d %s\\n',pi_value,ans,pi_repl_error,pi_repl_guard,pi_repl_status,pi_repl_column);"), /42 123 17 18 19 user/);
+		assert.match(await output("6*7"), /ans\s*=\s*42/);
+		assert.match(await output("fprintf('ans-now=%d\\n',ans);"), /ans-now=42/);
+		assert.match(await output("fprintf('λ 🧪 100%% \\n');"), /λ 🧪 100%/);
+		assert.match(await output("error('current-error')"), /current-error/);
+		const syntax = await output("if");
+		assert.match(syntax, /Error:|error:/);
+		assert.doesNotMatch(syntax, /current-error|uint8\(/);
+		assert.equal((await output("return; error('must-not-run')")).trim(), "(no output)");
+		const work = join(f.cwd, "work space λ");
+		mkdirSync(work);
+		writeFileSync(join(work, "pi_script.m"), "script_value=21;\n");
+		writeFileSync(join(work, "pi_twice.m"), "function y=pi_twice(x)\ny=2*x;\nend\n");
+		const mquote = (value) => `'${value.replaceAll("'", "''")}'`;
+		assert.doesNotMatch(await output(`cd(${mquote(work)}); addpath(${mquote(f.cwd)}); run('pi_script.m');`), /Error:/);
+		assert.match(await output("fprintf('function=%d\\n',pi_twice(script_value));"), /function=42/);
+		assert.match(await output(`fprintf('cwd=%d path=%d\\n',strcmp(pwd,${mquote(realpathSync(work))}),~isempty(strfind(path,${mquote(f.cwd)})));`), /cwd=1 path=1/);
+		assert.match(await output("clear all; final_value=42; fprintf('clear-done\\n');"), /clear-done/);
+		assert.match(await output("fprintf('survives=%d\\n',final_value); fprintf('names=%s\\n',strjoin(sort(who()),','));"), /survives=42\nnames=final_value/);
+		await f.repl(`export ${runtime}`);
+		const record = readReplSessionRecord((await f.status()).details[f.target].recordId);
+		assert.ok(record.entries.every((entry) => entry.runtime === runtime));
+		assert.match(readFileSync(join(f.cwd, readdirSync(f.cwd).find((name) => name.endsWith(".md"))), "utf8"), new RegExp('```' + runtime));
+		await assertVerifiedStop(f);
+	});
+
+	test(`${runtime} full display, unterminated output and optional figure export`, options, async (t) => {
+		const f = await fixture(t, { runtime });
+		if (!f) return;
+		const code = [...Array.from({ length: 12 }, (_, i) => `% comment ${i}`), "fprintf('no newline');"].join("\n");
+		const result = await f.send(code, { echoMode: "full" });
+		assert.equal(result.content[0].text.split("Output:\n")[1].trim(), "no newline");
+		const pane = await f.tmux("capture-pane", "-p", "-J", "-t", `${f.sessionName}:^`, "-S", "-200");
+		assert.match(pane, /no newline\n── done/);
+		const fallback = await f.send("pi_saved_path=getenv('PATH'); setenv('PATH','/missing-pi-test'); fprintf('fallback');");
+		assert.equal(fallback.content[0].text.split("Output:\n")[1].trim(), "fallback");
+		await f.send("setenv('PATH',pi_saved_path); clear pi_saved_path;");
+		let graphics = true;
+		if (runtime === "octave") {
+			graphics = /headless=1/.test((await f.send("fprintf('headless=%d\\n',any(strcmp(available_graphics_toolkits(),'gnuplot')));")).content[0].text);
+			if (graphics) assert.doesNotMatch((await f.send("graphics_toolkit('gnuplot');")).content[0].text.split("Output:\n")[1], /Error:/);
+		}
+		if (graphics) {
+			const image = join(f.cwd, "figure.png");
+			const result = await f.send(`figure('visible','off'); ${runtime === "octave" ? "graphics_toolkit(gcf,'gnuplot'); " : ""}plot(1:3,[1 4 9]); print(gcf,'${image}','-dpng'); close(gcf);`, { timeoutMs: 30000 });
+			assert.doesNotMatch(result.content[0].text.split("Output:\n")[1], /Error:/);
+			assert.deepEqual(readFileSync(image).subarray(0,8), Buffer.from([137,80,78,71,13,10,26,10]));
+		} else t.diagnostic("No gnuplot toolkit for invisible Octave figure export; native figure windows are not opened by this test.");
+		await assertVerifiedStop(f);
+	});
+
+	for (const mode of ["timeout", "abort", "interrupt", "exit"]) {
+		test(`${runtime} ${mode} settles controls and lease`, options, async (t) => {
+			const f = await fixture(t, { runtime });
+			if (!f) return;
+			const id = (await f.status()).details[f.target].recordId;
+			const abort = new AbortController();
+			if (mode === "abort") f.onEnter(() => abort.abort());
+			if (mode === "interrupt") f.onEnter(async () => {
+				await eventually(() => readdirSync(f.cwd).includes("started"));
+				await f.tmux("send-keys", "-t", `${f.sessionName}:^`, "C-c");
+			});
+			const code = mode === "exit" ? "exit" : `fclose(fopen('started','w')); pause(${mode === "interrupt" ? 30 : 2.5}); fprintf('settled\\n');`;
+			const request = f.send(code, { timeoutMs: mode === "timeout" ? 1000 : 15000 }, abort.signal);
+			if (mode === "interrupt") await request;
+			else if (mode === "exit") {
+				// MATLAB may run onCleanup before its pane closes. Either an
+				// observed completion or a session-ended error is valid here.
+				await request.catch((error) => assert.match(error.message, /session ended/));
+				await eventually(async () => !(await f.status()).details[f.target].running);
+			} else await assert.rejects(request, mode === "abort" ? /aborted/ : /Timed out/);
+			f.onEnter(undefined);
+			if (mode === "timeout" || mode === "abort") {
+				assert.ok(readdirSync(process.env.PI_REPL_CONTROL_ROOT).filter((name) => name.endsWith(".m")).length >= 2);
+				await assert.rejects(acquireReplSessionSendLease(id, { waitMs: 0 }), /busy/);
+			}
+			await eventually(async () => {
+				try { const lease = await acquireReplSessionSendLease(id, { waitMs: 0 }); await lease.release(); return true; }
+				catch (error) { if (/busy/.test(error.message)) return false; throw error; }
+			});
+			assert.equal(readdirSync(process.env.PI_REPL_CONTROL_ROOT).length, 0);
+			if (mode !== "exit") {
+				assert.match((await f.send("fprintf('recovered\\n');")).content[0].text, /Output:\nrecovered/);
+				await assertVerifiedStop(f);
+			}
+		});
+	}
+}
+
 const runtimeCases = [
 	["ipython", "pi_test_x = 41\nprint(pi_test_x + 1)", "raise ValueError('runtime-test-error')"],
 	["julia", "pi_test_x = 41\nprintln(pi_test_x + 1)", 'error("runtime-test-error")'],
@@ -466,6 +588,8 @@ const runtimeCases = [
 	["clojure", "(def pi-test-x 41)\n(println (+ pi-test-x 1))", '(throw (Exception. "runtime-test-error"))'],
 	["ruby", "pi_test_x = 41\nputs pi_test_x + 1", "raise 'runtime-test-error'"],
 	["java", "int pi_test_x = 41;\nSystem.out.println(pi_test_x + 1);", 'throw new RuntimeException("runtime-test-error");'],
+	["octave", "pi_test_x = 41;\nfprintf('%d\\n', pi_test_x + 1);", "error('runtime-test-error');"],
+	["matlab", "pi_test_x = 41;\nfprintf('%d\\n', pi_test_x + 1);", "error('runtime-test-error');"],
 ];
 for (const [runtime, code, errorCode] of runtimeCases) {
 	test(`${runtime} multiline wrapper, display cleanup and runtime errors`, {
@@ -491,6 +615,7 @@ for (const [runtime, code, errorCode] of runtimeCases) {
 				const physical = await f.tmux("capture-pane", "-p", "-t", `${f.sessionName}:^`, "-S", "-150");
 				assert.match(physical.slice(0, physical.lastIndexOf(begin)), /\n\n$/, physical);
 				if (runtime !== "ghci") assert.doesNotMatch(latest, /\n\n── done/, latest);
+				await assertCompletionGap(f, result);
 			} else {
 				assert.doesNotMatch(pane, /── pi-repl|── output ──|── done/);
 			}
@@ -512,8 +637,10 @@ for (const [runtime, code, errorCode] of runtimeCases) {
 		}
 		const result = await f.send(errorCode, { echoMode: "full" });
 		assert.match(result.content[0].text.split("Output:\n")[1], /runtime-test-error/);
+		await assertCompletionGap(f, result);
 		assert.doesNotMatch(result.content[0].text, /──|│/);
 		assert.equal(readdirSync(process.env.PI_REPL_CONTROL_ROOT).length, 0);
+		assert.ok(readReplSessionRecord((await f.status()).details[f.target].recordId).entries.every((entry) => entry.runtime === runtime), "record entries must retain their real runtime");
 		await assertVerifiedStop(f);
 	});
 }
@@ -681,6 +808,7 @@ for (const runtime of ["ghci", "ruby", "java"]) {
 			assert.equal(result.content[0].text.split("Output:\n")[1], "query fallback");
 			const pane = await f.tmux("capture-pane", "-p", "-J", "-t", `${f.sessionName}:^`, "-S", "-80");
 			assert.match(pane, /── output ──\nquery fallback\n── done/);
+			await assertCompletionGap(f, result);
 			const pid = Number(readFileSync(pidPath, "utf8").trim());
 			assert.ok(Number.isSafeInteger(pid) && pid > 0);
 			await eventually(() => {
@@ -691,6 +819,18 @@ for (const runtime of ["ghci", "ruby", "java"]) {
 		});
 	}
 }
+
+test("ghci shell fallback preserves the footer gap if Node cannot start", {
+	timeout: 30000, skip: !(optionalRuntimes.has("all") || optionalRuntimes.has("ghci")),
+}, async (t) => {
+	const f = await fixture(t, { runtime: "ghci" });
+	if (!f) return;
+	const result = await f.send('import qualified System.Environment\nSystem.Environment.setEnv "NODE_OPTIONS" "--pi-repl-invalid-test-option"\nputStr "shell fallback"');
+	assert.equal(result.content[0].text.split("Output:\n")[1], "shell fallback");
+	await assertCompletionGap(f, result);
+	await f.send('System.Environment.unsetEnv "NODE_OPTIONS"');
+	assert.equal(readdirSync(process.env.PI_REPL_CONTROL_ROOT).length, 0);
+});
 
 test("ruby suppresses only its loader result and restores manual echo and custom predicates", {
 	timeout: 60000, skip: !(optionalRuntimes.has("all") || optionalRuntimes.has("ruby")),

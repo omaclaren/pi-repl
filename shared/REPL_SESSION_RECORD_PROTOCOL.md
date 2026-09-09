@@ -80,9 +80,11 @@ Echo defaults are client preferences, not protocol requirements. `pi-repl` defau
 ── output ──
 2
 ── done · a1b2c3d4e5f6 ──
+
+<runtime prompt>
 ```
 
-The compact submitted and completion anchors remain in raw tmux history for human readability and deterministic future alignment. A plain unanchored `── output ──` divider separates the source preview from runtime output without repeating the ID or other metadata. `pi-repl` inserts one display-only blank line before the begin anchor in Summary and Full modes, with no padding between preview and output. Existing histories with different display spacing remain compatible. Clients remove the exact request-specific header, source preview, divider, and footer from captured tool output and clean-record output. These markers are presentation metadata, not clean-record authority: missing, malformed, duplicated, or user-produced marker-like text must never cause inferred raw activity to be promoted silently into protocol-v1 entries.
+The compact submitted and completion anchors remain in raw tmux history for human readability and deterministic future alignment. A plain unanchored `── output ──` divider separates the source preview from runtime output without repeating the ID or other metadata. `pi-repl` inserts one display-only blank line before the begin anchor and after the completion anchor in Summary and Full modes, with no internal padding. The trailing gap is removed from clean output along with the exact final anchor; additional user whitespace is preserved. Native prompt spacing is not changed. Existing histories with different display spacing remain compatible. Clients remove the exact request-specific header, source preview, divider, and footer from captured tool output and clean-record output. These markers are presentation metadata, not clean-record authority: missing, malformed, duplicated, or user-produced marker-like text must never cause inferred raw activity to be promoted silently into protocol-v1 entries.
 
 ## Runtime control files (outside protocol v1)
 
