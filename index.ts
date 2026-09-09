@@ -1210,8 +1210,8 @@ function buildRubyControlSource(code: string, doneFile: string, display: ReplSub
 function buildJavaControlSource(code: string, doneFile: string, display: ReplSubmissionDisplay): string {
 	if (/[\r\n]/.test(doneFile)) throw new Error("JShell control paths cannot contain line breaks.");
 	const prefix = display.enabled ? display.prefixLines.map((line) => `java.lang.System.out.println(${JSON.stringify(line)});`) : [];
-	// /open evaluates top-level snippets in the existing JShell. Completion is
-	// submitted separately so rejected or incomplete source cannot swallow it.
+	// /open evaluates top-level snippets in the existing JShell. Completion
+	// stays in the outer driver, outside this source file's parser state.
 	return [...prefix, code.replace(/\r/g, "").trimEnd(), ""].join("\n");
 }
 
@@ -1268,9 +1268,10 @@ function buildReplSubmissionLine(runtime: ImplementedRuntime, sourceFile: string
 	return `exec(open(${quotedPath}).read(),globals())`;
 }
 
-function buildJavaCompletionSource(doneFile: string, display: ReplSubmissionDisplay): string {
+function buildJavaDriverSource(sourceFile: string, doneFile: string, display: ReplSubmissionDisplay): string {
 	const completion = display.enabled ? [`  java.lang.System.out.println(${JSON.stringify(`\n${display.endMarker}`)});`] : [];
 	return [
+		buildReplSubmissionLine("java", sourceFile),
 		"{",
 		...completion,
 		`  java.nio.file.Files.write(java.nio.file.Paths.get(${JSON.stringify(doneFile)}), new byte[]{100, 111, 110, 101, 10});`,
@@ -1294,7 +1295,7 @@ function prepareReplControlFiles(
 	runtime: ImplementedRuntime,
 	code: string,
 	details: { submissionId: string; echoMode: ReplSubmissionEchoMode },
-): { controlPaths: ReplControlPaths; completionPaths?: ReplControlPaths; submissionLine: string; completionLine?: string; previewComment?: string; submissionText: string; display: ReplSubmissionDisplay } {
+): { controlPaths: ReplControlPaths; driverPaths?: ReplControlPaths; submissionLine: string; completionLine?: string; previewComment?: string; submissionText: string; display: ReplSubmissionDisplay } {
 	const display = createReplSubmissionDisplay({
 		entryId: details.submissionId,
 		origin: "pi-repl",
@@ -1306,25 +1307,23 @@ function prepareReplControlFiles(
 		extension: getReplControlExtension(runtime),
 		buildSource: ({ doneFile }: ReplControlPaths) => buildReplControlSource(runtime, code, doneFile, display),
 	});
-	let completionPaths: ReplControlPaths | undefined;
+	let driverPaths: ReplControlPaths | undefined;
 	try {
-		// Keep both /open commands short. A separate file also leaves the
-		// completion block outside the parser state of malformed user source.
+		// JShell echoes only the outer /open. Its nested source load returns
+		// before completion, even if user source is rejected or unfinished.
 		if (runtime === "java") {
-			completionPaths = createPrivateReplControlFiles({
+			driverPaths = createPrivateReplControlFiles({
 				...REPL_CONTROL_OPTIONS,
 				extension: "java",
-				buildSource: () => buildJavaCompletionSource(controlPaths.doneFile, display),
+				buildSource: () => buildJavaDriverSource(controlPaths.sourceFile, controlPaths.doneFile, display),
 			});
 		}
-		const submissionLine = buildReplSubmissionLine(runtime, controlPaths.sourceFile);
-		const completionLine = completionPaths
-			? buildReplSubmissionLine(runtime, completionPaths.sourceFile)
-			: buildReplCompletionLine(runtime, controlPaths.doneFile, display);
+		const submissionLine = buildReplSubmissionLine(runtime, driverPaths?.sourceFile ?? controlPaths.sourceFile);
+		const completionLine = buildReplCompletionLine(runtime, controlPaths.doneFile, display);
 		const previewComment = undefined;
 		return {
 			controlPaths,
-			completionPaths,
+			driverPaths,
 			submissionLine,
 			completionLine,
 			previewComment,
@@ -1333,7 +1332,7 @@ function prepareReplControlFiles(
 		};
 	} catch (error) {
 		cleanupPrivateReplControlFiles(controlPaths);
-		cleanupPrivateReplControlFiles(completionPaths);
+		cleanupPrivateReplControlFiles(driverPaths);
 		throw error;
 	}
 }
@@ -1713,7 +1712,7 @@ async function runReplCode(
 		const delta = extractPaneDelta(beforeCapture, afterCapture);
 		const output = cleanupReplDelta(delta, prepared.submissionLine, prepared.previewComment, prepared.completionLine, prepared.display);
 		cleanupPrivateReplControlFiles(prepared.controlPaths);
-		cleanupPrivateReplControlFiles(prepared.completionPaths);
+		cleanupPrivateReplControlFiles(prepared.driverPaths);
 
 		return {
 			output,
@@ -1732,7 +1731,7 @@ async function runReplCode(
 		if (existsSync(prepared.controlPaths.doneFile)) submissionState.completionObserved = true;
 		if (!submissionStarted || submissionState.completionObserved) {
 			cleanupPrivateReplControlFiles(prepared.controlPaths);
-			cleanupPrivateReplControlFiles(prepared.completionPaths);
+			cleanupPrivateReplControlFiles(prepared.driverPaths);
 		} else if (!options.onSubmissionStarted) {
 			retainReplSubmissionUntilSettled(pi, submissionState, null);
 		}
@@ -1781,7 +1780,7 @@ function retainReplSubmissionUntilSettled(
 			}
 		} finally {
 			cleanupPrivateReplControlFiles(state.prepared.controlPaths);
-			cleanupPrivateReplControlFiles(state.prepared.completionPaths);
+			cleanupPrivateReplControlFiles(state.prepared.driverPaths);
 			await lease?.release().catch(() => undefined);
 		}
 	})();
@@ -1906,7 +1905,7 @@ async function runRecordedReplCode(
 			retainReplSubmissionUntilSettled(pi, submissionState, lease);
 		} else {
 			cleanupPrivateReplControlFiles(submissionState?.prepared.controlPaths);
-			cleanupPrivateReplControlFiles(submissionState?.prepared.completionPaths);
+			cleanupPrivateReplControlFiles(submissionState?.prepared.driverPaths);
 			await lease.release().catch(() => undefined);
 		}
 	}

@@ -402,6 +402,33 @@ test("ruby preserves interpolation, literal hashes, Unicode, escapes and error r
 	assert.equal(readdirSync(process.env.PI_REPL_CONTROL_ROOT).length, 0);
 });
 
+test("java echoes only one loader command per send in every display mode", {
+	timeout: 60000, skip: !(optionalRuntimes.has("all") || optionalRuntimes.has("java")),
+}, async (t) => {
+	const f = await fixture(t, { runtime: "java", index: 1 });
+	if (!f) return;
+	const historyPath = (await f.status()).details.java.historyPath;
+	let sends = 0;
+	for (const echoMode of ["off", "summary", "full"]) {
+		const result = await f.send('System.out.println("one loader");', { echoMode });
+		sends++;
+		assert.equal(result.content[0].text.split("Output:\n")[1], "one loader");
+		const pane = await f.tmux("capture-pane", "-p", "-J", "-t", `${f.sessionName}:^`, "-S", "-1000");
+		assert.equal((pane.match(/^jshell> \/open /gm) || []).length, sends, pane);
+		if (echoMode !== "off") {
+			assert.ok(pane.includes(`── done · ${result.details.submissionAnchorId} ──`));
+			await eventually(() => readFileSync(historyPath, "utf8").includes(`── done · ${result.details.submissionAnchorId} ──`));
+		} else {
+			assert.doesNotMatch(pane, /── pi-repl|── done/);
+		}
+		assert.equal(readdirSync(process.env.PI_REPL_CONTROL_ROOT).length, 0);
+	}
+	const record = (await f.status()).details.java;
+	assert.equal(record.recordEntryCount, sends);
+	assert.ok(record.recordEntries.every((entry) => entry.output === "one loader"));
+	assert.equal((readFileSync(historyPath, "utf8").match(/^jshell> \/open /gm) || []).length, sends);
+});
+
 test("java preserves top-level snippets and completes after rejected or unfinished input", {
 	timeout: 60000, skip: !(optionalRuntimes.has("all") || optionalRuntimes.has("java")),
 }, async (t) => {
@@ -422,7 +449,7 @@ test("java preserves top-level snippets and completes after rejected or unfinish
 		assert.match(result.content[0].text.split("Output:\n")[1], expected);
 		assert.doesNotMatch(result.content[0].text, /──|│/);
 	}
-	for (const code of ['int broken = ;', 'int unfinished =', '/* unfinished comment', '"unfinished string']) {
+	for (const code of ['int broken = ;', 'int unfinished =', '/* unfinished comment', '"unfinished string', 'int incomplete(int x) {']) {
 		const result = await f.send(code, { timeoutMs: 3000 });
 		assert.equal(result.details.runtime, "java");
 		assert.doesNotMatch(result.content[0].text, /──|│/);
@@ -431,6 +458,27 @@ test("java preserves top-level snippets and completes after rejected or unfinish
 		assert.match(recovered.content[0].text.split("Output:\n")[1], /42/);
 		assert.equal(readdirSync(process.env.PI_REPL_CONTROL_ROOT).length, 0);
 	}
+});
+
+test("java driver stops with an explicit /exit and releases both files and its lease", {
+	timeout: 30000, skip: !(optionalRuntimes.has("all") || optionalRuntimes.has("java")),
+}, async (t) => {
+	const f = await fixture(t, { runtime: "java" });
+	if (!f) return;
+	const recordId = (await f.status()).details.java.recordId;
+	await assert.rejects(f.send("/exit", { timeoutMs: 5000 }), /REPL session ended/);
+	await eventually(async () => {
+		try {
+			const lease = await acquireReplSessionSendLease(recordId, { waitMs: 0 });
+			await lease.release();
+			return true;
+		} catch (error) {
+			if (/busy/.test(error.message)) return false;
+			throw error;
+		}
+	});
+	assert.equal(readdirSync(process.env.PI_REPL_CONTROL_ROOT).length, 0);
+	assert.equal((await f.status()).details.java.running, false);
 });
 
 test("java refuses line breaks in command paths before submission and releases its lease", {
@@ -461,7 +509,9 @@ for (const runtime of ["ruby", "java"]) {
 			await assert.rejects(f.send(slow, { timeoutMs: 1000 }, abort.signal), mode === "abort" ? /aborted/ : /Timed out waiting/);
 			f.onEnter(undefined);
 			await assert.rejects(acquireReplSessionSendLease(recordId, { waitMs: 0 }), /busy/);
-			assert.ok(readdirSync(process.env.PI_REPL_CONTROL_ROOT).some((file) => file.endsWith(runtime === "ruby" ? ".rb" : ".java")));
+			const retained = readdirSync(process.env.PI_REPL_CONTROL_ROOT).filter((file) => file.endsWith(runtime === "ruby" ? ".rb" : ".java"));
+			assert.equal(retained.length, runtime === "java" ? 2 : 1);
+			for (const file of retained) assert.equal(statSync(join(process.env.PI_REPL_CONTROL_ROOT, file)).mode & 0o777, 0o600);
 			await eventually(async () => {
 				try {
 					const lease = await acquireReplSessionSendLease(recordId, { waitMs: 0 });

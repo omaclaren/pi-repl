@@ -15,6 +15,9 @@ All notable changes to `pi-repl` are documented here.
 - Preserve output or display headers joined to the echoed loader command, as can happen with R and long control paths.
 - Restore isolated test launchers after login-shell profile initialization so their runtime flags and temporary-home settings are applied on macOS too.
 
+### Changed
+- Show only one Java `/open` command in the raw pane by loading source and signalling completion through a single outer driver. Keep the user source in its own file so compilation errors and incomplete input cannot absorb the completion step.
+
 ## [0.4.2] — 2026-09-09
 
 ### Fixed

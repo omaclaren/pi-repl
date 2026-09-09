@@ -145,7 +145,7 @@ int count = 41;
 System.out.println(count + 1);
 ```
 
-Java completion is sent in a separate private file, so compilation errors or incomplete source cannot swallow the completion signal. JShell control paths can contain spaces and quotes, but not line breaks. Submit complete snippets: native `/open` may silently discard an unfinished fragment. Evaluation is not transactional—valid snippets can run even if another snippet fails. JShell commands such as `/reset` and `/exit` change or end the live session; use them deliberately.
+Java uses one outer driver file to load the source and then signal completion. The source remains in a separate private file so malformed input cannot swallow the driver's completion step, while the pane shows only the initial `/open` command. JShell control paths can contain spaces and quotes, but not line breaks. Submit complete snippets: JShell can reject or discard unfinished input rather than continue it in a later send. Evaluation is not transactional—valid snippets can run even if another snippet fails. JShell commands such as `/reset` and `/exit` change or end the live session; use them deliberately.
 
 Both runtimes support the same private logs, clean records, exports, Summary/Off/Full displays, and timeout/abort lease handling as the existing runtimes. As with the other REPLs, wait for a normal prompt before sending code; do not send while a person is entering an unfinished interactive expression.
 
