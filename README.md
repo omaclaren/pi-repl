@@ -2,7 +2,7 @@
 
 Minimal [pi](https://github.com/badlogic/pi-mono) extension for collaborative REPL sessions using tmux.
 
-`pi-repl` starts a shared Python, IPython, Julia, R, Haskell (GHCi), or Clojure REPL in tmux that you can attach to from another terminal window. You can work in the REPL directly, or ask pi to send and execute code there.
+`pi-repl` starts a shared Python, IPython, Julia, R, Haskell (GHCi), Clojure, Ruby (irb), or Java (JShell) REPL in tmux that you can attach to from another terminal window. You can work in the REPL directly, or ask pi to send and execute code there.
 
 ![Interacting with a shared Julia REPL](./shared-julia-repl.png)
 
@@ -10,17 +10,17 @@ Minimal [pi](https://github.com/badlogic/pi-mono) extension for collaborative RE
 
 ## Current scope
 
-Currently, `pi-repl` supports **Python/IPython**, **Julia**, **R**, **Haskell (GHCi)**, and **Clojure**.
+Currently, `pi-repl` supports **Python/IPython**, **Julia**, **R**, **Haskell (GHCi)**, **Clojure**, **Ruby (irb)**, and **Java (JShell)**.
 
 With `pi-repl` you can:
 
 - start a shared REPL from pi
 - attach to that REPL from another terminal window
 - work in the REPL yourself as normal
-- ask pi, in natural language, to run code in the shared Python/IPython, Julia, R, Haskell (GHCi), or Clojure REPL
+- ask pi, in natural language, to run code in any supported shared REPL
 - start, attach to, inspect, and stop a shared R REPL
 - start, attach to, inspect, and stop a shared Haskell (GHCi) REPL
-- start, attach to, inspect, and stop a shared Clojure REPL
+- start, attach to, inspect, and stop a shared Clojure, Ruby, or Java REPL
 - let pi read the raw shared REPL transcript for extra context when needed
 - keep a bounded clean record of compatible-client submissions and captured output, synchronized automatically with a compatible `pi-studio` using the same tmux session
 - show bounded, request-specific submitted code and compact alignment anchors in the raw pane by default, with Summary previews, Off for quiet output, and Full as an explicit opt-in
@@ -59,12 +59,16 @@ Restart pi after installing.
 | `/repl r` | Start the shared R session with `R` |
 | `/repl ghci` | Start the shared Haskell (GHCi) session with `ghci` |
 | `/repl clojure` | Start the shared Clojure session with `clojure` |
+| `/repl ruby` | Start the shared Ruby session with `irb` |
+| `/repl java` | Start the shared Java session with `jshell` |
 | `/lab python` | Same as `/repl python` |
 | `/lab ipython` | Same as `/repl ipython` |
 | `/lab julia` | Same as `/repl julia` |
 | `/lab r` | Same as `/repl r` |
 | `/lab ghci` | Same as `/repl ghci` |
 | `/lab clojure` | Same as `/repl clojure` |
+| `/lab ruby` | Same as `/repl ruby` |
+| `/lab java` | Same as `/repl java` |
 | `/repl echo` | Show the current submitted-code pane-echo mode |
 | `/repl echo off` | Disable submitted-code displays and raw-history anchors for new sends |
 | `/repl echo summary` | Show short submissions in full, truncating after 6 lines or 600 source characters, with compact anchors (default) |
@@ -75,24 +79,32 @@ Restart pi after installing.
 | `/repl status r` | Show status for the shared R session |
 | `/repl status ghci` | Show status for the shared Haskell (GHCi) session |
 | `/repl status clojure` | Show status for the shared Clojure session |
+| `/repl status ruby` | Show status for the shared Ruby session |
+| `/repl status java` | Show status for the shared Java session |
 | `/repl env` | Show which interpreter and environment the shared Python/IPython REPL is using |
 | `/repl attach` | Show how to attach from a new terminal window |
 | `/repl attach julia` | Show how to attach to the shared Julia session |
 | `/repl attach r` | Show how to attach to the shared R session |
 | `/repl attach ghci` | Show how to attach to the shared Haskell (GHCi) session |
 | `/repl attach clojure` | Show how to attach to the shared Clojure session |
+| `/repl attach ruby` | Show how to attach to the shared Ruby session |
+| `/repl attach java` | Show how to attach to the shared Java session |
 | `/repl export` | Export the clean record when exactly one shared session is running |
 | `/repl export python` | Export the shared Python/IPython clean record as canonical Markdown |
 | `/repl export julia` | Export the shared Julia clean record as canonical Markdown |
 | `/repl export r` | Export the shared R clean record as canonical Markdown |
 | `/repl export ghci` | Export the shared Haskell (GHCi) clean record as canonical Markdown |
 | `/repl export clojure` | Export the shared Clojure clean record as canonical Markdown |
+| `/repl export ruby` | Export the shared Ruby clean record as canonical Markdown |
+| `/repl export java` | Export the shared Java clean record as canonical Markdown |
 | `/repl stop` | Stop the shared session if only one is running |
 | `/repl stop python` | Stop the shared Python/IPython session |
 | `/repl stop julia` | Stop the shared Julia session |
 | `/repl stop r` | Stop the shared R session |
 | `/repl stop ghci` | Stop the shared Haskell (GHCi) session |
 | `/repl stop clojure` | Stop the shared Clojure session |
+| `/repl stop ruby` | Stop the shared Ruby session |
+| `/repl stop java` | Stop the shared Java session |
 
 For R, both `/repl R` and `/repl r` work. The same applies to `/lab`, `/repl status`, `/repl attach`, `/repl export`, and `/repl stop`.
 
@@ -104,8 +116,8 @@ For Clojure, `/repl clojure` is canonical and `/repl clj` also works. The same a
 
 | Tool | Description |
 |------|-------------|
-| `repl_status` | Inspect shared Python/IPython, Julia, R, Haskell (GHCi), and Clojure REPL state |
-| `repl_send` | Execute code in the running shared Python/IPython, Julia, R, Haskell (GHCi), or Clojure session |
+| `repl_status` | Inspect the state of supported shared REPL sessions |
+| `repl_send` | Execute code in a running supported shared REPL session |
 
 Notes:
 
@@ -113,13 +125,29 @@ Notes:
 - while a shared REPL is running, `repl_status` exposes the versioned clean-record ID/path/count/tail and the separate raw session history path
 - pi can use the clean entries when it needs compatible-client code/output boundaries, or read the raw history for context about direct pane interaction
 - the relevant shared session must already be running before `repl_send`
-- you can ask pi naturally to run code in Python, IPython, Julia, R, Haskell, or Clojure; pi chooses the tool parameters internally
+- you can ask pi naturally to run code in Python, IPython, Julia, R, Haskell, Clojure, Ruby, or Java; pi chooses the tool parameters internally
+- the tools accept `target: ruby` or `target: irb`, and `target: java` or `target: jshell`; use the canonical `ruby` and `java` names in `/repl` commands
 - for plain Python, `print(...)` is the safest way to get values back reliably
 - in Haskell (GHCi), use normal interactive syntax such as `let` bindings or `:{ ... :}` blocks for multiline declarations
 - in Clojure, use normal interactive syntax such as `let`, `def`/`defn`, or `do` forms for multiline code
 - tool output includes both the submitted code and the captured output; the complete response is limited to 2,000 lines or 50 KiB, with the full response saved to a private file when truncated
 - `repl_send` accepts `echoMode: off|summary|full` for a single send; otherwise it uses `/repl echo`, initialized from `PI_REPL_ECHO_MODE` or Summary
 - Full echo mode writes bounded submitted source code into persistent raw terminal history; Summary shows short submissions in full and truncates after 6 lines or 600 source characters
+
+### Ruby and Java submissions
+
+Ruby requires `irb` on PATH. Submissions evaluate in the active IRB workspace, so variables and definitions are shared between agent sends and code you type directly. The last non-`nil` result is printed. Source, paths and previews are encoded without prematurely expanding Ruby interpolation.
+
+Java requires a JDK with `jshell` on PATH. Submissions use JShell's native `/open` command: imports, variables, methods and classes remain available across sends and direct terminal input. **Use `System.out.println(...)` for visible results**; `/open` executes bare expressions but does not echo their values. For example:
+
+```java
+int count = 41;
+System.out.println(count + 1);
+```
+
+Java completion is sent in a separate private file, so compilation errors or incomplete source cannot swallow the completion signal. JShell control paths can contain spaces and quotes, but not line breaks. Submit complete snippets: native `/open` may silently discard an unfinished fragment. Evaluation is not transactional—valid snippets can run even if another snippet fails. JShell commands such as `/reset` and `/exit` change or end the live session; use them deliberately.
+
+Both runtimes support the same private logs, clean records, exports, Summary/Off/Full displays, and timeout/abort lease handling as the existing runtimes. As with the other REPLs, wait for a normal prompt before sending code; do not send while a person is entering an unfinished interactive expression.
 
 ## Shared clean record
 
@@ -152,6 +180,8 @@ The default shared tmux session names are:
 - `pi-repl-r` for R
 - `pi-repl-ghci` for Haskell (GHCi)
 - `pi-repl-clojure` for Clojure
+- `pi-repl-ruby` for Ruby/irb
+- `pi-repl-java` for Java/JShell
 
 Nonzero tmux `base-index` and `pane-base-index` settings are supported. `pi-repl` selects the lowest-indexed pane in the lowest-indexed window, then pins that pane's stable ID for each send so switching active windows cannot redirect its output capture.
 
@@ -193,6 +223,14 @@ tmux attach -t pi-repl-python
 /repl status clojure
 /repl attach clojure
 
+/repl ruby
+/repl status ruby
+/repl attach ruby
+
+/repl java
+/repl status java
+/repl attach java
+
 /repl export python
 ```
 
@@ -205,6 +243,8 @@ Example requests once the REPL is running:
 - `in the shared R REPL, run mean(c(1, 2, 3, 4))`
 - `in the shared Haskell REPL, run map (+1) [1,2,3]`
 - `in the shared Clojure REPL, run (map inc [1 2 3])`
+- `in the shared Ruby REPL, run (1..3).map { |x| x + 1 }`
+- `in the shared Java REPL, run System.out.println(1 + 2);`
 
 ## Notes
 
@@ -232,13 +272,18 @@ To exercise all installed runtimes, or just a selected subset:
 ```bash
 PI_REPL_TEST_RUNTIMES=all npm test
 PI_REPL_TEST_RUNTIMES=julia,r npm run test:integration
+PI_REPL_TEST_RUNTIMES=ruby,java npm run test:integration
 ```
 
-The integration tests cover nonzero indexes, pane selection, session restarts, raw-log permissions, clean records and exports, concurrent sends, timeout/abort leases, and runtime wrappers. Optional runtime tests are opt-in and skip missing executables. Julia tests resolve the existing juliaup-selected binary before isolating the test home.
+The integration tests cover nonzero indexes, pane selection, session restarts, raw-log permissions, clean records and exports, concurrent sends, timeout/abort leases, and runtime wrappers. Ruby/Java checks also cover shared direct input, interpolation, Unicode and quoted control paths, persistent declarations, malformed input and error recovery. Optional runtime tests are opt-in and skip missing executables. Julia tests resolve the existing juliaup-selected binary before isolating the test home.
 
 `PI_REPL_CONTROL_ROOT` optionally overrides the private runtime-control directory; it must be current-user-owned mode `0700`. Tests set it to their temporary directory so even stale-file cleanup stays isolated. This does not change the shared-record protocol or Studio's control-file location.
 
 Before testing the checkout interactively, replace the npm package source with the absolute local repo path and restart Pi. Avoid loading both copies.
+
+## Acknowledgements
+
+Ruby and Java support builds on [Ifiht's contribution in PR #2](https://github.com/omaclaren/pi-repl/pull/2), adapted to the current execution, display and recording machinery.
 
 ## Related extensions
 

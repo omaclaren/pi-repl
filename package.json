@@ -23,7 +23,11 @@
     "r",
     "haskell",
     "ghci",
-    "clojure"
+    "clojure",
+    "ruby",
+    "irb",
+    "java",
+    "jshell"
   ],
   "files": [
     "index.ts",

@@ -15,7 +15,6 @@ process.env.TMPDIR = root;
 process.env.PI_REPL_CONTROL_ROOT = join(root, "controls");
 process.env.SHELL = "/bin/sh";
 delete process.env.PI_REPL_ECHO_MODE;
-const { default: register } = await import("../index.ts");
 const available = process.platform !== "win32" && spawnSync("tmux", ["-V"]).status === 0;
 const optionalRuntimes = new Set((process.env.PI_REPL_TEST_RUNTIMES || "").split(","));
 
@@ -41,9 +40,9 @@ async function eventually(check, timeout = 15000) {
 	throw new Error("Timed out waiting for isolated REPL test condition");
 }
 
-async function fixture(t, { index = 0, runtime = "python" } = {}) {
+async function fixture(t, { index = 0, runtime = "python", controlName } = {}) {
 	if (!available) { t.skip("tmux is required for local integration tests"); return null; }
-	const command = runtime === "r" ? "R" : runtime === "python" ? "python3" : runtime;
+	const command = runtime === "r" ? "R" : runtime === "python" ? "python3" : runtime === "ruby" ? "irb" : runtime === "java" ? "jshell" : runtime;
 	let executable = binary(command);
 	if (!executable) { t.skip(`${command} is not installed`); return null; }
 	if (runtime === "julia") {
@@ -58,12 +57,16 @@ async function fixture(t, { index = 0, runtime = "python" } = {}) {
 	const bin = join(cwd, "bin");
 	mkdirSync(home);
 	mkdirSync(bin);
+	// macOS /etc/profile resets PATH in the login shell used by the extension.
+	// Restore our isolated launchers afterwards so runtime flags really apply.
+	writeFileSync(join(home, ".profile"), `export PATH=${quote(`${bin}:${process.env.PATH}`)}\n`);
 	const flags = {
 		python: "-I -q -i", ipython: "--no-banner --no-confirm-exit --simple-prompt --HistoryManager.enabled=False",
 		julia: "--startup-file=no --history-file=no -i", r: "--vanilla --quiet", ghci: "-ignore-dot-ghci -v0", clojure: "",
+		ruby: "-f --noreadline", java: `-J-Duser.home=${quote(home)} -J-Djava.util.prefs.userRoot=${quote(join(home, "java-prefs"))}`,
 	}[runtime];
-	const launcher = runtime === "r" ? "R" : runtime;
-	writeFileSync(join(bin, launcher), `#!/bin/sh\nexec ${quote(executable)} ${flags}\n`, { mode: 0o700 });
+	const launcher = runtime === "r" ? "R" : runtime === "ruby" ? "irb" : runtime === "java" ? "jshell" : runtime;
+	writeFileSync(join(bin, launcher), `#!/bin/sh\nexec ${quote(executable)} ${flags} "$@"\n`, { mode: 0o700 });
 	// A distinct socket/server and empty config: never target the user's tmux.
 	const socket = `pi-repl-test-${process.pid}-${randomUUID()}`;
 	const config = join(cwd, "tmux.conf");
@@ -73,6 +76,12 @@ async function fixture(t, { index = 0, runtime = "python" } = {}) {
 	delete env.TMUX_PANE;
 	delete env.PYTHONSTARTUP;
 	delete env.JULIA_PROJECT;
+	delete env.RUBYOPT;
+	delete env.RUBYLIB;
+	delete env.IRBRC;
+	delete env.JAVA_TOOL_OPTIONS;
+	delete env.JDK_JAVA_OPTIONS;
+	delete env._JAVA_OPTIONS;
 	const tmuxArgs = ["-L", socket, "-f", config];
 	const calls = [];
 	const tools = new Map();
@@ -96,6 +105,9 @@ async function fixture(t, { index = 0, runtime = "python" } = {}) {
 		},
 	};
 	const ctx = { cwd, hasUI: true, ui: { notify: (message, level) => notifications.push({ message, level }) } };
+	process.env.PI_REPL_CONTROL_ROOT = join(root, controlName ?? 'controls space "quoted" #{raise} λ');
+	// Fresh module preferences/config for each independent test extension.
+	const { default: register } = await import(`../index.ts?fixture=${randomUUID()}`);
 	register(pi);
 	async function tmux(...args) {
 		return (await exec("tmux", [...tmuxArgs, ...args], { env, cwd, timeout: 10000 })).stdout.trim();
@@ -109,10 +121,10 @@ async function fixture(t, { index = 0, runtime = "python" } = {}) {
 	const target = runtime === "ipython" ? "python" : runtime;
 	const repl = (args) => commands.get("repl").handler(args, ctx);
 	const send = (code, options = {}, signal) => tools.get("repl_send").execute(randomUUID(), { code, target, ...options }, signal, undefined, ctx);
-	const status = () => tools.get("repl_status").execute(randomUUID(), { target }, undefined, undefined, ctx);
+	const status = (options = {}) => tools.get("repl_status").execute(randomUUID(), { target, ...options }, undefined, undefined, ctx);
 	await repl(runtime);
 	assert.equal(notifications.some((n) => n.level === "error" || n.level === "warning"), false, JSON.stringify(notifications));
-	const prompt = { python: />>>/, ipython: /In \[\d+\]:/, julia: /julia>/, r: /(^|\n)>/, ghci: /ghci>/, clojure: /user=>/ }[runtime];
+	const prompt = { python: />>>/, ipython: /In \[\d+\]:/, julia: /julia>/, r: /(^|\n)>/, ghci: /ghci>/, clojure: /user=>/, ruby: /irb\(.*\).*?>/, java: /jshell>/ }[runtime];
 	let startupOutput = "";
 	try {
 		await eventually(async () => {
@@ -290,6 +302,8 @@ const runtimeCases = [
 	["r", "pi_test_x <- 41\nprint(pi_test_x + 1)", 'stop("runtime-test-error")'],
 	["ghci", "let pi_test_x = 41\nprint (pi_test_x + 1)", 'error "runtime-test-error"'],
 	["clojure", "(def pi-test-x 41)\n(println (+ pi-test-x 1))", '(throw (Exception. "runtime-test-error"))'],
+	["ruby", "pi_test_x = 41\nputs pi_test_x + 1", "raise 'runtime-test-error'"],
+	["java", "int pi_test_x = 41;\nSystem.out.println(pi_test_x + 1);", 'throw new RuntimeException("runtime-test-error");'],
 ];
 for (const [runtime, code, errorCode] of runtimeCases) {
 	test(`${runtime} multiline wrapper, display cleanup and runtime errors`, {
@@ -300,7 +314,7 @@ for (const [runtime, code, errorCode] of runtimeCases) {
 		if (!f) return;
 		for (const echoMode of ["off", "summary", "full"]) {
 			const result = await f.send(code, { echoMode });
-			assert.match(result.content[0].text.split("Output:\n")[1], /42/);
+			assert.match(result.content[0].text.split("Output:\n")[1], /42/, await f.tmux("capture-pane", "-p", "-J", "-t", `${f.sessionName}:^`, "-S", "-80"));
 			assert.doesNotMatch(result.content[0].text, /──|│/);
 		}
 		if (runtime === "julia") {
@@ -313,4 +327,155 @@ for (const [runtime, code, errorCode] of runtimeCases) {
 		assert.doesNotMatch(result.content[0].text, /──|│/);
 		assert.equal(readdirSync(process.env.PI_REPL_CONTROL_ROOT).length, 0);
 	});
+}
+
+for (const runtime of ["ruby", "java"]) {
+	for (const index of [0, 1]) {
+		test(`${runtime} lifecycle, direct interaction, aliases, private records and export at index ${index}`, {
+			timeout: 60000,
+			skip: !(optionalRuntimes.has("all") || optionalRuntimes.has(runtime)),
+		}, async (t) => {
+			const f = await fixture(t, { runtime, index });
+			if (!f) return;
+			const alias = runtime === "ruby" ? "IRB" : "JShell";
+			let status = (await f.status({ target: alias })).details[runtime];
+			assert.equal(status.running, true);
+			assert.equal(status.runtime, runtime);
+			assert.match(status.recordId, /^[a-f0-9]{32}$/);
+			assert.equal(statSync(status.historyPath).mode & 0o777, 0o600);
+			const firstRecord = status.recordId;
+			const firstHistory = status.historyPath;
+			await f.send(runtime === "ruby" ? "pi_value = 41" : "int pi_value = 41;", { target: alias });
+			const next = await f.send(runtime === "ruby" ? "pi_value + 1" : "System.out.println(pi_value + 1);");
+			assert.match(next.content[0].text.split("Output:\n")[1], /42/);
+			const direct = runtime === "ruby" ? 'pi_human_value = pi_value + 10; puts "direct-ready"' : 'int pi_human_value = pi_value + 10;';
+			await f.tmux("send-keys", "-t", `${f.sessionName}:^`, "-l", direct);
+			await f.tmux("send-keys", "-t", `${f.sessionName}:^`, "C-m");
+			const shared = await f.send(runtime === "ruby" ? "pi_human_value" : "System.out.println(pi_human_value);");
+			assert.match(shared.content[0].text.split("Output:\n")[1], /51/);
+			assert.doesNotMatch(shared.content[0].text, /──|│|=> nil/);
+			status = (await f.status()).details[runtime];
+			assert.equal(status.recordEntries.length, 3);
+			assert.equal(status.recordEntries.at(-1).status, "captured");
+			assert.match(status.recordEntries.at(-1).output, /51/);
+			await eventually(() => readFileSync(firstHistory, "utf8").includes(`── done · ${shared.details.submissionAnchorId} ──`));
+			await f.repl(`status ${runtime}`);
+			assert.match(f.notifications.at(-1).message, /session is running/);
+			await f.repl(`attach ${runtime}`);
+			assert.match(f.notifications.at(-1).message, new RegExp(`tmux attach -t ${f.sessionName}`));
+			await f.repl(`export ${runtime}`);
+			const exported = readdirSync(f.cwd).find((file) => file.endsWith(".md"));
+			assert.match(readFileSync(join(f.cwd, exported), "utf8"), new RegExp("```" + runtime));
+			assert.equal(readdirSync(process.env.PI_REPL_CONTROL_ROOT).length, 0);
+			await f.repl(`stop ${runtime}`);
+			assert.equal((await f.status()).details[runtime].running, false);
+			await f.repl(runtime);
+			status = (await f.status()).details[runtime];
+			assert.notEqual(status.recordId, firstRecord);
+			assert.notEqual(status.historyPath, firstHistory);
+			assert.equal(status.recordEntries.length, 0);
+		});
+	}
+}
+
+test("ruby preserves interpolation, literal hashes, Unicode, escapes and error recovery", {
+	timeout: 60000, skip: !(optionalRuntimes.has("all") || optionalRuntimes.has("ruby")),
+}, async (t) => {
+	const f = await fixture(t, { runtime: "ruby", index: 1 });
+	if (!f) return;
+	const cases = [
+		['pi_name = "world"\nputs "hello #{pi_name}"', "hello world"],
+		["puts '#{1 + 2} #@ivar #$gvar'", "#{1 + 2} #@ivar #$gvar"],
+		['@pi_ivar = "instance"\n$pi_gvar = "global"\nputs "#@pi_ivar #$pi_gvar"', "instance global"],
+		['puts "λ 🧪 \\"quoted\\" \\\\path"', 'λ 🧪 "quoted" \\path'],
+		['print "no newline"', "no newline"],
+	];
+	for (const echoMode of ["off", "summary", "full"]) {
+		for (const [code, expected] of cases) {
+			const result = await f.send(code, { echoMode });
+			assert.equal(result.content[0].text.split("Output:\n")[1], expected);
+		}
+	}
+	const syntaxError = await f.send("def broken(", { timeoutMs: 3000 });
+	assert.match(syntaxError.content[0].text.split("Output:\n")[1], /SyntaxError|syntax error/);
+	assert.match((await f.send('puts "recovered"')).content[0].text, /Output:\nrecovered/);
+	assert.equal(readdirSync(process.env.PI_REPL_CONTROL_ROOT).length, 0);
+});
+
+test("java preserves top-level snippets and completes after rejected or unfinished input", {
+	timeout: 60000, skip: !(optionalRuntimes.has("all") || optionalRuntimes.has("java")),
+}, async (t) => {
+	const f = await fixture(t, { runtime: "java", index: 1 });
+	if (!f) return;
+	const cases = [
+		['import java.time.LocalDate;\nSystem.out.println(LocalDate.of(2026, 1, 2));', /2026-01-02/],
+		['int twice(int x) {\n    return 2 * x;\n}', /\(no output\)/],
+		['System.out.println(twice(21));', /42/],
+		['class PiBox {\n    int value = 17;\n}\nSystem.out.println(new PiBox().value);', /17/],
+		['int pi_counter = 0;\n++pi_counter', /\(no output\)/],
+		['System.out.println(pi_counter);', /1/],
+		['System.out.println("λ 🧪 \\"quoted\\" \\\\path");', /λ 🧪 "quoted" \\path/],
+		['System.out.print("no newline");', /no newline/],
+	];
+	for (const [code, expected] of cases) {
+		const result = await f.send(code);
+		assert.match(result.content[0].text.split("Output:\n")[1], expected);
+		assert.doesNotMatch(result.content[0].text, /──|│/);
+	}
+	for (const code of ['int broken = ;', 'int unfinished =', '/* unfinished comment', '"unfinished string']) {
+		const result = await f.send(code, { timeoutMs: 3000 });
+		assert.equal(result.details.runtime, "java");
+		assert.doesNotMatch(result.content[0].text, /──|│/);
+		if (code === 'int broken = ;') assert.match(result.content[0].text.split("Output:\n")[1], /Error:/);
+		const recovered = await f.send("System.out.println(twice(21));");
+		assert.match(recovered.content[0].text.split("Output:\n")[1], /42/);
+		assert.equal(readdirSync(process.env.PI_REPL_CONTROL_ROOT).length, 0);
+	}
+});
+
+test("java refuses line breaks in command paths before submission and releases its lease", {
+	timeout: 30000, skip: !(optionalRuntimes.has("all") || optionalRuntimes.has("java")),
+}, async (t) => {
+	const f = await fixture(t, { runtime: "java", controlName: "controls\ninvalid" });
+	if (!f) return;
+	const recordId = (await f.status()).details.java.recordId;
+	const callsBefore = f.calls.length;
+	await assert.rejects(f.send("System.out.println(42);"), /JShell control paths cannot contain line breaks/);
+	assert.equal(f.calls.slice(callsBefore).some((call) => call.args[0] === "paste-buffer"), false);
+	assert.equal(readdirSync(process.env.PI_REPL_CONTROL_ROOT).length, 0);
+	const lease = await acquireReplSessionSendLease(recordId, { waitMs: 0 });
+	await lease.release();
+});
+
+for (const runtime of ["ruby", "java"]) {
+	for (const mode of ["timeout", "abort"]) {
+		test(`${runtime} ${mode} holds the lease until code actually finishes`, {
+			timeout: 60000, skip: !(optionalRuntimes.has("all") || optionalRuntimes.has(runtime)),
+		}, async (t) => {
+			const f = await fixture(t, { runtime });
+			if (!f) return;
+			const recordId = (await f.status()).details[runtime].recordId;
+			const abort = new AbortController();
+			if (mode === "abort") f.onEnter(() => abort.abort());
+			const slow = runtime === "ruby" ? 'sleep 2.5\nputs "late result"' : 'Thread.sleep(2500);\nSystem.out.println("late result");';
+			await assert.rejects(f.send(slow, { timeoutMs: 1000 }, abort.signal), mode === "abort" ? /aborted/ : /Timed out waiting/);
+			f.onEnter(undefined);
+			await assert.rejects(acquireReplSessionSendLease(recordId, { waitMs: 0 }), /busy/);
+			assert.ok(readdirSync(process.env.PI_REPL_CONTROL_ROOT).some((file) => file.endsWith(runtime === "ruby" ? ".rb" : ".java")));
+			await eventually(async () => {
+				try {
+					const lease = await acquireReplSessionSendLease(recordId, { waitMs: 0 });
+					await lease.release();
+					return true;
+				} catch (error) {
+					if (/busy/.test(error.message)) return false;
+					throw error;
+				}
+			});
+			assert.equal(readdirSync(process.env.PI_REPL_CONTROL_ROOT).length, 0);
+			const next = await f.send(runtime === "ruby" ? 'puts "next request"' : 'System.out.println("next request");');
+			assert.match(next.content[0].text, /next request/);
+			assert.doesNotMatch(next.content[0].text, /late result/);
+		});
+	}
 }

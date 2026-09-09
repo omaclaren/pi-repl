@@ -4,6 +4,17 @@ All notable changes to `pi-repl` are documented here.
 
 ## [Unreleased]
 
+### Added
+- Add Ruby/irb and Java/JShell sessions, adapting Ifiht's contribution in [PR #2](https://github.com/omaclaren/pi-repl/pull/2). Include start/status/attach/stop commands, clean records and exports, and Summary/Off/Full displays.
+- Add isolated Ruby/Java integration coverage for persistence across agent and direct terminal input, interpolation and Unicode, private paths, failed compilation, incomplete snippets, and timeout/abort cleanup. Add portable command/schema routing tests; no CI workflow.
+
+### Fixed
+- Encode Ruby source and paths without premature interpolation, and evaluate in the active IRB workspace so agent sends share variables with direct input.
+- Preserve JShell top-level declarations with native `/open` submissions and a separate completion file. Compilation failures no longer prevent completion; use `System.out.println(...)` for visible values because `/open` does not echo expression results.
+- Escape literal `#` characters in tmux `load-buffer` paths instead of treating parts of a custom private control root as tmux formats.
+- Preserve output or display headers joined to the echoed loader command, as can happen with R and long control paths.
+- Restore isolated test launchers after login-shell profile initialization so their runtime flags and temporary-home settings are applied on macOS too.
+
 ## [0.4.2] — 2026-09-09
 
 ### Fixed
