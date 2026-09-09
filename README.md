@@ -4,9 +4,9 @@ Minimal [pi](https://github.com/badlogic/pi-mono) extension for collaborative RE
 
 `pi-repl` starts a shared Python, IPython, Julia, R, Haskell (GHCi), Clojure, Ruby (irb), Java (JShell), Octave, or MATLAB REPL in tmux that you can attach to from another terminal window. You can work in the REPL directly, or ask pi to send and execute code there.
 
-![Interacting with a shared Julia REPL](./shared-julia-repl.png)
+![Pi and a shared Julia REPL with labelled input and output](./shared-julia-repl.png)
 
-*Interacting with a shared Julia REPL.*
+*Pi (left) and the same Julia workspace in an attached terminal (right). The second request uses a matrix changed directly in the terminal.*
 
 ## Current scope
 
