@@ -1342,8 +1342,9 @@ function prepareReplControlFiles(
 		code,
 		mode: details.echoMode,
 	});
+	const controlOptions = { ...REPL_CONTROL_OPTIONS, anchorId: display.anchorId };
 	const controlPaths: ReplControlPaths = createPrivateReplControlFiles({
-		...REPL_CONTROL_OPTIONS,
+		...controlOptions,
 		extension: getReplControlExtension(runtime),
 		buildSource: ({ doneFile }: ReplControlPaths) => buildReplControlSource(runtime, code, doneFile, display),
 	});
@@ -1355,13 +1356,13 @@ function prepareReplControlFiles(
 			// command handler catches it and its script stops normally, letting
 			// the OUTER driver continue to completion. Two levels alone fail.
 			const guard = createPrivateReplControlFiles({
-				...REPL_CONTROL_OPTIONS,
+				...controlOptions,
 				extension: "ghci",
 				buildSource: () => buildReplSubmissionLine("ghci", controlPaths.sourceFile) + "\n",
 			});
 			guardPaths = guard;
 			driverPaths = createPrivateReplControlFiles({
-				...REPL_CONTROL_OPTIONS,
+				...controlOptions,
 				extension: "ghci",
 				buildSource: () => [buildReplSubmissionLine("ghci", guard.sourceFile), buildReplCompletionLine("ghci", controlPaths.doneFile, display), ""].join("\n"),
 			});
@@ -1370,14 +1371,14 @@ function prepareReplControlFiles(
 		// before completion, even if user source is rejected or unfinished.
 		if (runtime === "java") {
 			driverPaths = createPrivateReplControlFiles({
-				...REPL_CONTROL_OPTIONS,
+				...controlOptions,
 				extension: "java",
 				buildSource: () => buildJavaDriverSource(controlPaths.sourceFile, controlPaths.doneFile, display),
 			});
 		}
 		if (runtime === "octave" || runtime === "matlab") {
 			driverPaths = createPrivateReplControlFiles({
-				...REPL_CONTROL_OPTIONS,
+				...controlOptions,
 				extension: "m",
 				buildSource: () => buildMLanguageDriverSource(runtime, controlPaths.sourceFile, controlPaths.doneFile, display),
 			});

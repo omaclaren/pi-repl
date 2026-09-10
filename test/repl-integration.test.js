@@ -7,6 +7,7 @@ import { dirname, join } from "node:path";
 import { promisify } from "node:util";
 import { randomUUID } from "node:crypto";
 import { acquireReplSessionSendLease, readReplSessionRecord, upsertReplSessionRecordEntry } from "../shared/repl-session-record.js";
+import { createReplSubmissionDisplay } from "../shared/repl-submission-display.js";
 import { createTestTmux, readProcessTable } from "./helpers/repl-test-tmux.js";
 
 const exec = promisify(execFile);
@@ -165,6 +166,16 @@ async function assertCompletionGap(f, result) {
 		const index = physical.lastIndexOf(marker);
 		return index >= 0 && physical.slice(index + marker.length).startsWith("\n\n");
 	}, 5000).catch((error) => { throw new Error(`Missing trailing display gap:\n${physical}`, { cause: error }); });
+}
+
+function assertCorrelatedControlFiles(files, entryId) {
+	assert.equal(typeof entryId, "string");
+	assert.ok(entryId.length > 0);
+	assert.ok(files.length > 0);
+	const { anchorId } = createReplSubmissionDisplay({ entryId });
+	const pattern = new RegExp(`^${anchorId}-[a-f0-9]{16}\\.[A-Za-z0-9]{1,8}$`);
+	for (const file of files) assert.match(file, pattern);
+	return anchorId;
 }
 
 async function assertVerifiedStop(f) {
@@ -472,7 +483,9 @@ for (const mode of ["timeout", "abort", "session-ended"]) {
 		const request = f.send(`import time\ntime.sleep(${mode === "session-ended" ? 30 : 2.5})\nprint('late result')`, { timeoutMs: 1000 }, abort.signal);
 		await assert.rejects(request, mode === "timeout" ? /Timed out waiting/ : /aborted/);
 		f.onEnter(undefined);
-		assert.ok(readdirSync(process.env.PI_REPL_CONTROL_ROOT).some((file) => file.endsWith(".py")));
+		const retained = readdirSync(process.env.PI_REPL_CONTROL_ROOT);
+		assert.ok(retained.some((file) => file.endsWith(".py")));
+		assertCorrelatedControlFiles(retained, readReplSessionRecord(recordId).entries.at(-1).id);
 		await assert.rejects(acquireReplSessionSendLease(recordId, { owner: "pi-studio:test", waitMs: 0 }), /busy in another compatible client/);
 		if (mode === "session-ended") {
 			await f.tmux("kill-session", "-t", f.sessionName);
@@ -581,7 +594,9 @@ for (const runtime of ["octave", "matlab"]) {
 			} else await assert.rejects(request, mode === "abort" ? /aborted/ : /Timed out/);
 			f.onEnter(undefined);
 			if (mode === "timeout" || mode === "abort") {
-				assert.ok(readdirSync(process.env.PI_REPL_CONTROL_ROOT).filter((name) => name.endsWith(".m")).length >= 2);
+				const retained = readdirSync(process.env.PI_REPL_CONTROL_ROOT);
+				assert.ok(retained.filter((name) => name.endsWith(".m")).length >= 2);
+				assertCorrelatedControlFiles(retained, readReplSessionRecord(id).entries.at(-1).id);
 				await assert.rejects(acquireReplSessionSendLease(id, { waitMs: 0 }), /busy/);
 			}
 			await eventually(async () => {
@@ -598,6 +613,7 @@ for (const runtime of ["octave", "matlab"]) {
 }
 
 const runtimeCases = [
+	["python", "pi_test_x = 41\nprint(pi_test_x + 1)", "raise ValueError('runtime-test-error')"],
 	["ipython", "pi_test_x = 41\nprint(pi_test_x + 1)", "raise ValueError('runtime-test-error')"],
 	["julia", "pi_test_x = 41\nprintln(pi_test_x + 1)", 'error("runtime-test-error")'],
 	["r", "pi_test_x <- 41\nprint(pi_test_x + 1)", 'stop("runtime-test-error")'],
@@ -611,15 +627,28 @@ const runtimeCases = [
 for (const [runtime, code, errorCode] of runtimeCases) {
 	test(`${runtime} multiline wrapper, display cleanup and runtime errors`, {
 		timeout: 60000,
-		skip: !(optionalRuntimes.has("all") || optionalRuntimes.has(runtime)) && "set PI_REPL_TEST_RUNTIMES=all to include installed optional runtimes",
+		skip: runtime !== "python" && !(optionalRuntimes.has("all") || optionalRuntimes.has(runtime)) && "set PI_REPL_TEST_RUNTIMES=all to include installed optional runtimes",
 	}, async (t) => {
 		const f = await fixture(t, { index: 1, runtime, startWithTool: true });
 		if (!f) return;
 		for (const echoMode of ["off", "summary", "full"]) {
 			// Exercise both wrapped and unwrapped R loader echoes.
 			if (runtime === "r" && echoMode === "full") await f.tmux("resize-window", "-t", `${f.sessionName}:^`, "-x", "320");
+			let allocated = [];
+			f.onEnter(() => { allocated = readdirSync(process.env.PI_REPL_CONTROL_ROOT); });
 			const result = await f.send(code, { echoMode });
+			f.onEnter(undefined);
+			const family = allocated.filter((name) => !name.endsWith(".txt"));
+			const anchorId = assertCorrelatedControlFiles(family, result.details.recordEntryId);
+			const sources = family.filter((name) => !name.endsWith(".done"));
+			assert.equal(sources.length, { ghci: 3, java: 2, octave: 2, matlab: 2 }[runtime] ?? 1, "all source, guard and driver files must share the prefix");
+			const pasteFiles = allocated.filter((name) => name.endsWith(".txt"));
+			assert.equal(pasteFiles.length, 1);
+			assert.match(pasteFiles[0], /^[a-f0-9]{16}\.txt$/, "transient paste-buffer files remain unlabelled");
+			assert.equal(result.details.submissionAnchorId, echoMode === "off" ? undefined : anchorId);
+			assert.equal(readdirSync(process.env.PI_REPL_CONTROL_ROOT).length, 0);
 			const pane = await f.tmux("capture-pane", "-p", "-J", "-t", `${f.sessionName}:^`, "-S", "-80");
+			if (runtime === "python" || runtime === "julia") assert.ok(pane.includes(sources[0]), pane);
 			assert.match(result.content[0].text.split("Output:\n")[1], /42/, pane);
 			assert.doesNotMatch(result.content[0].text, /──|│/);
 			if (echoMode !== "off") {
@@ -1028,6 +1057,7 @@ for (const runtime of ["ghci", "ruby", "java"]) {
 			await assert.rejects(acquireReplSessionSendLease(recordId, { waitMs: 0 }), /busy/);
 			const retained = readdirSync(process.env.PI_REPL_CONTROL_ROOT).filter((file) => file.endsWith({ ruby: ".rb", java: ".java", ghci: ".ghci" }[runtime]));
 			assert.equal(retained.length, { ruby: 1, java: 2, ghci: 3 }[runtime]);
+			assertCorrelatedControlFiles(retained, readReplSessionRecord(recordId).entries.at(-1).id);
 			for (const file of retained) assert.equal(statSync(join(process.env.PI_REPL_CONTROL_ROOT, file)).mode & 0o777, 0o600);
 			if (mode === "session-ended") {
 				await f.tmux("kill-session", "-t", f.sessionName);
