@@ -37,7 +37,8 @@
     "README.md",
     "CHANGELOG.md",
     "LICENSE",
-    "shared-julia-repl.png"
+    "shared-julia-repl.png",
+    "shared-julia-repl-dark.png"
   ],
   "pi": {
     "extensions": [
