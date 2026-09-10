@@ -94,6 +94,8 @@ Runtime-specific source wrappers and completion files are client implementation 
 
 A client removes the source and completion files after output capture. If a send times out or is aborted after submission, the same watcher that retains any shared lease also retains those files until the wrapper signals completion or the exact session lifetime disappears. Orphans left by a process crash are pruned after 24 hours on a later send. These files remain protocol-independent: their names and presence never turn raw pane activity into a clean-record entry.
 
+gnuplot's implementation additionally uses its guard's `.done` path as a private acknowledgment that the nested source returned. The pipe producer writes the source's actual completion file only after acknowledgment or native pipe closure on error/interruption. Neither a display marker, a comment written to the pipe, nor SIGINT alone establishes completion. This does not change the shared record or its lease protocol; source, guard and producer files are all retained until settlement.
+
 ## Compatibility
 
 A client that sees an unsupported version leaves it untouched. Existing tmux sessions gain v1 metadata lazily when inspected or used. Studio may import legacy browser-local entries as `pi-studio` entries using their stable IDs, making retries idempotent.

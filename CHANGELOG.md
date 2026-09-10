@@ -2,6 +2,13 @@
 
 All notable changes to `pi-repl` are documented here.
 
+## [Unreleased]
+
+### Added
+- Add standalone gnuplot sessions with command/tool routing, prompt readiness, persistent native state, direct terminal collaboration, clean records/exports and verified explicit stop. Launch the user's normal `gnuplot` command without selecting or repairing a plotting backend.
+- Add private source/guard/pipe-producer submissions that complete after native return or error/interrupt unwinding, without queuing terminal input, adding gnuplot variables, or changing print/output/table settings and error status. Preserve correlated filenames, Summary/Off/Full displays, and controls/leases through timeout or abort.
+- Add portable producer/quoting/routing tests and isolated gnuplot integration checks for state, hostile literal paths, errors, Ctrl-C, native pauses/exits, plotting, export and shutdown. Include an optional Qt offscreen graphics-child check, skipped when that backend is unavailable.
+
 ## [0.6.1] — 2026-09-10
 
 ### Changed

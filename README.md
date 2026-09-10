@@ -2,7 +2,7 @@
 
 Minimal [pi](https://github.com/badlogic/pi-mono) extension for collaborative REPL sessions using tmux.
 
-`pi-repl` starts a shared Python, IPython, Julia, R, Haskell (GHCi), Clojure, Ruby (irb), Java (JShell), Octave, or MATLAB REPL in tmux that you can attach to from another terminal window. You can work in the REPL directly, or ask pi to send and execute code there.
+`pi-repl` starts a shared Python, IPython, Julia, R, Haskell (GHCi), Clojure, Ruby (irb), Java (JShell), Octave, MATLAB, or gnuplot REPL in tmux that you can attach to from another terminal window. You can work in the REPL directly, or ask pi to send and execute code there.
 
 <picture>
   <source media="(prefers-color-scheme: dark)" srcset="./shared-julia-repl-dark.png">
@@ -13,7 +13,7 @@ Minimal [pi](https://github.com/badlogic/pi-mono) extension for collaborative RE
 
 ## Current scope
 
-Currently, `pi-repl` supports **Python/IPython**, **Julia**, **R**, **Haskell (GHCi)**, **Clojure**, **Ruby (irb)**, **Java (JShell)**, **Octave**, and **MATLAB**.
+Currently, `pi-repl` supports **Python/IPython**, **Julia**, **R**, **Haskell (GHCi)**, **Clojure**, **Ruby (irb)**, **Java (JShell)**, **Octave**, **MATLAB**, and **gnuplot**.
 
 With `pi-repl` you can:
 
@@ -23,7 +23,7 @@ With `pi-repl` you can:
 - ask pi, in natural language, to run code in any supported shared REPL
 - start, attach to, inspect, and stop a shared R REPL
 - start, attach to, inspect, and stop a shared Haskell (GHCi) REPL
-- start, attach to, inspect, and stop a shared Clojure, Ruby, Java, Octave, or MATLAB REPL
+- start, attach to, inspect, and stop a shared Clojure, Ruby, Java, Octave, MATLAB, or gnuplot REPL
 - let pi read the raw shared REPL transcript for extra context when needed
 - keep a bounded clean record of compatible-client submissions and captured output, synchronized automatically with a compatible `pi-studio` using the same tmux session
 - show bounded, request-specific submitted code and compact alignment anchors in the raw pane by default, with Summary previews, Off for quiet output, and Full as an explicit opt-in
@@ -66,6 +66,7 @@ Restart pi after installing.
 | `/repl java` | Start the shared Java session with `jshell` |
 | `/repl octave` | Start the shared Octave session with `octave-cli` |
 | `/repl matlab` | Start the shared MATLAB terminal session |
+| `/repl gnuplot` | Start the independent shared gnuplot session |
 | `/lab python` | Same as `/repl python` |
 | `/lab ipython` | Same as `/repl ipython` |
 | `/lab julia` | Same as `/repl julia` |
@@ -76,6 +77,7 @@ Restart pi after installing.
 | `/lab java` | Same as `/repl java` |
 | `/lab octave` | Same as `/repl octave` |
 | `/lab matlab` | Same as `/repl matlab` |
+| `/lab gnuplot` | Same as `/repl gnuplot` |
 | `/repl echo` | Show the current submitted-code pane-echo mode |
 | `/repl echo off` | Disable submitted-code displays and raw-history anchors for new sends |
 | `/repl echo summary` | Show short submissions in full, truncating after 6 lines or 600 source characters, with compact anchors (default) |
@@ -90,6 +92,7 @@ Restart pi after installing.
 | `/repl status java` | Show status for the shared Java session |
 | `/repl status octave` | Show status for the shared Octave session |
 | `/repl status matlab` | Show status for the shared MATLAB session |
+| `/repl status gnuplot` | Show status for the shared gnuplot session |
 | `/repl env` | Show which interpreter and environment the shared Python/IPython REPL is using |
 | `/repl attach` | Show how to attach from a new terminal window |
 | `/repl attach julia` | Show how to attach to the shared Julia session |
@@ -100,6 +103,7 @@ Restart pi after installing.
 | `/repl attach java` | Show how to attach to the shared Java session |
 | `/repl attach octave` | Show how to attach to the shared Octave session |
 | `/repl attach matlab` | Show how to attach to the shared MATLAB session |
+| `/repl attach gnuplot` | Show how to attach to the shared gnuplot session |
 | `/repl export` | Export the clean record when exactly one shared session is running |
 | `/repl export python` | Export the shared Python/IPython clean record as canonical Markdown |
 | `/repl export julia` | Export the shared Julia clean record as canonical Markdown |
@@ -110,6 +114,7 @@ Restart pi after installing.
 | `/repl export java` | Export the shared Java clean record as canonical Markdown |
 | `/repl export octave` | Export the shared Octave clean record as canonical Markdown |
 | `/repl export matlab` | Export the shared MATLAB clean record as canonical Markdown |
+| `/repl export gnuplot` | Export the shared gnuplot clean record as canonical Markdown |
 | `/repl stop` | Stop the shared session if only one is running |
 | `/repl stop python` | Stop the shared Python/IPython session |
 | `/repl stop julia` | Stop the shared Julia session |
@@ -120,6 +125,7 @@ Restart pi after installing.
 | `/repl stop java` | Stop the shared Java session |
 | `/repl stop octave` | Stop the shared Octave session |
 | `/repl stop matlab` | Stop the shared MATLAB session |
+| `/repl stop gnuplot` | Stop the shared gnuplot session |
 
 For R, both `/repl R` and `/repl r` work. The same applies to `/lab`, `/repl status`, `/repl attach`, `/repl export`, and `/repl stop`.
 
@@ -141,8 +147,8 @@ Notes:
 - while a shared REPL is running, `repl_status` exposes the versioned clean-record ID/path/count/tail and the separate raw session history path
 - pi can use the clean entries when it needs compatible-client code/output boundaries, or read the raw history for context about direct pane interaction
 - the relevant shared session must already be running and at a normal prompt before `repl_send`; it never auto-starts a missing session
-- you can ask pi naturally to run code in Python, IPython, Julia, R, Haskell, Clojure, Ruby, Java, Octave, or MATLAB; pi chooses the tool parameters internally
-- use `target: octave` or `target: matlab` for their separate sessions; they never substitute for one another
+- you can ask pi naturally to run code in Python, IPython, Julia, R, Haskell, Clojure, Ruby, Java, Octave, MATLAB, or gnuplot; pi chooses the tool parameters internally
+- use `target: octave`, `target: matlab`, or `target: gnuplot` for their separate sessions; they never substitute for one another
 - `repl_status` and `repl_send` accept `target: ruby` or `target: irb`, and `target: java` or `target: jshell`; use the canonical `ruby` and `java` names in `/repl` commands and `repl_start`
 - for plain Python, `print(...)` is the safest way to get values back reliably
 - in Haskell (GHCi), use normal interactive syntax such as `let` bindings or `:{ ... :}` blocks for multiline declarations
@@ -159,7 +165,7 @@ Ask, for example, “Start a shared Ruby REPL.” Pi can call:
 { "runtime": "ruby", "timeoutMs": 20000 }
 ```
 
-`repl_start` requires `runtime`: `python`, `ipython`, `julia`, `r`, `ghci`, `clojure`, `ruby`, `java`, `octave`, or `matlab`. It shares the `/repl` and `/lab` startup implementation: a detached tmux session, launched from Pi's working directory through your normal interactive login shell. It returns `created`/`reused`, `ready`, the requested and recorded runtimes, session status (including record/history paths), and an `attachCommand`. It does not open a terminal or attach a client automatically.
+`repl_start` requires `runtime`: `python`, `ipython`, `julia`, `r`, `ghci`, `clojure`, `ruby`, `java`, `octave`, `matlab`, or `gnuplot`. It shares the `/repl` and `/lab` startup implementation: a detached tmux session, launched from Pi's working directory through your normal interactive login shell. It returns `created`/`reused`, `ready`, the requested and recorded runtimes, session status (including record/history paths), and an `attachCommand`. It does not open a terminal or attach a client automatically.
 
 An existing session is reused without resetting variables, changing its working directory, replacing its history logger, or sending input. Python and IPython share `pi-repl-python`: requesting the other interpreter preserves the one already running and reports the difference. As with status inspection, legacy sessions can lazily acquire clean-record metadata; existing metadata is preserved.
 
@@ -199,6 +205,35 @@ A private `.m` driver loads the code and records completion without adding helpe
 
 Graphics retain the runtime's normal behaviour and installed backends. Figures are not captured automatically. Export explicitly when needed, for example `print(gcf, 'figure.png', '-dpng')`. Headless Octave graphics depend on an appropriate toolkit; `octave-cli` does not repair a missing or broken Qt installation.
 
+### gnuplot submissions
+
+gnuplot requires `gnuplot` on PATH. `/repl gnuplot` starts it through your normal interactive login shell, with its own `pi-repl-gnuplot` session. It is not a plotting backend for another REPL. Startup files, terminal selection, output destinations and plotting preferences retain their native behaviour; the extension does not add `-persist` or choose a graphics backend.
+
+Variables, functions, data blocks and plotting state are shared with direct terminal input. For example:
+
+```gnuplot
+a = 0.2
+f(x) = exp(-a*x)*sin(5*x)
+plot [0:20] f(x)
+```
+
+Change `a` directly in the attached terminal, then ask Pi to `replot` in gnuplot. Use `print` for console values; a user-selected `set print` destination is respected, so an empty tool result can be normal. Figures are not captured automatically. Export explicitly when wanted, selecting an installed file terminal and closing its output file afterwards. For example, with no output file currently open:
+
+```gnuplot
+set term push
+set term svg size 640,360
+set output 'figure.svg'
+replot
+unset output
+set term pop
+```
+
+Submit complete native scripts. Commands run via `load`, not expression-by-expression emulation. Earlier effects survive a later error; syntax errors, nested load failures and Ctrl-C return control without resetting variables or settings. In a loaded script, `exit`/`quit` returns from that script; **`exit gnuplot` ends the process**. `reset` and `reset session` deliberately change state. Interactive waits such as `pause -1` remain genuine waits for the person at the terminal; do not request them accidentally.
+
+A private `.gp` source and acknowledgment guard run through a short-lived Node pipe producer (`.cjs`). The producer uses pipe closure to detect native error/interrupt unwinding, rather than guessing from a prompt or queuing completion commands into terminal input. It does not introduce gnuplot helper variables or alter `set print`, terminal/output/table settings, or native error status. Display markers go to the terminal's stderr independently of `set print`. Paths support Unicode, quotes and shell metacharacters, but not line breaks or NUL bytes. Source/guard/driver files remain private and retained with the send lease through timeout/abort until completion or the exact session ends.
+
+The normal `gnuplot>` prompt is recognised for startup readiness. Native graphics require a working installed terminal/backend; no backend repair or automatic window capture is performed. This support is in `pi-repl`, not new gnuplot controls in `pi-studio`.
+
 ## Shared clean record
 
 `pi-repl` remains independently usable and has no dependency on `pi-studio`. When a compatible `pi-studio` uses the same tmux REPL session, both clients automatically discover one session-owned clean record and see each other's submitted code and captured output.
@@ -215,7 +250,7 @@ Pane echo, enabled in Summary mode by default, places one blank line before the 
 
 Use `/repl echo off|summary|full` to change the default for the current Pi process, or set `PI_REPL_ECHO_MODE` before startup. A per-send `echoMode` overrides that default without changing it. **Summary** is the startup default: it shows short submissions in full, truncates after 6 lines or 600 source characters, and puts a plain output divider before runtime output. **Off** disables the optional display and alignment anchors for quiet output, although the REPL can still echo its unavoidable temporary-file control command. **Full** is an explicit opt-in that raises the bounds to 40 lines or 4,000 source characters. Terminal, line-separator, and bidirectional control characters are escaped in all visible previews.
 
-GHCi, Ruby, Java, Octave and MATLAB use a read-only tmux cursor-column query, with a short timeout, to avoid adding an empty row before `done` while still separating it from output that has no trailing newline. If that query is unavailable, they fall back to the safe newline guard. Output streams and interactive echo settings are not replaced.
+GHCi, Ruby, Java, Octave, MATLAB and gnuplot use a read-only tmux cursor-column query, with a short timeout, to avoid adding an empty row before `done` while still separating it from output that has no trailing newline. If that query is unavailable, they fall back to the safe newline guard. Output streams and interactive echo settings are not replaced.
 
 Both Summary and Full persist the displayed source in raw terminal history. Off suppresses this extra copy, not the submitted code already retained in tool results and the clean record. Explicit `PI_REPL_ECHO_MODE=off` settings are still honoured.
 
@@ -242,6 +277,7 @@ The default shared tmux session names are:
 - `pi-repl-java` for Java/JShell
 - `pi-repl-octave` for Octave
 - `pi-repl-matlab` for MATLAB
+- `pi-repl-gnuplot` for gnuplot
 
 Nonzero tmux `base-index` and `pane-base-index` settings are supported. `pi-repl` selects the lowest-indexed pane in the lowest-indexed window, then pins that pane's stable ID for each send so switching active windows cannot redirect its output capture.
 
@@ -299,6 +335,10 @@ tmux attach -t pi-repl-python
 /repl status java
 /repl attach java
 
+/repl gnuplot
+/repl status gnuplot
+/repl attach gnuplot
+
 /repl export python
 ```
 
@@ -313,6 +353,7 @@ Example requests once the REPL is running:
 - `in the shared Clojure REPL, run (map inc [1 2 3])`
 - `in the shared Ruby REPL, run (1..3).map { |x| x + 1 }`
 - `in the shared Java REPL, run System.out.println(1 + 2);`
+- `in the shared gnuplot REPL, replot using the current parameter values`
 
 ## Notes
 
@@ -343,9 +384,12 @@ PI_REPL_TEST_RUNTIMES=all npm test
 PI_REPL_TEST_RUNTIMES=julia,r npm run test:integration
 PI_REPL_TEST_RUNTIMES=ruby,java npm run test:integration
 PI_REPL_TEST_RUNTIMES=octave,matlab npm run test:integration
+PI_REPL_TEST_RUNTIMES=gnuplot npm run test:integration
 ```
 
 The integration tests cover command/tool startup across runtimes, concurrent starts, state-preserving reuse, readiness timeout on unfinished direct input, nonzero indexes, pane selection, session restarts, raw-log permissions, clean records and exports, concurrent sends, timeout/abort leases, and runtime wrappers. Portable startup tests also cover explicit runtime validation, failures, cancellation, custom/continuation prompts, and bounded status output. Ruby/Java checks also cover shared direct input, interpolation, Unicode and quoted control paths, persistent declarations, malformed input and error recovery. Octave/MATLAB checks cover base-workspace and direct-input persistence, `ans`, scripts/functions, cwd/path changes, Unicode, syntax/runtime errors, clearing, return, interruption, exit, retained controls and figure-file export where a non-windowed backend is available. MATLAB tests need a working licence; they isolate preferences and startup files without changing the installed licence. Optional runtime tests are opt-in and skip missing executables. Julia tests resolve the existing juliaup-selected binary before isolating the test home.
+
+gnuplot checks cover direct edits, functions/data blocks, literal control paths, native settings and print/table/output destinations, errors and nested scripts, Ctrl-C, genuine input waits, retained leases, native exit, text/SVG plotting and verified stop. An optional Qt offscreen test checks graphics-child ownership where the backend is available; missing plugins are reported as a skip, not repaired. Test-only flags isolate gnuplot startup files and select a text terminal; production startup leaves these choices to the user.
 
 Test launchers record PID/owner/start-time identities before executing a runtime. The test harness tracks server descendants and pane process groups across session replacement, then individually revalidates survivors before TERM/KILL cleanup. It never kills by executable name or signals a whole process group. The teardown hook is registered before launch, runs after setup failures too, verifies no owned runtime is still running, and removes its private socket directory only after successful cleanup. Regression tests cover ignored hangup/TERM, orphaned children, PID reuse, failed setup, and preservation of unrelated sessions. Production `/repl stop` tests independently verify runtime exit before test teardown, across all supported runtimes, including a busy GHCi session, resistant child processes, linked windows and same-name replacement races.
 

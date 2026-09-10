@@ -1,13 +1,14 @@
 import { after, test } from "node:test";
 import assert from "node:assert/strict";
 import { execFile, spawnSync } from "node:child_process";
-import { mkdirSync, mkdtempSync, readFileSync, readdirSync, realpathSync, rmSync, statSync, writeFileSync } from "node:fs";
+import { existsSync, mkdirSync, mkdtempSync, readFileSync, readdirSync, realpathSync, rmSync, statSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { dirname, join } from "node:path";
 import { promisify } from "node:util";
 import { randomUUID } from "node:crypto";
 import { acquireReplSessionSendLease, readReplSessionRecord, upsertReplSessionRecordEntry } from "../shared/repl-session-record.js";
 import { createReplSubmissionDisplay } from "../shared/repl-submission-display.js";
+import { gnuplotStringLiteral } from "../shared/repl-gnuplot.js";
 import { createTestTmux, readProcessTable } from "./helpers/repl-test-tmux.js";
 
 const exec = promisify(execFile);
@@ -66,7 +67,7 @@ async function fixture(t, { index = 0, runtime = "python", controlName, startWit
 		python: "-I -q -i", ipython: "--no-banner --no-confirm-exit --simple-prompt --HistoryManager.enabled=False",
 		julia: "--startup-file=no --history-file=no -i", r: "--vanilla --quiet", ghci: "-ignore-dot-ghci -v0", clojure: "",
 		ruby: "-f --noreadline", java: `-J-Duser.home=${quote(home)} -J-Djava.util.prefs.userRoot=${quote(join(home, "java-prefs"))}`,
-		octave: "--no-init-file --no-history --no-line-editing", matlab: "",
+		octave: "--no-init-file --no-history --no-line-editing", matlab: "", gnuplot: "-d",
 	}[runtime];
 	const launcher = runtime === "r" ? "R" : runtime === "ruby" ? "irb" : runtime === "java" ? "jshell" : runtime === "octave" ? "octave-cli" : runtime;
 	// A distinct socket/server and empty config: never target the user's tmux.
@@ -83,6 +84,13 @@ async function fixture(t, { index = 0, runtime = "python", controlName, startWit
 	delete env.JAVA_TOOL_OPTIONS;
 	delete env.JDK_JAVA_OPTIONS;
 	delete env._JAVA_OPTIONS;
+	if (runtime === "gnuplot") {
+		env.GNUTERM = "dumb";
+		env.QT_QPA_PLATFORM = "offscreen";
+		delete env.GNUPLOT_LIB;
+		delete env.GNUPLOT_DRIVER_DIR;
+		delete env.GNUHELP;
+	}
 	if (runtime === "matlab") {
 		env.MATLAB_PREFDIR = join(home, "matlab-prefs");
 		delete env.MATLABPATH;
@@ -145,7 +153,7 @@ async function fixture(t, { index = 0, runtime = "python", controlName, startWit
 		await repl(runtime);
 	}
 	assert.equal(notifications.some((n) => n.level === "error" || n.level === "warning"), false, JSON.stringify(notifications));
-	const prompt = { python: />>>/, ipython: /In \[\d+\]:/, julia: /julia>/, r: /(^|\n)>/, ghci: /ghci>/, clojure: /user=>/, ruby: /irb\(.*\).*?>/, java: /jshell>/, octave: /octave:\d+>/, matlab: /(^|\n)>>/ }[runtime];
+	const prompt = { python: />>>/, ipython: /In \[\d+\]:/, julia: /julia>/, r: /(^|\n)>/, ghci: /ghci>/, clojure: /user=>/, ruby: /irb\(.*\).*?>/, java: /jshell>/, octave: /octave:\d+>/, matlab: /(^|\n)>>/, gnuplot: /gnuplot>/ }[runtime];
 	let startupOutput = "";
 	try {
 		await eventually(async () => {
@@ -623,6 +631,7 @@ const runtimeCases = [
 	["java", "int pi_test_x = 41;\nSystem.out.println(pi_test_x + 1);", 'throw new RuntimeException("runtime-test-error");'],
 	["octave", "pi_test_x = 41;\nfprintf('%d\\n', pi_test_x + 1);", "error('runtime-test-error');"],
 	["matlab", "pi_test_x = 41;\nfprintf('%d\\n', pi_test_x + 1);", "error('runtime-test-error');"],
+	["gnuplot", "pi_test_x = 41\nprint pi_test_x + 1", 'exit error "runtime-test-error"'],
 ];
 for (const [runtime, code, errorCode] of runtimeCases) {
 	test(`${runtime} multiline wrapper, display cleanup and runtime errors`, {
@@ -641,7 +650,7 @@ for (const [runtime, code, errorCode] of runtimeCases) {
 			const family = allocated.filter((name) => !name.endsWith(".txt"));
 			const anchorId = assertCorrelatedControlFiles(family, result.details.recordEntryId);
 			const sources = family.filter((name) => !name.endsWith(".done"));
-			assert.equal(sources.length, { ghci: 3, java: 2, octave: 2, matlab: 2 }[runtime] ?? 1, "all source, guard and driver files must share the prefix");
+			assert.equal(sources.length, { ghci: 3, java: 2, octave: 2, matlab: 2, gnuplot: 3 }[runtime] ?? 1, "all source, guard and driver files must share the prefix");
 			const pasteFiles = allocated.filter((name) => name.endsWith(".txt"));
 			assert.equal(pasteFiles.length, 1);
 			assert.match(pasteFiles[0], /^[a-f0-9]{16}\.txt$/, "transient paste-buffer files remain unlabelled");
@@ -1025,7 +1034,7 @@ test("java driver stops with an explicit /exit and releases both files and its l
 	assert.equal((await f.status()).details.java.running, false);
 });
 
-for (const runtime of ["ghci", "java"]) {
+for (const runtime of ["ghci", "java", "gnuplot"]) {
 	test(`${runtime} refuses line breaks in command paths before submission and releases its lease`, {
 		timeout: 30000, skip: !(optionalRuntimes.has("all") || optionalRuntimes.has(runtime)),
 	}, async (t) => {
@@ -1082,3 +1091,211 @@ for (const runtime of ["ghci", "ruby", "java"]) {
 		});
 	}
 }
+
+const gnuplotTestOptions = { timeout: 60000, skip: !(optionalRuntimes.has("all") || optionalRuntimes.has("gnuplot")) };
+const outputOf = (result) => result.content[0].text.split("Output:\n")[1];
+
+async function assertGnuplotSettled(recordId) {
+	await eventually(async () => {
+		try { const lease = await acquireReplSessionSendLease(recordId, { waitMs: 0 }); await lease.release(); return true; }
+		catch (error) { if (/busy/.test(error.message)) return false; throw error; }
+	});
+	assert.equal(readdirSync(process.env.PI_REPL_CONTROL_ROOT).length, 0);
+}
+
+test("gnuplot native state, direct edits, literal paths, plots, records and exports", gnuplotTestOptions, async (t) => {
+	const f = await fixture(t, { runtime: "gnuplot", controlName: "gnuplot 'single''pair' \"quoted\" `touch GNUPLOT_INJECTED` $(touch GNUPLOT_INJECTED) # @missing \\ λ" });
+	if (!f) return;
+	const status = (await f.status()).details.gnuplot;
+	assert.equal(status.runtime, "gnuplot");
+	assert.equal(statSync(status.historyPath).mode & 0o777, 0o600);
+	const capture = () => f.tmux("capture-pane", "-p", "-J", "-t", `${f.sessionName}:^`, "-S", "-200");
+	await f.send('a = 0.2\nf(x) = exp(-a*x)*sin(5*x)\nset term dumb size 55,15\nset title "Native gnuplot"\nplot [0:20] f(x)');
+	await f.tmux("send-keys", "-t", `${f.sessionName}:^`, "-l", 'a = 0.4; print "human-ready"');
+	await f.tmux("send-keys", "-t", `${f.sessionName}:^`, "C-m");
+	await eventually(async () => /\nhuman-ready\ngnuplot>/.test(await capture()));
+	assert.equal(outputOf(await f.send("print a\nprint f(0)")), "0.4\n0.0");
+	assert.match(outputOf(await f.send("replot")), /Native gnuplot/);
+	const literal = "literal '' `touch GNUPLOT_INJECTED` @missing $value \\ λ 🧪";
+	assert.equal(outputOf(await f.send(`print ${gnuplotStringLiteral(literal)}`, { echoMode: "full" })), literal);
+	assert.equal(existsSync(join(f.cwd, "GNUPLOT_INJECTED")), false);
+	const svg = join(f.cwd, "native 'λ'.svg");
+	await f.send(`set term push\nset term svg size 640,360\nset output ${gnuplotStringLiteral(svg)}\nreplot\nunset output\nset term pop`);
+	assert.match(readFileSync(svg, "utf8"), /<svg[\s>]/);
+	assert.match(readFileSync(svg, "utf8"), /Native gnuplot/);
+	assert.match(outputOf(await f.send("show terminal")), /dumb/);
+	const final = (await f.status()).details.gnuplot;
+	assert.equal(final.recordId, status.recordId);
+	assert.ok(final.recordEntries.every((entry) => entry.runtime === "gnuplot"));
+	assert.ok(final.recordEntries.every((entry) => !/human-ready/.test(entry.code)));
+	await eventually(() => readFileSync(status.historyPath, "utf8").includes("human-ready"));
+	await f.repl("export gnuplot");
+	const exported = readdirSync(f.cwd).find((file) => file.endsWith(".md"));
+	assert.match(readFileSync(join(f.cwd, exported), "utf8"), /```gnuplot/);
+	await assertGnuplotSettled(status.recordId);
+	await assertVerifiedStop(f);
+});
+
+test("gnuplot preserves print/output destinations, table mode, settings and native error status", gnuplotTestOptions, async (t) => {
+	const f = await fixture(t, { runtime: "gnuplot" });
+	if (!f) return;
+	const printFile = join(f.cwd, "user-print.txt"), plotFile = join(f.cwd, "user-plot.txt"), tableFile = join(f.cwd, "user-table.txt");
+	const beforeFile = join(f.cwd, "before.gp"), afterFile = join(f.cwd, "after.gp");
+	await f.send(`set print ${gnuplotStringLiteral(printFile)}\nset output ${gnuplotStringLiteral(plotFile)}\nset title 'keep title'\nset logscale x\nset label 3 'keep label'\nsave set ${gnuplotStringLiteral(beforeFile)}`);
+	assert.equal(outputOf(await f.send('print "first"')), "(no output)");
+	assert.equal(outputOf(await f.send('print "second"', { echoMode: "off" })), "(no output)");
+	await f.send(`save set ${gnuplotStringLiteral(afterFile)}`);
+	assert.equal(readFileSync(afterFile, "utf8"), readFileSync(beforeFile, "utf8"));
+	await f.send(`set table ${gnuplotStringLiteral(tableFile)}\nplot [1:3] x`);
+	await f.send('print "third"');
+	await f.send('plot [1:3] 2*x\nunset table\nset print\nunset output');
+	assert.equal(readFileSync(printFile, "utf8"), "first\nsecond\nthird\n");
+	assert.doesNotMatch(readFileSync(plotFile, "utf8") + readFileSync(tableFile, "utf8"), /──|pi-repl|done/);
+	assert.match(readFileSync(tableFile, "utf8"), /2\*x/);
+	await f.send('system "exit 7"');
+	assert.equal(outputOf(await f.send("print GPVAL_SYSTEM_ERRNO")), "7");
+	await f.send("print undefined_state_probe");
+	assert.equal(outputOf(await f.send("print GPVAL_ERRNO")), "1");
+	assert.match(outputOf(await f.send("print GPVAL_ERRMSG")), /undefined variable: undefined_state_probe/);
+	await assertVerifiedStop(f);
+});
+
+test("gnuplot display preserves literal markers, Unicode and native output spacing", gnuplotTestOptions, async (t) => {
+	const f = await fixture(t, { runtime: "gnuplot" });
+	if (!f) return;
+	const cases = [
+		['print "42"', "42\n"],
+		['system "printf \'no newline\'"', "no newline\n"],
+		['print "λ 🧪"', "λ 🧪\n"],
+		[`print "${"x".repeat(80)}"`, "x".repeat(80) + "\n"],
+		['print "first\\n\\nlast\\n"', "first\n\nlast\n\n"],
+		['print "── output ──"', "── output ──\n"],
+		['answer = 42', ""],
+	];
+	for (const echoMode of ["summary", "full"]) {
+		for (const [code, expected] of cases) {
+			const result = await f.send(code, { echoMode });
+			assert.equal(outputOf(result), expected.trim() || "(no output)");
+			const pane = await f.tmux("capture-pane", "-p", "-J", "-t", `${f.sessionName}:^`, "-S", "-150");
+			const begin = `── pi-repl · input · 1 line · id: ${result.details.submissionAnchorId} ──`;
+			const latest = pane.slice(pane.lastIndexOf(begin));
+			const start = latest.indexOf("── output ──\n") + "── output ──\n".length;
+			const end = latest.lastIndexOf(`── done · id: ${result.details.submissionAnchorId} ──`);
+			assert.equal(latest.slice(start, end), expected);
+			await assertCompletionGap(f, result);
+		}
+	}
+	await f.tmux("resize-window", "-t", `${f.sessionName}:^`, "-x", "48");
+	const literal = await f.send('$text << EOD\nfirst\n── output ──\n│ literal pipe\nlast\nEOD\nprint $text', { echoMode: "full" });
+	assert.equal(outputOf(literal), "first\n── output ──\n│ literal pipe\nlast");
+	await assertVerifiedStop(f);
+});
+
+test("gnuplot malformed and nested scripts recover without rollback or helper variables", gnuplotTestOptions, async (t) => {
+	const f = await fixture(t, { runtime: "gnuplot" });
+	if (!f) return;
+	const recordId = (await f.status()).details.gnuplot.recordId;
+	const nested = join(f.cwd, "nested 'λ'.gp");
+	writeFileSync(nested, 'nested_value = 17\nexit error "nested-error"\nnested_value = 99\n');
+	const failures = [
+		["a = (", /invalid expression/],
+		['do for [i=1:2] {\nprint i', /missing block terminator/],
+		['print "unterminated', /unterminated|invalid|expecting/],
+		['a = 5\nprint missing_value\na = 6', /undefined variable/],
+		[`load ${gnuplotStringLiteral(nested)}`, /nested-error/],
+	];
+	for (const echoMode of ["off", "summary", "full"]) {
+		for (const [code, expected] of failures) {
+			const result = await f.send(code, { echoMode, timeoutMs: 3000 });
+			assert.match(outputOf(result), expected);
+			if (echoMode !== "off") await assertCompletionGap(f, result);
+			await assertGnuplotSettled(recordId);
+		}
+		assert.equal(outputOf(await f.send("print a\nprint nested_value", { echoMode })), "5\n17");
+	}
+	await f.send("a=8\nexit\na=9");
+	assert.equal(outputOf(await f.send("print a")), "8");
+	await f.send("reset session");
+	assert.equal(outputOf(await f.send('print exists("a")\nprint exists("nested_value")')), "0\n0");
+	const variables = outputOf(await f.send("show variables"));
+	assert.doesNotMatch(variables, /pi_repl|__pi|sourceFile|guardFile|ending|writable/);
+	await f.send('$data << EOD\n1 2\n2 4\nEOD\nplot $data using 1:2');
+	await assertVerifiedStop(f);
+});
+
+for (const mode of ["timeout", "abort", "interrupt", "pause-input", "stop"]) {
+	test(`gnuplot ${mode} retains controls and lease until native completion or verified exit`, gnuplotTestOptions, async (t) => {
+		const f = await fixture(t, { runtime: "gnuplot" });
+		if (!f) return;
+		const recordId = (await f.status()).details.gnuplot.recordId;
+		const abort = new AbortController();
+		if (["abort", "interrupt", "stop"].includes(mode)) f.onEnter(() => abort.abort());
+		const code = mode === "pause-input" ? 'pause -1 "waiting-for-human"\nfinished = 42' : `print "started-native-work"\npause ${["interrupt", "stop"].includes(mode) ? 30 : 2.5}\nfinished = 42`;
+		await assert.rejects(f.send(code, { timeoutMs: 1000 }, abort.signal), ["abort", "interrupt", "stop"].includes(mode) ? /aborted/ : /Timed out waiting/);
+		f.onEnter(undefined);
+		await assert.rejects(acquireReplSessionSendLease(recordId, { waitMs: 0 }), /busy/);
+		const controls = readdirSync(process.env.PI_REPL_CONTROL_ROOT);
+		assert.equal(controls.filter((file) => file.endsWith(".gp")).length, 2);
+		assert.equal(controls.filter((file) => file.endsWith(".cjs")).length, 1);
+		assert.equal(controls.some((file) => file.endsWith(".done")), false);
+		assertCorrelatedControlFiles(controls, readReplSessionRecord(recordId).entries.at(-1).id);
+		for (const file of controls) assert.equal(statSync(join(process.env.PI_REPL_CONTROL_ROOT, file)).mode & 0o777, 0o600);
+		if (mode === "stop") await assertVerifiedStop(f);
+		if (mode === "interrupt" || mode === "pause-input") {
+			await eventually(async () => (await f.tmux("capture-pane", "-p", "-J", "-t", `${f.sessionName}:^`, "-S", "-80")).includes(mode === "interrupt" ? "── output ──\nstarted-native-work" : "── output ──\nwaiting-for-human"));
+			await f.tmux("send-keys", "-t", `${f.sessionName}:^`, mode === "interrupt" ? "C-c" : "C-m");
+		}
+		await assertGnuplotSettled(recordId);
+		if (mode !== "stop") {
+			assert.equal(outputOf(await f.send('print exists("finished")')), mode === "interrupt" ? "0" : "1");
+			await assertVerifiedStop(f);
+		}
+	});
+}
+
+test("gnuplot explicit process exit releases private controls and lease", gnuplotTestOptions, async (t) => {
+	const f = await fixture(t, { runtime: "gnuplot" });
+	if (!f) return;
+	const recordId = (await f.status()).details.gnuplot.recordId;
+	try { await f.send("exit gnuplot", { timeoutMs: 5000 }); }
+	catch (error) { assert.match(error.message, /REPL session ended/); }
+	await eventually(async () => !(await f.status()).details.gnuplot.running);
+	await assertGnuplotSettled(recordId);
+});
+
+test("gnuplot Qt graphics child survives sends/errors and exits with verified stop", gnuplotTestOptions, async (t) => {
+	const f = await fixture(t, { runtime: "gnuplot" });
+	if (!f) return;
+	const rootPid = Number(await f.tmux("display-message", "-p", "-t", `${f.sessionName}:^`, "#{pane_pid}"));
+	const identity = (p) => `${p.pid}:${p.uid}:${p.startedAt}`;
+	const descendants = (table) => {
+		const pids = new Set([rootPid]);
+		let changed;
+		do {
+			changed = false;
+			for (const p of table) if (pids.has(p.ppid) && !pids.has(p.pid)) { pids.add(p.pid); changed = true; }
+		} while (changed);
+		return table.filter((p) => p.pid !== rootPid && pids.has(p.pid) && !p.state.startsWith("Z"));
+	};
+	const before = new Set(descendants(await readProcessTable()).map(identity));
+	const unavailable = /unknown or ambiguous terminal|could not connect to display|Could not.*plugin/i;
+	let text;
+	try { text = outputOf(await f.send('set term qt\nplot sin(x)', { timeoutMs: 5000 })); }
+	catch (error) {
+		if (!unavailable.test(error.message)) throw error;
+		text = error.message;
+	}
+	if (unavailable.test(text)) {
+		await assertVerifiedStop(f);
+		t.skip("Qt offscreen backend is unavailable; no runtime/backend configuration was repaired");
+		return;
+	}
+	assert.doesNotMatch(text, /error|failed|not initialized/i);
+	const graphics = descendants(await readProcessTable()).filter((p) => !before.has(identity(p)));
+	assert.ok(graphics.length > 0, "native graphics must create an owned child, not merely reuse the pre-existing runtime");
+	assert.match(outputOf(await f.send("print undefined_with_graphics", { timeoutMs: 3000 })), /undefined variable/);
+	assert.equal(outputOf(await f.send("print 42\nreplot", { timeoutMs: 3000 })).trim(), "42");
+	const after = new Set(descendants(await readProcessTable()).map(identity));
+	assert.ok(graphics.some((p) => after.has(identity(p))), "the graphics child must survive later sends, unlike a short-lived producer");
+	await assertVerifiedStop(f);
+});

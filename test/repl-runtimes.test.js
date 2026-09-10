@@ -24,7 +24,7 @@ function fixture() {
 	};
 }
 
-for (const [runtime, alias, executable] of [["ruby", " IRB ", "irb"], ["java", " JShell ", "jshell"], ["octave", " OCTAVE ", "octave-cli --quiet --interactive"], ["matlab", " MATLAB ", "matlab -nodesktop -nosplash"]]) {
+for (const [runtime, alias, executable] of [["ruby", " IRB ", "irb"], ["java", " JShell ", "jshell"], ["octave", " OCTAVE ", "octave-cli --quiet --interactive"], ["matlab", " MATLAB ", "matlab -nodesktop -nosplash"], ["gnuplot", " GNUPLOT ", "gnuplot"]]) {
 	test(`${runtime} command and tool routing never fall back to Python`, async () => {
 		const f = fixture();
 		for (const target of [runtime, alias]) {
@@ -56,10 +56,10 @@ test("help and schemas advertise Ruby, Java, exports and existing echo controls"
 	const f = fixture();
 	await f.command("");
 	const help = f.notifications.at(-1).message;
-	for (const name of ["ruby", "java", "octave", "matlab"]) {
+	for (const name of ["ruby", "java", "octave", "matlab", "gnuplot"]) {
 		assert.match(help, new RegExp(`/repl ${name}`));
 		assert.match(f.tools.get("repl_send").parameters.properties.target.description, new RegExp(name));
 	}
 	assert.match(help, /\/repl echo \[off\|summary\|full\]/);
-	assert.match(help, /\/repl export \[python\|julia\|r\|ghci\|clojure\|ruby\|java\|octave\|matlab\]/);
+	assert.match(help, /\/repl export \[python\|julia\|r\|ghci\|clojure\|ruby\|java\|octave\|matlab\|gnuplot\]/);
 });

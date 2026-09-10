@@ -29,7 +29,8 @@
     "java",
     "jshell",
     "octave",
-    "matlab"
+    "matlab",
+    "gnuplot"
   ],
   "files": [
     "index.ts",
