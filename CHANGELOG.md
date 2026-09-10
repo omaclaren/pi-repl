@@ -2,13 +2,16 @@
 
 All notable changes to `pi-repl` are documented here.
 
-## [Unreleased]
+## [0.6.1] — 2026-09-10
 
 ### Changed
 - Prefix submission source, guard, driver and completion filenames with the same short ID used by their input/done markers. Keep independent 64-bit random allocation tokens, private/exclusive creation, timeout/abort retention, and cleanup of older unprefixed files. Off still suppresses display markers; transient paste-buffer names remain unprefixed. Record IDs, display hashes and the shared protocol are unchanged.
 
 ### Fixed
 - Reject control-file extensions containing trailing line breaks, keeping allocated filenames consistent with the strict cleanup parser.
+
+### Documentation
+- Refresh the shared Julia REPL example with matching control-file IDs, and select light/dark screenshots automatically in the README.
 
 ## [0.6.0] — 2026-09-10
 
