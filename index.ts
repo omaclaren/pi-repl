@@ -40,6 +40,7 @@ import { createPrivateReplHistoryFile } from "./shared/repl-history.js";
 import { stopVerifiedReplSession } from "./shared/repl-session-stop.js";
 import { mStringLiteral, buildMLanguageControlSource, buildMLanguageDriverSource } from "./shared/repl-m-language.js";
 import { buildGnuplotSubmissionLine, buildGnuplotGuardSource, buildGnuplotDriverSource } from "./shared/repl-gnuplot.js";
+import { GNUPLOT_OWNER_ENV, GNUPLOT_OWNER_OPTION } from "./shared/repl-gnuplot-processes.js";
 
 const SUPPORTED_RUNTIMES = ["julia", "python", "ipython", "r", "ghci", "clojure", "clj", "ruby", "java", "octave", "matlab", "gnuplot", "bun"] as const;
 const DEFAULT_PYTHON_SESSION = "pi-repl-python";
@@ -2102,8 +2103,10 @@ async function startDefaultReplSession(
 	if (!exists) {
 		// tmux atomically creates the name. Do not use -A, respawn or kill: a
 		// concurrent winner must be reused without rewriting its metadata/log.
+		const gnuplotOwner = runtime === "gnuplot" ? randomUUID().replace(/-/g, "") : undefined;
 		const result = await execTmux(pi, [
-			"new-session", "-d", "-P", "-F", "#{session_id}", "-s", sessionName, "-c", cwd, shellLaunch.command,
+			"new-session", "-d", "-P", "-F", "#{session_id}", "-s", sessionName, "-c", cwd,
+			...(gnuplotOwner ? ["-e", `${GNUPLOT_OWNER_ENV}=${gnuplotOwner}`] : []), shellLaunch.command,
 		], cwd, 10_000);
 		if (result.code !== 0) {
 			if (!(await tmuxSessionExists(pi, sessionName, cwd))) {
@@ -2116,6 +2119,9 @@ async function startDefaultReplSession(
 			if (!/^\$\d+$/.test(sessionTarget)) throw new Error(`Could not identify newly created session ${sessionName}; inspect it with repl_status. It has not been stopped.`);
 			// Finish initial metadata even if the caller cancels during creation.
 			// Pin the returned ID so an external same-name replacement is untouched.
+			if (gnuplotOwner && !(await setTmuxSessionOption(pi, sessionTarget, GNUPLOT_OWNER_OPTION, gnuplotOwner, cwd))) {
+				warnings.push("Could not record gnuplot helper ownership; detached graphics cleanup cannot be verified.");
+			}
 			if (!(await setTmuxSessionOption(pi, sessionTarget, REPL_RUNTIME_OPTION, runtime, cwd))) {
 				warnings.push(`Could not record the runtime for ${sessionName}.`);
 			}
@@ -2134,6 +2140,7 @@ async function startDefaultReplSession(
 			`Launch method: ${shellLaunch.shell} -i -l -c '${buildRuntimeLaunchCommand(runtime)}' inside tmux.`,
 			...(target === "python" ? ["This respects your normal shell-level Python setup (aliases, pyenv/virtualenv/conda activation, shell init, etc.)."] : []),
 			...(target === "clojure" ? ["`clojure` is used without rlwrap; `/repl clj` remains an alias."] : []),
+			...(target === "gnuplot" ? ["An inherited ownership marker identifies this session's interpreter and Qt helpers during explicit stop; plotting settings are unchanged."] : []),
 		] : []),
 		ready ? "Readiness: normal prompt observed (snapshot only, not a reservation)." : "Readiness: unconfirmed.",
 		...warnings.map((warning) => `Warning: ${warning}`),
@@ -2453,7 +2460,8 @@ async function stopReplSession(
 			sessionName,
 		});
 		const escalated = result.signals.length ? ` Cleaned up ${new Set(result.signals.map((entry) => entry.pid)).size} surviving process(es).` : "";
-		notify(ctx, `Stopped default ${getSessionDisplayName(selector)} REPL session: ${sessionName}. Verified owned runtime processes exited.${escalated}`, "info");
+		const warnings = result.warnings ?? [];
+		notify(ctx, `Stopped default ${getSessionDisplayName(selector)} REPL session: ${sessionName}. Verified owned runtime processes exited.${escalated}${warnings.length ? "\n" + warnings.join("\n") : ""}`, warnings.length ? "warning" : "info");
 	} catch (error) {
 		notify(ctx, `Could not fully stop ${sessionName}: ${error instanceof Error ? error.message : String(error)}`, "error");
 	}

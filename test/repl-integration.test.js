@@ -97,7 +97,7 @@ async function fixture(t, { index = 0, runtime = "python", controlName, startWit
 		// Shadow a user startup script in this isolated working directory.
 		writeFileSync(join(cwd, "startup.m"), "");
 	}
-	const tmuxHarness = createTestTmux(t, { cwd, env, config });
+	const tmuxHarness = createTestTmux(t, { cwd, env, config, trackDetachedGnuplot: runtime === "gnuplot" });
 	writeFileSync(join(bin, launcher), `#!/bin/sh\n${tmuxHarness.launcherPrologue}exec ${quote(executable)} ${flags} "$@"\n`, { mode: 0o700 });
 	const calls = [];
 	const tools = new Map();
@@ -163,7 +163,7 @@ async function fixture(t, { index = 0, runtime = "python", controlName, startWit
 	} catch (error) {
 		throw new Error(`${runtime} startup failed: ${startupOutput}`, { cause: error });
 	}
-	return { cwd, calls, notifications, tmux, sessionName, target, repl, send, status, start, onEnter: (callback) => { afterEnter = callback; }, onBeforeStop: (callback) => { beforeStop = callback; } };
+	return { cwd, calls, notifications, tmux, sessionName, target, repl, send, status, start, owned: () => tmuxHarness.owned(), cleanup: () => tmuxHarness.cleanup(), onEnter: (callback) => { afterEnter = callback; }, onBeforeStop: (callback) => { beforeStop = callback; } };
 }
 
 async function assertCompletionGap(f, result) {
@@ -1263,21 +1263,7 @@ test("gnuplot explicit process exit releases private controls and lease", gnuplo
 	await assertGnuplotSettled(recordId);
 });
 
-test("gnuplot Qt graphics child survives sends/errors and exits with verified stop", gnuplotTestOptions, async (t) => {
-	const f = await fixture(t, { runtime: "gnuplot" });
-	if (!f) return;
-	const rootPid = Number(await f.tmux("display-message", "-p", "-t", `${f.sessionName}:^`, "#{pane_pid}"));
-	const identity = (p) => `${p.pid}:${p.uid}:${p.startedAt}`;
-	const descendants = (table) => {
-		const pids = new Set([rootPid]);
-		let changed;
-		do {
-			changed = false;
-			for (const p of table) if (pids.has(p.ppid) && !pids.has(p.pid)) { pids.add(p.pid); changed = true; }
-		} while (changed);
-		return table.filter((p) => p.pid !== rootPid && pids.has(p.pid) && !p.state.startsWith("Z"));
-	};
-	const before = new Set(descendants(await readProcessTable()).map(identity));
+async function qtPlotOrSkip(t, f) {
 	const unavailable = /unknown or ambiguous terminal|could not connect to display|Could not.*plugin/i;
 	let text;
 	try { text = outputOf(await f.send('set term qt\nplot sin(x)', { timeoutMs: 5000 })); }
@@ -1288,14 +1274,68 @@ test("gnuplot Qt graphics child survives sends/errors and exits with verified st
 	if (unavailable.test(text)) {
 		await assertVerifiedStop(f);
 		t.skip("Qt offscreen backend is unavailable; no runtime/backend configuration was repaired");
-		return;
+		return false;
 	}
 	assert.doesNotMatch(text, /error|failed|not initialized/i);
-	const graphics = descendants(await readProcessTable()).filter((p) => !before.has(identity(p)));
+	return true;
+}
+
+test("gnuplot Qt graphics child survives sends/errors and exits with verified stop", gnuplotTestOptions, async (t) => {
+	const f = await fixture(t, { runtime: "gnuplot" });
+	if (!f) return;
+	const identity = (p) => `${p.pid}:${p.uid}:${p.startedAt}`;
+	// Independent private-cwd rescue discovers Qt even after startDetached
+	// reparents it and creates a new process group. It does NOT read markers.
+	const before = new Set((await f.owned()).map(identity));
+	if (!await qtPlotOrSkip(t, f)) return;
+	const graphics = (await f.owned()).filter((p) => !before.has(identity(p)));
 	assert.ok(graphics.length > 0, "native graphics must create an owned child, not merely reuse the pre-existing runtime");
 	assert.match(outputOf(await f.send("print undefined_with_graphics", { timeoutMs: 3000 })), /undefined variable/);
-	assert.equal(outputOf(await f.send("print 42\nreplot", { timeoutMs: 3000 })).trim(), "42");
-	const after = new Set(descendants(await readProcessTable()).map(identity));
+	assert.match(outputOf(await f.send("print 42\nreplot", { timeoutMs: 3000 })).trim(), /^42(?:\nThis plugin does not support raise\(\))*$/);
+	const after = new Set((await f.owned()).map(identity));
 	assert.ok(graphics.some((p) => after.has(identity(p))), "the graphics child must survive later sends, unlike a short-lived producer");
 	await assertVerifiedStop(f);
+	// Before the independent hook can rescue anything, verify PRODUCTION
+	// stop reaped these exact detached lifetimes too, not just tmux children.
+	const stopped = new Set((await readProcessTable()).filter((p) => !p.state.startsWith("Z")).map(identity));
+	assert.ok(graphics.every((p) => !stopped.has(identity(p))), "production stop leaked a detached graphics helper");
+	assert.ok(graphics.every((p) => !existsSync(join(root, `qtgnuplot${p.pid}`))), "production stop left an owned Qt socket before test cleanup");
+});
+
+test("gnuplot Qt stop preserves another server's marked helper and live state", gnuplotTestOptions, async (t) => {
+	const a = await fixture(t, { runtime: "gnuplot" });
+	if (!a) return;
+	const b = await fixture(t, { runtime: "gnuplot" });
+	if (!b) return;
+	await b.send("keep = 93");
+	if (!await qtPlotOrSkip(t, a) || !await qtPlotOrSkip(t, b)) return;
+	const identity = (p) => `${p.pid}:${p.uid}:${p.startedAt}`;
+	const protectedIds = (await b.owned()).map(identity);
+	assert.notEqual(await a.tmux("show-options", "-qv", "-t", a.sessionName, "@pi_repl_gnuplot_owner"), await b.tmux("show-options", "-qv", "-t", b.sessionName, "@pi_repl_gnuplot_owner"));
+	await assertVerifiedStop(a);
+	const alive = new Set((await readProcessTable()).filter((p) => !p.state.startsWith("Z")).map(identity));
+	assert.ok(protectedIds.every((id) => alive.has(id)), "another server's owned lifetimes must survive");
+	assert.match(outputOf(await b.send("print keep\nreplot")).trim(), /^93(?:\nThis plugin does not support raise\(\))*$/);
+	await assertVerifiedStop(b);
+});
+
+test("gnuplot Qt legacy stop warns and independent teardown rescues the unmarked helper", gnuplotTestOptions, async (t) => {
+	const f = await fixture(t, { runtime: "gnuplot" });
+	if (!f) return;
+	const identity = (p) => `${p.pid}:${p.uid}:${p.startedAt}`;
+	const before = new Set((await f.owned()).map(identity));
+	if (!await qtPlotOrSkip(t, f)) return;
+	const graphics = (await f.owned()).filter((p) => !before.has(identity(p)));
+	assert.ok(graphics.length);
+	// Remove only this disposable session's authority, simulating an old
+	// session. Its inherited environment alone is not permission to adopt it.
+	await f.tmux("set-option", "-u", "-t", f.sessionName, "@pi_repl_gnuplot_owner");
+	await f.repl("stop gnuplot");
+	assert.equal(f.notifications.at(-1).level, "warning");
+	assert.match(f.notifications.at(-1).message, /Detached.*cannot be verified/);
+	let alive = new Set((await readProcessTable()).filter((p) => !p.state.startsWith("Z")).map(identity));
+	assert.ok(graphics.some((p) => alive.has(identity(p))), "unproven detached helper should not be guessed and killed");
+	await f.cleanup(); // same independent path registered before launch
+	alive = new Set((await readProcessTable()).filter((p) => !p.state.startsWith("Z")).map(identity));
+	assert.ok(graphics.every((p) => !alive.has(identity(p))), "independent rescue must not rely on production markers");
 });

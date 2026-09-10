@@ -96,6 +96,8 @@ A client removes the source and completion files after output capture. If a send
 
 gnuplot's implementation additionally uses its guard's `.done` path as a private acknowledgment that the nested source returned. The pipe producer writes the source's actual completion file only after acknowledgment or native pipe closure on error/interruption. Neither a display marker, a comment written to the pipe, nor SIGINT alone establishes completion. This does not change the shared record or its lease protocol; source, guard and producer files are all retained until settlement.
 
+New gnuplot sessions also have independent launch-ownership metadata: the inherited `PI_REPL_GNUPLOT_OWNER` environment marker and matching tmux `@pi_repl_gnuplot_owner` option (32 lowercase hexadecimal characters). These are allocated only for a newly created session, not derived from a record ID, copied to another session, or retrofitted into a running interpreter. They support explicit-stop attribution of detached helpers together with UID/birth identities and pane protections. They are not record identity, send-lease authority or completion signals, and do not change protocol version 1. Clients without that attribution must report detached-helper cleanup as unverified rather than infer ownership from a process name or PID.
+
 ## Compatibility
 
 A client that sees an unsupported version leaves it untouched. Existing tmux sessions gain v1 metadata lazily when inspected or used. Studio may import legacy browser-local entries as `pi-studio` entries using their stable IDs, making retries idempotent.

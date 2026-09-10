@@ -91,6 +91,11 @@ for (const [runtime, executable, prompt] of runtimes) {
 		const launch = f.calls.find((call) => call.args[0] === "new-session");
 		assert.ok(launch.args.includes(f.state.sessionName));
 		assert.ok(launch.args.includes(root));
+		if (runtime === "gnuplot") {
+			const marker = f.metadata.get("@pi_repl_gnuplot_owner");
+			assert.match(marker, /^[a-f0-9]{32}$/);
+			assert.ok(launch.args.includes(`PI_REPL_GNUPLOT_OWNER=${marker}`));
+		} else assert.equal(launch.args.includes("-e"), false);
 		assert.match(launch.args.at(-1), new RegExp(` -i -l -c '${executable}${runtime === "matlab" ? " -sd " : "'$"}`));
 		const pipe = f.calls.find((call) => call.args[0] === "pipe-pane");
 		assert.ok(pipe.args.includes("%9"));

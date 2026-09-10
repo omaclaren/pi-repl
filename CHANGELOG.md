@@ -7,7 +7,12 @@ All notable changes to `pi-repl` are documented here.
 ### Added
 - Add standalone gnuplot sessions with command/tool routing, prompt readiness, persistent native state, direct terminal collaboration, clean records/exports and verified explicit stop. Launch the user's normal `gnuplot` command without selecting or repairing a plotting backend.
 - Add private source/guard/pipe-producer submissions that complete after native return or error/interrupt unwinding, without queuing terminal input, adding gnuplot variables, or changing print/output/table settings and error status. Preserve correlated filenames, Summary/Off/Full displays, and controls/leases through timeout or abort.
-- Add portable producer/quoting/routing tests and isolated gnuplot integration checks for state, hostile literal paths, errors, Ctrl-C, native pauses/exits, plotting, export and shutdown. Include an optional Qt offscreen graphics-child check, skipped when that backend is unavailable.
+- Add portable producer/quoting/routing tests and isolated gnuplot integration checks for state, hostile literal paths, errors, Ctrl-C, native pauses/exits, plotting, export and shutdown. Include optional Qt offscreen checks, skipped when that backend is unavailable.
+
+### Fixed
+- Track new gnuplot sessions' detached interpreter/Qt helpers using an inherited launch marker plus UID/birth identity and protected-pane checks. Preserve other sessions, warn for older unmarked sessions, and never repair plotting configuration or adopt helpers by executable name alone.
+- Remove stale Qt sockets only after verified process exit and fresh descriptor/inode/reference checks; leave uncertain files untouched with a warning. Native ownership inspection uses `/proc` on Linux or an existing isolated `python3` on macOS; socket inspection uses `lsof`.
+- Register independent private-cwd provenance before launching test gnuplot sessions so failed Qt tests cannot silently leak detached helpers. Verify production cleanup before the rescue hook, including a second live Qt session and legacy-session handling.
 
 ## [0.6.1] — 2026-09-10
 

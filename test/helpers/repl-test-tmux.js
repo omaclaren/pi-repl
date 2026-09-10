@@ -3,6 +3,7 @@ import { execFile } from "node:child_process";
 import { mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
 import { promisify } from "node:util";
+import { createDetachedGnuplotTestObserver } from "./repl-test-detached.js";
 
 const exec = promisify(execFile);
 const psColumns = "pid=,ppid=,pgid=,uid=,lstart=,stat=";
@@ -31,7 +32,7 @@ export async function readProcessTable() {
 
 /** Test-only ownership registry. Never signal by executable name or bare PGID. */
 export class OwnedTestProcesses {
-	constructor({ ledgerPath, snapshot = readProcessTable, signal = (pid, value) => process.kill(pid, value), waitMs = 750 }) {
+	constructor({ ledgerPath, snapshot = readProcessTable, signal = (pid, value) => process.kill(pid, value), waitMs = 750, discoverDetached }) {
 		this.ledgerPath = ledgerPath;
 		this.snapshot = snapshot;
 		this.signal = signal;
@@ -39,6 +40,7 @@ export class OwnedTestProcesses {
 		this.owned = new Map();
 		this.groups = new Map();
 		this.signals = [];
+		this.discoverDetached = discoverDetached;
 	}
 
 	remember(p) {
@@ -53,6 +55,7 @@ export class OwnedTestProcesses {
 	async refresh(rootPids = []) {
 		const table = await this.snapshot();
 		const byPid = new Map(table.map((p) => [p.pid, p]));
+		if (this.discoverDetached) for (const p of await this.discoverDetached(table)) this.remember(p);
 		const ledger = parseProcessTable(readFileSync(this.ledgerPath, "utf8"));
 		for (const recorded of ledger) {
 			const current = byPid.get(recorded.pid);
@@ -101,17 +104,17 @@ export class OwnedTestProcesses {
 		}
 	}
 
-	async settle(ms) {
+	async settle(ms, full = false) {
 		const deadline = Date.now() + ms;
 		while (true) {
 			const remaining = await this.refresh();
-			if (!remaining.length || Date.now() >= deadline) return remaining;
+			if ((!remaining.length && !full) || Date.now() >= deadline) return remaining;
 			await sleep(50);
 		}
 	}
 
 	async terminate() {
-		let remaining = await this.settle(150); // allow ordinary tmux hangup/exit
+		let remaining = await this.settle(this.discoverDetached ? 750 : 150, Boolean(this.discoverDetached)); // allow ordinary hangup and detached-launch settlement
 		for (const p of remaining) await this.send(p, "SIGTERM");
 		remaining = await this.settle(this.waitMs);
 		const deadline = Date.now() + 3000;
@@ -124,14 +127,14 @@ export class OwnedTestProcesses {
 	}
 }
 
-export function createTestTmux(t, { cwd, env, config }) {
+export function createTestTmux(t, { cwd, env, config, trackDetachedGnuplot = false }) {
 	// A short private -S path avoids Unix socket limits and leaves no stale
 	// test sockets in the user's tmux directory. Only our directory is removed.
 	const socketDir = mkdtempSync("/tmp/pi-repl-tmux-");
 	const socketPath = join(socketDir, "server.sock");
 	const ledgerPath = join(socketDir, "processes.log");
 	writeFileSync(ledgerPath, "", { mode: 0o600, flag: "wx" });
-	const processes = new OwnedTestProcesses({ ledgerPath });
+	const processes = new OwnedTestProcesses({ ledgerPath, discoverDetached: trackDetachedGnuplot ? createDetachedGnuplotTestObserver(cwd) : undefined });
 	const raw = (args, options = {}) => exec("tmux", [...(args[0] === "new-session" ? [] : ["-N"]), "-S", socketPath, "-f", config, ...args], {
 		env, cwd, timeout: 10000, maxBuffer: 8 * 1024 * 1024, ...options,
 	});
@@ -151,6 +154,7 @@ export function createTestTmux(t, { cwd, env, config }) {
 	let cleanupPromise;
 	const harness = {
 		socketPath, ledgerPath, processes,
+		async owned() { await observe(); return processes.refresh(); },
 		// A runtime can outlive a vanished pane before the next tmux inspection.
 		// Record its identity before exec, including every restarted lifetime.
 		launcherPrologue: `LC_ALL=C TZ=UTC ps -p "$$" -o ${psColumns} >> ${quote(ledgerPath)} || exit 1\n`,

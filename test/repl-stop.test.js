@@ -6,12 +6,15 @@ const birth = "Wed Sep 9 08:00:00 2026";
 const later = "Wed Sep 9 08:01:00 2026";
 const proc = (pid, extra = {}) => ({ pid, ppid: 900, pgid: pid, uid: 501, tty: "ttys100", startedAt: birth, state: "S", ...extra });
 const pane = (extra = {}) => ({ serverPid: 900, sessionId: "$1", sessionName: "pi-repl-python", createdAt: "123", paneId: "%1", pid: 1001, tty: "/dev/ttys100", dead: "0", windowId: "@1", windowIndex: 1, paneIndex: 1, linked: "0", recordId: "a".repeat(32), ...extra });
-const paneRow = (p) => [p.serverPid, p.sessionId, p.sessionName, p.createdAt, p.paneId, p.pid, p.tty, p.dead, p.windowId, p.windowIndex, p.paneIndex, p.linked, p.recordId].join("\t");
+const paneRow = (p) => [p.serverPid, p.sessionId, p.sessionName, p.createdAt, p.paneId, p.pid, p.tty, p.dead, p.windowId, p.windowIndex, p.paneIndex, p.linked, p.gnuplotOwner ?? "", p.recordId].join("\t");
 
 function fixture(options = {}) {
 	const protectedPane = pane({ sessionId: "$2", sessionName: "unrelated", paneId: "%2", pid: 2001, tty: "/dev/ttys200", windowId: "@2" });
+	const sessionName = options.gnuplot ? "pi-repl-gnuplot" : "pi-repl-python";
+	const owner = "c".repeat(32);
 	const state = {
-		panes: [pane(), protectedPane],
+		markers: new Map(),
+		panes: [pane({ sessionName, ...(options.gnuplot ? { gnuplotOwner: owner } : {}) }), protectedPane],
 		table: [proc(900, { ppid: 1, tty: "??" }), proc(1001), proc(1002, { ppid: 1001, pgid: 1001 }), proc(2001, { tty: "ttys200" }), proc(9999, { ppid: 1, tty: "??" })],
 		calls: [], signals: [], snapshots: 0, stopped: false, ...options,
 	};
@@ -35,7 +38,13 @@ function fixture(options = {}) {
 	return {
 		state,
 		stop: () => stopVerifiedReplSession({
-			tmux, sessionName: "pi-repl-python", currentPid: 9999, uid: 501, graceMs: 0, termMs: 0, killMs: 10,
+			tmux, sessionName, currentPid: 9999, uid: 501, graceMs: 0, termMs: 0, killMs: 10,
+			snapshotSockets: async () => [],
+			findMarked: async (table, marker) => {
+				state.onMarked?.(++state.markerReads || (state.markerReads = 1));
+				if (state.markerFailure) throw new Error("ownership inspection failed");
+				return table.filter((p) => state.markers.get(p.pid) === marker);
+			},
 			snapshot: async () => { state.onSnapshot?.(++state.snapshots); return state.table.map((p) => ({ ...p })); },
 			signal: (pid, signal) => {
 				state.signals.push({ pid, signal });
@@ -143,3 +152,76 @@ test("unknown orphan group members without identity continuity produce a warning
 	await assert.rejects(f.stop(), /Unconfirmed survivors/);
 	assert.deepEqual(f.state.signals, []);
 });
+
+const qtOwner = "c".repeat(32);
+function addQt(f, pid, marker = qtOwner) {
+	f.state.table.push(proc(pid, { ppid: 1, pgid: pid - 1, tty: "??" }));
+	f.state.markers.set(pid, marker);
+}
+
+test("gnuplot explicit stop tracks marked detached helpers and preserves unmarked/foreign helpers", async () => {
+	const f = fixture({ gnuplot: true });
+	addQt(f, 3001);
+	addQt(f, 4001, "d".repeat(32));
+	addQt(f, 5001, null);
+	const result = await f.stop();
+	assert.equal(result.processCount, 3);
+	assert.deepEqual(result.warnings, []);
+	assert.ok(result.signals.some((s) => s.pid === 3001 && s.signal === "SIGKILL"));
+	assert.ok(!result.signals.some((s) => [4001, 5001].includes(s.pid)));
+	assert.ok(f.state.calls.find((args) => args[0] === "if-shell")[4].includes("@pi_repl_gnuplot_owner"));
+});
+
+test("gnuplot discovers a late marked helper after tmux exits, without requiring ancestry", async () => {
+	const f = fixture({ gnuplot: true });
+	f.state.afterStop = () => addQt(f, 3001);
+	const result = await f.stop();
+	assert.ok(result.signals.some((s) => s.pid === 3001));
+});
+
+test("gnuplot helper PID reuse with a different marker is not adopted or signalled", async () => {
+	const f = fixture({ gnuplot: true });
+	addQt(f, 3001);
+	f.state.afterStop = () => {
+		f.state.table.find((p) => p.pid === 3001).startedAt = later;
+		f.state.markers.set(3001, "d".repeat(32));
+	};
+	await f.stop();
+	assert.ok(!f.state.signals.some((s) => s.pid === 3001));
+});
+
+for (const mode of ["shared marker", "protected process", "inspection failure"]) {
+	test(`gnuplot ${mode} refuses shutdown without touching either session`, async () => {
+		const f = fixture({ gnuplot: true });
+		if (mode === "shared marker") f.state.panes[1].gnuplotOwner = qtOwner;
+		if (mode === "protected process") f.state.markers.set(2001, qtOwner);
+		if (mode === "inspection failure") f.state.markerFailure = true;
+		await assert.rejects(f.stop(), /shared|protected|inspection failed/);
+		assert.equal(f.state.stopped, false);
+		assert.deepEqual(f.state.signals, []);
+	});
+}
+
+test("gnuplot revalidates pane birth after slow helper inspection before closing tmux", async () => {
+	const f = fixture({ gnuplot: true });
+	f.state.onMarked = (count) => { if (count === 2) f.state.table.find((p) => p.pid === 1001).startedAt = later; };
+	await assert.rejects(f.stop(), /changed during helper inspection/);
+	assert.equal(f.state.stopped, false);
+	assert.deepEqual(f.state.signals, []);
+});
+
+for (const marker of [undefined, "bad", qtOwner + "\n"]) {
+	test(`gnuplot legacy/invalid marker ${JSON.stringify(marker)} warns instead of claiming Qt cleanup`, async () => {
+		const f = fixture({ gnuplot: true });
+		f.state.panes[0].gnuplotOwner = marker;
+		addQt(f, 3001);
+		if (marker?.includes("\n")) {
+			await assert.rejects(f.stop(), /refusing unsafe shutdown/);
+			assert.equal(f.state.stopped, false);
+		} else {
+			const result = await f.stop();
+			assert.match(result.warnings.join("\n"), /Detached.*cannot be verified/);
+		}
+		assert.ok(!f.state.signals.some((s) => s.pid === 3001));
+	});
+}
