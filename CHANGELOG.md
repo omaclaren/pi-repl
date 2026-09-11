@@ -4,6 +4,8 @@ All notable changes to `pi-repl` are documented here.
 
 ## [Unreleased]
 
+## [0.7.0] — 2026-09-11
+
 ### Changed
 - Raise the default Summary preview from 6 lines / 600 source characters to 20 lines / 2,000 characters. Full remains 40 lines / 4,000 characters; Off, execution, clean records and display/record identities are unchanged.
 
