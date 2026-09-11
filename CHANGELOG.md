@@ -10,6 +10,7 @@ All notable changes to `pi-repl` are documented here.
 - Add portable producer/quoting/routing tests and isolated gnuplot integration checks for state, hostile literal paths, errors, Ctrl-C, native pauses/exits, plotting, export and shutdown. Include optional Qt offscreen checks, skipped when that backend is unavailable.
 
 ### Fixed
+- Preserve diagnostics and user output containing old control paths, loader-like expressions or preview-like comments in Off/Summary/Full mode. Remove only the current submission's anchored loader echo, and retain display boundaries while trimming native scaffolding so printed commands and prompt-looking output are not mistaken for control noise.
 - Track new gnuplot sessions' detached interpreter/Qt helpers using an inherited launch marker plus UID/birth identity and protected-pane checks. Preserve other sessions, warn for older unmarked sessions, and never repair plotting configuration or adopt helpers by executable name alone.
 - Remove stale Qt sockets only after verified process exit and fresh descriptor/inode/reference checks; leave uncertain files untouched with a warning. Native ownership inspection uses `/proc` on Linux or an existing isolated `python3` on macOS; socket inspection uses `lsof`.
 - Register independent private-cwd provenance before launching test gnuplot sessions so failed Qt tests cannot silently leak detached helpers. Verify production cleanup before the rescue hook, including a second live Qt session and legacy-session handling.

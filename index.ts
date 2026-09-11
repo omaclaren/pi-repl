@@ -1505,79 +1505,73 @@ function extractPaneDelta(before: string, after: string): string {
 	return afterLines.slice(index).join("\n");
 }
 
-function cleanupReplDelta(delta: string, submissionLine: string, previewComment?: string, completionLine?: string, display?: ReplSubmissionDisplay): string {
+export function cleanupReplDelta(delta: string, submissionLine: string, previewComment?: string, completionLine?: string, display?: ReplSubmissionDisplay): string {
 	const isMLanguageSubmission = submissionLine.startsWith("eval(fileread(");
-	const isMLanguagePrompt = (line: string) => isMLanguageSubmission && /^(?:octave:\d+>|>>)\s*$/.test(line);
-	const rawLines = stripBoundaryBlankLines(delta).split("\n");
-	while (rawLines.length > 0) {
-		const first = rawLines[0].trim();
-		if (!first) { rawLines.shift(); continue; }
-		const loaderIndex = first.indexOf(submissionLine);
-		if (loaderIndex < 0) break;
-		// Some input editors join the loader echo to the first output/header.
-		const remainder = first.slice(loaderIndex + submissionLine.length);
-		if (remainder.trim()) rawLines[0] = remainder;
-		else rawLines.shift();
-	}
-	const loaderCleaned = rawLines.join("\n");
-	const displayCleaned = display ? stripReplSubmissionDisplay(loaderCleaned, display) : loaderCleaned;
-	const lines = stripBoundaryBlankLines(displayCleaned).split("\n");
-	const loaderHints = [submissionLine, "exec(open(", "run_cell(open(", "include(", "source(", ":script ", "load-file", "/tmp/pr.py", "/tmp/jr.jl", "/tmp/rr.R", "/tmp/gr.ghci", "/tmp/cr.clj", "/tmp/pi-repl", "control.py", ":pi-repl/silent", ...(isMLanguageSubmission ? ["eval(fileread("] : [])];
-	const previewHints = previewComment ? [previewComment, "# pi-repl:", "-- pi-repl:", ";; pi-repl:"] : ["# pi-repl:", "-- pi-repl:", ";; pi-repl:"];
-
+	const isPrompt = (line: string) =>
+		/^(?:>>>|In \[\d+\]:|\.\.\.:|>|\+)\s*$/.test(line) ||
+		/^(ghci|Prelude|\*?[A-Za-z0-9_.:]+)>\s*$/.test(line) ||
+		/^[^\s>]+=>\s*$/.test(line) ||
+		/^irb\(.*\)[:\d]+[>*]\s*$/.test(line) ||
+		(isMLanguageSubmission && /^(?:octave:\d+>|>>)\s*$/.test(line));
+	const echoEnd = (line: string, command: string) => {
+		if (!command) return -1;
+		const index = line.indexOf(command);
+		const prefix = line.slice(0, index).trim();
+		// An exact command at the start (optionally after a native prompt),
+		// not a command/path mentioned somewhere inside a diagnostic.
+		return index >= 0 && (!prefix || isPrompt(prefix)) ? index + command.length : -1;
+	};
+	const lines = stripBoundaryBlankLines(delta).split("\n");
+	let removedPreview = false;
 	while (lines.length > 0) {
-		const first = lines[0]?.trim() ?? "";
-		if (!first) {
+		const first = lines[0].trim();
+		if (!first || isPrompt(first)) { lines.shift(); continue; }
+		if (!removedPreview && previewComment && first === previewComment) {
 			lines.shift();
+			removedPreview = true;
 			continue;
 		}
-		if (loaderHints.some((hint) => first.includes(hint))) {
-			lines.shift();
-			continue;
-		}
-		if (previewHints.some((hint) => first.includes(hint))) {
-			lines.shift();
-			continue;
-		}
-		if (
-			/^\s*\.\.\.:/.test(first) ||
-			/^>\s*$/.test(first) ||
-			/^\+\s*$/.test(first) ||
-			/^(ghci|Prelude|\*?[A-Za-z0-9_.:]+)>\s*$/.test(first) ||
-			/^[^\s>]+=>\s*$/.test(first) ||
-			/^irb\(.*\)[:\d]+[>*]\s*$/.test(first) ||
-			/^jshell>\s*$/.test(first) || isMLanguagePrompt(first)
-		) {
-			lines.shift();
-			continue;
-		}
+		const end = echoEnd(lines[0], submissionLine);
+		if (end < 0) break;
+		// Some input editors join output/header to the loader echo. Preserve
+		// the remainder, including its spaces, and consume at most ONE echo:
+		// printing that same command again is legitimate user output.
+		const remainder = lines[0].slice(end);
+		if (remainder.trim()) lines[0] = remainder;
+		else lines.shift();
 		break;
 	}
 
+	const isClojureSubmission = submissionLine.startsWith("(do (load-file ") && submissionLine.endsWith(":pi-repl/silent)");
+	let removedPrompt = false;
+	let removedResult = false;
+	let removedCompletion = false;
 	while (lines.length > 0) {
-		const last = lines[lines.length - 1]?.trim() ?? "";
-		if (
-			!last ||
-			(completionLine ? last.includes(completionLine) : false) ||
-			/^>>>\s*$/.test(last) ||
-			/^In \[\d+\]:\s*$/.test(last) ||
-			/^\s*\.\.\.:\s*$/.test(last) ||
-			/^julia>\s*$/.test(last) ||
-			/^>\s*$/.test(last) ||
-			/^\+\s*$/.test(last) ||
-			/^(ghci|Prelude|\*?[A-Za-z0-9_.:]+)>\s*$/.test(last) ||
-			/^[^\s>]+=>\s*$/.test(last) ||
-			/^irb\(.*\)[:\d]+[>*]\s*$/.test(last) ||
-			/^jshell>\s*$/.test(last) || isMLanguagePrompt(last) ||
-			last === ":pi-repl/silent"
-		) {
+		const last = lines[lines.length - 1].trim();
+		if (!last) { lines.pop(); continue; }
+		if (!removedPrompt && isPrompt(last)) {
 			lines.pop();
+			removedPrompt = true;
+			continue;
+		}
+		if (!removedResult && isClojureSubmission && last === ":pi-repl/silent") {
+			lines.pop();
+			removedResult = true;
+			continue;
+		}
+		if (!removedCompletion && completionLine && echoEnd(last, completionLine) === last.length) {
+			lines.pop();
+			removedCompletion = true;
 			continue;
 		}
 		break;
 	}
 
-	return stripBoundaryBlankLines(lines.join("\n"));
+	// Remove native scaffolding while the display still separates it from
+	// payload. Never reclassify that payload using generic loader/path/comment
+	// substrings (e.g. /tmp/pi-repl), which can be real output or error text.
+	const scaffoldCleaned = lines.join("\n");
+	return stripBoundaryBlankLines(display ? stripReplSubmissionDisplay(scaffoldCleaned, display) : scaffoldCleaned);
 }
 
 async function waitForReplDoneFile(

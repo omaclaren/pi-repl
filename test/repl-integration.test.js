@@ -306,6 +306,24 @@ test("plain source containing the output divider survives narrow-pane display cl
 	}
 });
 
+test("loader-looking output survives capture, clean records and export", { timeout: 30000 }, async (t) => {
+	const f = await fixture(t);
+	if (!f) return;
+	await f.tmux("resize-window", "-t", `${f.sessionName}:^`, "-x", "48");
+	const expected = '  Error in /tmp/pi-repl-custom/control.py: user diagnostic\nsource("user-data.R")\n# pi-repl: user text  ';
+	for (const echoMode of ["off", "summary", "full"]) {
+		const result = await f.send(`print(${JSON.stringify(expected)})`, { echoMode });
+		assert.equal(result.content[0].text.split("Output:\n")[1], expected);
+		const record = readReplSessionRecord((await f.status()).details.python.recordId);
+		assert.equal(record.entries.at(-1).output, expected);
+	}
+	await f.repl("export python");
+	const exported = readdirSync(f.cwd).find((file) => file.endsWith(".md"));
+	// Canonical Markdown fences trim trailing whitespace; capture/records above do not.
+	assert.ok(readFileSync(join(f.cwd, exported), "utf8").includes(expected.trimEnd()));
+	await assertVerifiedStop(f);
+});
+
 test("Summary is the default pane display; command and per-send overrides still work", { timeout: 30000 }, async (t) => {
 	const f = await fixture(t);
 	if (!f) return;
@@ -1133,6 +1151,27 @@ test("gnuplot native state, direct edits, literal paths, plots, records and expo
 	const exported = readdirSync(f.cwd).find((file) => file.endsWith(".md"));
 	assert.match(readFileSync(join(f.cwd, exported), "utf8"), /```gnuplot/);
 	await assertGnuplotSettled(status.recordId);
+	await assertVerifiedStop(f);
+});
+
+test("gnuplot diagnostics under legacy-looking control paths survive cleanup", gnuplotTestOptions, async (t) => {
+	const f = await fixture(t, { runtime: "gnuplot", controlName: "tmp/pi-repl-cocoa-check/controls 'λ'" });
+	if (!f) return;
+	mkdirSync(dirname(process.env.PI_REPL_CONTROL_ROOT), { recursive: true, mode: 0o700 });
+	const recordId = (await f.status()).details.gnuplot.recordId;
+	await f.tmux("resize-window", "-t", `${f.sessionName}:^`, "-x", "48");
+	for (const echoMode of ["off", "summary", "full"]) {
+		const result = await f.send("print undefined_path_regression", { echoMode });
+		const output = outputOf(result);
+		assert.match(output, /\/tmp\/pi-repl-cocoa-check\//);
+		assert.match(output, /line 1: undefined variable: undefined_path_regression/);
+		assert.equal(readReplSessionRecord(recordId).entries.at(-1).output, output);
+		assert.equal(outputOf(await f.send('print "recovered"', { echoMode })), "recovered");
+	}
+	await f.repl("export gnuplot");
+	const exported = readdirSync(f.cwd).find((file) => file.endsWith(".md"));
+	assert.match(readFileSync(join(f.cwd, exported), "utf8"), /undefined variable: undefined_path_regression/);
+	await assertGnuplotSettled(recordId);
 	await assertVerifiedStop(f);
 });
 
