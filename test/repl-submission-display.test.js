@@ -161,7 +161,7 @@ test("summary previews are adaptive but bounded by lines and code points", () =>
 	});
 	assert.equal(manyLines.previewLines.length, REPL_SUBMISSION_SUMMARY_MAX_LINES + 1);
 	assert.equal(manyLines.previewLines[0], "line_1");
-	assert.match(manyLines.previewLines.at(-1), /preview truncated; 9 lines total/);
+	assert.equal(manyLines.previewLines.at(-1), `… preview truncated; ${REPL_SUBMISSION_SUMMARY_MAX_LINES + 3} lines total`);
 });
 
 test("plain previews preserve indentation and internal blanks without added bars", () => {
@@ -279,6 +279,32 @@ test("a repeated plain output divider in user output is preserved", () => {
 	const display = createReplSubmissionDisplay({ entryId: "entry", origin: "pi-repl", code: "print(divider)", mode: "summary" });
 	const capture = [...display.prefixLines, display.outputMarker, "user output", display.endMarker].join("\n");
 	assert.equal(stripReplSubmissionDisplay(capture, display), `${display.outputMarker}\nuser output\n`);
+});
+
+test("Summary shows 20 source lines or 2000 code points while Full retains its larger limits", () => {
+	assert.equal(REPL_SUBMISSION_SUMMARY_MAX_LINES, 20);
+	assert.equal(REPL_SUBMISSION_SUMMARY_MAX_CHARS, 2000);
+	assert.equal(REPL_SUBMISSION_FULL_MAX_LINES, 40);
+	assert.equal(REPL_SUBMISSION_FULL_MAX_CHARS, 4000);
+	const lines = Array.from({ length: 20 }, (_, i) => `line_${i + 1}`);
+	const atLineLimit = createReplSubmissionDisplay({ entryId: "twenty-lines", code: lines.join("\n") });
+	assert.deepEqual(atLineLimit.previewLines, lines);
+	for (const code of ["😀".repeat(2000), "x".repeat(1000) + "\n" + "y".repeat(999)]) {
+		const display = createReplSubmissionDisplay({ entryId: "character-boundary", code });
+		assert.deepEqual(display.previewLines, code.split("\n"));
+	}
+	const over = createReplSubmissionDisplay({ entryId: "over-character-boundary", code: "x".repeat(1000) + "\n" + "y".repeat(1000) });
+	assert.equal(Array.from(over.previewLines.slice(0, -1).join("\n")).length, 2000);
+	assert.equal(over.previewLines.at(-1), "… preview truncated; 2 lines total");
+});
+
+test("older six-line Summary previews still clean with their original display metadata", () => {
+	const code = Array.from({ length: 18 }, (_, i) => `line_${i + 1}`).join("\n");
+	const current = createReplSubmissionDisplay({ entryId: "old-summary-budget", code });
+	assert.deepEqual(current.previewLines, code.split("\n"));
+	const previewLines = [...code.split("\n").slice(0, 6), "… preview truncated; 18 lines total"];
+	const old = { ...current, previewLines, prefixLines: ["", current.beginMarker, ...previewLines, current.outputMarker] };
+	assert.equal(stripReplSubmissionDisplay([...old.prefixLines, "42", ...old.suffixLines, "prompt>"].join("\n"), old), "42\nprompt>");
 });
 
 test("the final completion anchor is removed without deleting identical user output", () => {

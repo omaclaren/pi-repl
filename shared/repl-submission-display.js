@@ -3,8 +3,8 @@ import { createHash } from "node:crypto";
 export const REPL_SUBMISSION_DISPLAY_VERSION = 1;
 export const DEFAULT_REPL_SUBMISSION_ECHO_MODE = "summary";
 export const REPL_SUBMISSION_ECHO_MODES = Object.freeze(["off", "summary", "full"]);
-export const REPL_SUBMISSION_SUMMARY_MAX_CHARS = 600;
-export const REPL_SUBMISSION_SUMMARY_MAX_LINES = 6;
+export const REPL_SUBMISSION_SUMMARY_MAX_CHARS = 2_000;
+export const REPL_SUBMISSION_SUMMARY_MAX_LINES = 20;
 export const REPL_SUBMISSION_FULL_MAX_CHARS = 4_000;
 export const REPL_SUBMISSION_FULL_MAX_LINES = 40;
 

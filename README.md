@@ -80,7 +80,7 @@ Restart pi after installing.
 | `/lab gnuplot` | Same as `/repl gnuplot` |
 | `/repl echo` | Show the current submitted-code pane-echo mode |
 | `/repl echo off` | Disable submitted-code displays and raw-history anchors for new sends |
-| `/repl echo summary` | Show short submissions in full, truncating after 6 lines or 600 source characters, with compact anchors (default) |
+| `/repl echo summary` | Show short submissions in full, truncating after 20 lines or 2,000 source characters, with compact anchors (default) |
 | `/repl echo full` | Show up to 40 lines or 4,000 source characters and anchors in persistent raw history |
 | `/repl status` | Show running shared REPL sessions |
 | `/repl status python` | Show status for the shared Python/IPython session |
@@ -155,7 +155,7 @@ Notes:
 - in Clojure, use normal interactive syntax such as `let`, `def`/`defn`, or `do` forms for multiline code
 - tool output includes both the submitted code and the captured output; the complete response is limited to 2,000 lines or 50 KiB, with the full response saved to a private file when truncated
 - `repl_send` accepts `echoMode: off|summary|full` for a single send; otherwise it uses `/repl echo`, initialized from `PI_REPL_ECHO_MODE` or Summary
-- Full echo mode writes bounded submitted source code into persistent raw terminal history; Summary shows short submissions in full and truncates after 6 lines or 600 source characters
+- Full echo mode writes bounded submitted source code into persistent raw terminal history; Summary shows short submissions in full and truncates after 20 lines or 2,000 source characters
 
 ### Starting a session through pi
 
@@ -254,7 +254,7 @@ Existing sessions attach lazily. Unsupported versions and invalid or stale sessi
 
 Pane echo, enabled in Summary mode by default, places one blank line before the compact begin anchor, separating the runtime loader command from the readable block. Submitted code, the plain `── output ──` divider, output and the completion anchor then follow without added internal padding. All runtimes add one display-only blank line after `done` too, separating the block from the returning prompt. Native prompt spacing is left unchanged. Blank lines printed by user code remain in the raw pane; display spacing does not change submitted code or clean captured output. The header reads `── pi-repl · input · 2 lines · id: 40c4561ef0f6 ──`, followed by plain code with its indentation and no added vertical bars. The same labelled ID appears after `done`. This is a stable 12-character hexadecimal hash derived from the Shared REPL Record entry ID: a correlation label for matching raw history to a recorded send, not a counter, timestamp or execution signal. Older marker formats remain readable. `repl_send` removes the exact header, source preview, divider, and footer from captured output and the clean record, while they remain in raw pane history.
 
-Use `/repl echo off|summary|full` to change the default for the current Pi process, or set `PI_REPL_ECHO_MODE` before startup. A per-send `echoMode` overrides that default without changing it. **Summary** is the startup default: it shows short submissions in full, truncates after 6 lines or 600 source characters, and puts a plain output divider before runtime output. **Off** disables the optional display and alignment anchors for quiet output, although the REPL can still echo its unavoidable temporary-file control command. **Full** is an explicit opt-in that raises the bounds to 40 lines or 4,000 source characters. Terminal, line-separator, and bidirectional control characters are escaped in all visible previews.
+Use `/repl echo off|summary|full` to change the default for the current Pi process, or set `PI_REPL_ECHO_MODE` before startup. A per-send `echoMode` overrides that default without changing it. **Summary** is the startup default: it shows short submissions in full, truncates after 20 lines or 2,000 source characters, and puts a plain output divider before runtime output. **Off** disables the optional display and alignment anchors for quiet output, although the REPL can still echo its unavoidable temporary-file control command. **Full** is an explicit opt-in that raises the bounds to 40 lines or 4,000 source characters. Line limits count source lines, not soft-wrapped terminal rows, and affect only the preview: submitted code still executes in full. Terminal, line-separator, and bidirectional control characters are escaped in all visible previews.
 
 GHCi, Ruby, Java, Octave, MATLAB and gnuplot use a read-only tmux cursor-column query, with a short timeout, to avoid adding an empty row before `done` while still separating it from output that has no trailing newline. If that query is unavailable, they fall back to the safe newline guard. Output streams and interactive echo settings are not replaced.
 

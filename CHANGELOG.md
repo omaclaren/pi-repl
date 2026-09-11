@@ -4,6 +4,9 @@ All notable changes to `pi-repl` are documented here.
 
 ## [Unreleased]
 
+### Changed
+- Raise the default Summary preview from 6 lines / 600 source characters to 20 lines / 2,000 characters. Full remains 40 lines / 4,000 characters; Off, execution, clean records and display/record identities are unchanged.
+
 ### Added
 - Add standalone gnuplot sessions with command/tool routing, prompt readiness, persistent native state, direct terminal collaboration, clean records/exports and verified explicit stop. Launch the user's normal `gnuplot` command without selecting or repairing a plotting backend.
 - Add private source/guard/pipe-producer submissions that complete after native return or error/interrupt unwinding, without queuing terminal input, adding gnuplot variables, or changing print/output/table settings and error status. Preserve correlated filenames, Summary/Off/Full displays, and controls/leases through timeout or abort.

@@ -324,6 +324,31 @@ test("loader-looking output survives capture, clean records and export", { timeo
 	await assertVerifiedStop(f);
 });
 
+for (const runtime of ["python", "gnuplot"]) {
+	test(`${runtime} Summary shows 20 source lines without truncating execution or clean records`, {
+		timeout: 30000,
+		skip: runtime !== "python" && !(optionalRuntimes.has("all") || optionalRuntimes.has(runtime)),
+	}, async (t) => {
+		const f = await fixture(t, { runtime });
+		if (!f) return;
+		for (const count of [20, 21]) {
+			const values = Array.from({ length: count }, (_, i) => `preview-${i + 1}`);
+			const lines = values.map(value => runtime === "python" ? `print("${value}")` : `print "${value}"`);
+			const result = await f.send(lines.join("\n"));
+			assert.equal(result.details.echoMode, "summary");
+			assert.equal(result.content[0].text.split("Output:\n")[1], values.join("\n"));
+			const record = readReplSessionRecord((await f.status()).details[f.target].recordId);
+			assert.equal(record.entries.at(-1).output, values.join("\n"));
+			const pane = await f.tmux("capture-pane", "-p", "-J", "-t", `${f.sessionName}:^`, "-S", "-150");
+			const preview = count === 20 ? lines : [...lines.slice(0, 20), "… preview truncated; 21 lines total"];
+			const header = `── pi-repl · input · ${count} lines · id: ${result.details.submissionAnchorId} ──`;
+			assert.ok(pane.includes([header, ...preview, "── output ──", ...values].join("\n")), pane);
+			await assertCompletionGap(f, result);
+		}
+		await assertVerifiedStop(f);
+	});
+}
+
 test("Summary is the default pane display; command and per-send overrides still work", { timeout: 30000 }, async (t) => {
 	const f = await fixture(t);
 	if (!f) return;
