@@ -808,7 +808,17 @@ async function enableSessionHistoryLogging(
 async function readSessionInfo(pi: ExtensionAPI, sessionName: string, cwd: string, inspectPrompt = false): Promise<SessionInfo | null> {
 	if (!(await tmuxSessionExists(pi, sessionName, cwd))) return null;
 
-	const target = await getPaneTarget(pi, sessionName, cwd);
+	let target: string;
+	try {
+		target = await getPaneTarget(pi, sessionName, cwd);
+	} catch (error) {
+		// Native exit can remove the session after the first existence check.
+		// Only a fresh, explicit absence result settles this observation; do not
+		// turn permissions, timeouts or an uninspectable live pane into "stopped".
+		const check = await execTmux(pi, ["has-session", "-t", getSessionTarget(sessionName)], cwd, 3_000);
+		if (check.code === 1 && /no server running|can't find session:|(?:error connecting|failed to connect).*?(?:No such file|Connection refused)/i.test(check.stderr)) return null;
+		throw error;
+	}
 	const summaryResult = await execTmux(
 		pi,
 		["display-message", "-p", "-t", target, "#{session_name}\t#{session_id}\t#{session_created}\t#{pane_current_command}\t#{pane_current_path}"],

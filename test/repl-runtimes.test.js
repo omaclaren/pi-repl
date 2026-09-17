@@ -52,6 +52,32 @@ for (const [runtime, alias, executable] of [["ruby", " IRB ", "irb"], ["java", "
 	});
 }
 
+for (const outcome of ['ended', 'still-live', 'inspection-error']) {
+	test(`status handles pane lookup racing native exit: ${outcome}`, async () => {
+		const tools = new Map();
+		let checks = 0;
+		register({
+			registerTool: (tool) => tools.set(tool.name, tool),
+			registerCommand() {},
+			async exec(command, args) {
+				assert.equal(command, 'tmux');
+				if (args[0] === 'has-session') {
+					if (!args.includes('=pi-repl-matlab')) return { code: 1, stdout: '', stderr: "can't find session" };
+					checks++;
+					if (checks === 1 || outcome === 'still-live') return { code: 0, stdout: '', stderr: '' };
+					return { code: 1, stdout: '', stderr: outcome === 'ended' ? 'no server running on /tmp/test.sock' : 'error connecting to /tmp/test.sock (Permission denied)' };
+				}
+				if (args[0] === 'list-panes') return { code: 1, stdout: '', stderr: 'server exited unexpectedly' };
+				assert.fail(`Unexpected mutation or inspection: ${args.join(' ')}`);
+			},
+		});
+		const request = tools.get('repl_status').execute('exit-race', { target: 'matlab' }, undefined, undefined, { cwd: process.cwd() });
+		if (outcome === 'ended') assert.equal((await request).details.matlab.running, false);
+		else await assert.rejects(request, /Could not locate a REPL pane/);
+		assert.equal(checks, 2);
+	});
+}
+
 test("help and schemas advertise Ruby, Java, exports and existing echo controls", async () => {
 	const f = fixture();
 	await f.command("");
