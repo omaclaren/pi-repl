@@ -4,6 +4,11 @@ All notable changes to `pi-repl` are documented here.
 
 ## [Unreleased]
 
+### Added
+- Add experimental `cpp`: a Cling-based C++ REPL with normal login-shell discovery, observational startup/reuse, command/tool routing, clean records/exports, submission displays and verified explicit stop.
+- Evaluate C++ prompt groups using Cling's native validator/interpreter in the same process. Private framed requests and correlated replies distinguish native return, compilation failure, incomplete groups and C++ exceptions without feeding completion commands to stdin. Retain controls/leases through timeout or cancellation; native exit/crashes/busy Ctrl-C may end the workspace, with no restart or replay.
+- Add portable control/identity/routing tests and isolated native checks, including an optional one-rank PETSc persistent-object regression. Cling/PETSc are not installed or bundled by the extension. Cling 1.3 on ARM64 macOS is the tested configuration; other builds/platforms remain experimental.
+
 ## [0.7.0] — 2026-09-11
 
 ### Changed

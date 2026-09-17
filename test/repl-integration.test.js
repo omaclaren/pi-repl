@@ -1,7 +1,7 @@
 import { after, test } from "node:test";
 import assert from "node:assert/strict";
 import { execFile, spawnSync } from "node:child_process";
-import { existsSync, mkdirSync, mkdtempSync, readFileSync, readdirSync, realpathSync, rmSync, statSync, writeFileSync } from "node:fs";
+import { existsSync, mkdirSync, mkdtempSync, readFileSync, readdirSync, realpathSync, renameSync, rmSync, statSync, unlinkSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { dirname, join } from "node:path";
 import { promisify } from "node:util";
@@ -45,7 +45,7 @@ async function eventually(check, timeout = 15000) {
 
 async function fixture(t, { index = 0, runtime = "python", controlName, startWithTool = false, concurrentStart = false } = {}) {
 	if (!available) { t.skip("tmux is required for local integration tests"); return null; }
-	const command = runtime === "r" ? "R" : runtime === "python" ? "python3" : runtime === "ruby" ? "irb" : runtime === "java" ? "jshell" : runtime === "octave" ? "octave-cli" : runtime;
+	const command = runtime === "r" ? "R" : runtime === "python" ? "python3" : runtime === "ruby" ? "irb" : runtime === "java" ? "jshell" : runtime === "octave" ? "octave-cli" : runtime === "cpp" ? "cling" : runtime;
 	let executable = binary(command);
 	if (!executable) { t.skip(`${command} is not installed`); return null; }
 	if (runtime === "julia") {
@@ -67,9 +67,9 @@ async function fixture(t, { index = 0, runtime = "python", controlName, startWit
 		python: "-I -q -i", ipython: "--no-banner --no-confirm-exit --simple-prompt --HistoryManager.enabled=False",
 		julia: "--startup-file=no --history-file=no -i", r: "--vanilla --quiet", ghci: "-ignore-dot-ghci -v0", clojure: "",
 		ruby: "-f --noreadline", java: `-J-Duser.home=${quote(home)} -J-Djava.util.prefs.userRoot=${quote(join(home, "java-prefs"))}`,
-		octave: "--no-init-file --no-history --no-line-editing", matlab: "", gnuplot: "-d",
+		octave: "--no-init-file --no-history --no-line-editing", matlab: "", gnuplot: "-d", cpp: "",
 	}[runtime];
-	const launcher = runtime === "r" ? "R" : runtime === "ruby" ? "irb" : runtime === "java" ? "jshell" : runtime === "octave" ? "octave-cli" : runtime;
+	const launcher = runtime === "r" ? "R" : runtime === "ruby" ? "irb" : runtime === "java" ? "jshell" : runtime === "octave" ? "octave-cli" : runtime === "cpp" ? "cling" : runtime;
 	// A distinct socket/server and empty config: never target the user's tmux.
 	const config = join(cwd, "tmux.conf");
 	writeFileSync(config, `set -g base-index ${index}\nset -g pane-base-index ${index}\nset -g history-limit 10000\nset -g default-shell /bin/sh\n`);
@@ -84,6 +84,11 @@ async function fixture(t, { index = 0, runtime = "python", controlName, startWit
 	delete env.JAVA_TOOL_OPTIONS;
 	delete env.JDK_JAVA_OPTIONS;
 	delete env._JAVA_OPTIONS;
+	if (runtime === "cpp") {
+		env.OPENBLAS_NUM_THREADS = '1';
+		env.OMP_NUM_THREADS = '1';
+		delete env.PETSC_OPTIONS;
+	}
 	if (runtime === "gnuplot") {
 		env.GNUTERM = "dumb";
 		env.QT_QPA_PLATFORM = "offscreen";
@@ -98,12 +103,16 @@ async function fixture(t, { index = 0, runtime = "python", controlName, startWit
 		writeFileSync(join(cwd, "startup.m"), "");
 	}
 	const tmuxHarness = createTestTmux(t, { cwd, env, config, trackDetachedGnuplot: runtime === "gnuplot" });
-	writeFileSync(join(bin, launcher), `#!/bin/sh\n${tmuxHarness.launcherPrologue}exec ${quote(executable)} ${flags} "$@"\n`, { mode: 0o700 });
+	if (runtime === 'cpp') t.after(async () => {
+		assert.deepEqual(await tmuxHarness.cleanup(), [], 'C++ tests must not conceal a runtime leak with fallback signals');
+	});
+	writeFileSync(join(bin, launcher), `#!/bin/sh\n${tmuxHarness.launcherPrologue}${runtime === 'cpp' ? 'ulimit -c 0\n' : ''}exec ${quote(executable)} ${flags} "$@"\n`, { mode: 0o700 });
 	const calls = [];
 	const tools = new Map();
 	const commands = new Map();
 	const notifications = [];
 	let afterEnter;
+	let beforePaste;
 	let beforeStop;
 	const pi = {
 		registerTool: (tool) => tools.set(tool.name, tool),
@@ -112,6 +121,7 @@ async function fixture(t, { index = 0, runtime = "python", controlName, startWit
 			calls.push({ command, args: [...args] });
 			try {
 				if (command === "tmux" && args[0] === "if-shell" && beforeStop) await beforeStop();
+				if (command === "tmux" && args[0] === "paste-buffer" && beforePaste) await beforePaste();
 				const execOptions = { cwd: options.cwd, env, timeout: options.timeout, maxBuffer: 8 * 1024 * 1024 };
 				const result = command === "tmux" ? await tmuxHarness.run(args, execOptions) : await exec(command, args, execOptions);
 				if (command === "tmux" && args[0] === "send-keys" && afterEnter) await afterEnter();
@@ -153,7 +163,7 @@ async function fixture(t, { index = 0, runtime = "python", controlName, startWit
 		await repl(runtime);
 	}
 	assert.equal(notifications.some((n) => n.level === "error" || n.level === "warning"), false, JSON.stringify(notifications));
-	const prompt = { python: />>>/, ipython: /In \[\d+\]:/, julia: /julia>/, r: /(^|\n)>/, ghci: /ghci>/, clojure: /user=>/, ruby: /irb\(.*\).*?>/, java: /jshell>/, octave: /octave:\d+>/, matlab: /(^|\n)>>/, gnuplot: /gnuplot>/ }[runtime];
+	const prompt = { python: />>>/, ipython: /In \[\d+\]:/, julia: /julia>/, r: /(^|\n)>/, ghci: /ghci>/, clojure: /user=>/, ruby: /irb\(.*\).*?>/, java: /jshell>/, octave: /octave:\d+>/, matlab: /(^|\n)>>/, gnuplot: /gnuplot>/, cpp: /\[cling\]\$/ }[runtime];
 	let startupOutput = "";
 	try {
 		await eventually(async () => {
@@ -163,7 +173,7 @@ async function fixture(t, { index = 0, runtime = "python", controlName, startWit
 	} catch (error) {
 		throw new Error(`${runtime} startup failed: ${startupOutput}`, { cause: error });
 	}
-	return { cwd, calls, notifications, tmux, sessionName, target, repl, send, status, start, owned: () => tmuxHarness.owned(), cleanup: () => tmuxHarness.cleanup(), onEnter: (callback) => { afterEnter = callback; }, onBeforeStop: (callback) => { beforeStop = callback; } };
+	return { cwd, calls, notifications, tmux, sessionName, target, repl, send, status, start, owned: () => tmuxHarness.owned(), cleanup: () => tmuxHarness.cleanup(), onEnter: (callback) => { afterEnter = callback; }, onBeforePaste: (callback) => { beforePaste = callback; }, onBeforeStop: (callback) => { beforeStop = callback; } };
 }
 
 async function assertCompletionGap(f, result) {
@@ -210,6 +220,199 @@ async function assertVerifiedStop(f) {
 	assert.ok(readFileSync(status.historyPath, "utf8").startsWith(history));
 	assert.equal(readReplSessionRecord(status.recordId).entries.length, status.recordEntryCount);
 }
+
+test("cpp adapter preserves native state, errors, stdin boundaries and verified stop", {
+	timeout: 60000, skip: !(optionalRuntimes.has("all") || optionalRuntimes.has("cpp")),
+}, async (t) => {
+	const f = await fixture(t, { runtime: "cpp", concurrentStart: true });
+	if (!f) return;
+	let result = await f.send('int cpp_seed=41;\nprintf("SEED=%d\\n",cpp_seed);');
+	assert.equal(result.details.cppResult, 0, result.content[0].text);
+	assert.equal(result.content[0].text.split("Output:\n")[1], "SEED=41");
+	await f.tmux("send-keys", "-t", `${f.sessionName}:^`, "-l", "++cpp_seed;");
+	await f.tmux("send-keys", "-t", `${f.sessionName}:^`, "C-m");
+	result = await f.send('printf("DIRECT=%d\\n",cpp_seed);');
+	assert.equal(result.content[0].text.split("Output:\n")[1], "DIRECT=42");
+	assert.equal((await f.send("int cpp_bad = ;")).details.cppResult, 1);
+	assert.equal((await f.send("int unfinished(int n) {\nreturn n;")).details.cppResult, 2);
+	result = await f.send('printf("RECOVER=%d\\n",cpp_seed);');
+	assert.equal(result.content[0].text.split("Output:\n")[1], "RECOVER=42");
+	await f.send('int cpp_unwound=0;\nstruct CppGuard { ~CppGuard(){ ++cpp_unwound; } };\nvoid cpp_throw() { CppGuard guard; throw std::runtime_error("cpp deliberate"); }');
+	assert.equal((await f.send('cpp_throw();')).details.cppResult, 3);
+	assert.match((await f.send('printf("UNWOUND=%d\\n",cpp_unwound);')).content[0].text, /Output:\nUNWOUND=1/);
+	await f.send('int cpp_missing();');
+	assert.equal((await f.send('cpp_missing();\n++cpp_seed;')).details.cppResult, 1);
+	assert.equal((await f.send('.q\n++cpp_seed;')).details.cppResult, 1);
+	assert.equal((await f.send('++cpp_seed;\nint cpp_error=;\n++cpp_seed;')).details.cppResult, 1);
+	await f.send('--cpp_seed;');
+	const header = join(f.cwd, 'header λ definitions.hpp');
+	writeFileSync(header, 'int cpp_allman(int n)\n{\n return n+1;\n}\n');
+	assert.match((await f.send(`#include <${header}>\nprintf("HEADER=%d\\n",cpp_allman(4));`)).content[0].text, /Output:\nHEADER=5/);
+	for (const echoMode of ['summary', 'full', 'off']) {
+		result = await f.send('printf("no newline");', { echoMode });
+		assert.equal(result.content[0].text.split("Output:\n")[1], 'no newline');
+		if (echoMode !== 'off') await assertCompletionGap(f, result);
+	}
+	const record = (await f.status()).details.cpp;
+	await assert.rejects(f.send('char cpp_input[200];\nprintf("[cling]$ "); fflush(stdout);\nfgets(cpp_input,sizeof cpp_input,stdin);\nprintf("DATA=%s",cpp_input);', { timeoutMs: 1000 }), /Timed out/);
+	const files = readdirSync(process.env.PI_REPL_CONTROL_ROOT);
+	assert.ok(files.some((name) => name.endsWith(".cpp")));
+	assert.ok(files.some((name) => name.endsWith(".req")));
+	await assert.rejects(acquireReplSessionSendLease(record.recordId, { waitMs: 0 }), /busy/);
+	const falseReply = join(process.env.PI_REPL_CONTROL_ROOT, files.find((name) => name.endsWith('.cpp')).replace(/\.cpp$/, '.done'));
+	writeFileSync(falseReply, 'done\n', { mode: 0o600 });
+	await new Promise((resolve) => setTimeout(resolve, 600));
+	await assert.rejects(acquireReplSessionSendLease(record.recordId, { waitMs: 0 }), /busy/);
+	assert.ok(existsSync(falseReply), 'malformed completion must not release controls');
+	unlinkSync(falseReply);
+	await f.tmux("send-keys", "-t", `${f.sessionName}:^`, "-l", "HUMAN_DATA");
+	await f.tmux("send-keys", "-t", `${f.sessionName}:^`, "C-m");
+	await eventually(() => readdirSync(process.env.PI_REPL_CONTROL_ROOT).length === 0);
+	await f.send('#include <iostream>\nstd::string cpp_line;');
+	await assert.rejects(f.send('std::getline(std::cin,cpp_line);', { timeoutMs: 1000 }), /Timed out/);
+	await f.tmux('send-keys', '-t', `${f.sessionName}:^`, '-l', 'SECOND_INPUT');
+	await f.tmux('send-keys', '-t', `${f.sessionName}:^`, 'C-m');
+	await eventually(() => readdirSync(process.env.PI_REPL_CONTROL_ROOT).length === 0);
+	assert.match((await f.send('printf("LINE=%s\\n",cpp_line.c_str());')).content[0].text, /Output:\nLINE=SECOND_INPUT/);
+	result = await f.send('printf("FINAL=%d,%s",cpp_seed,cpp_input);', { echoMode: "off" });
+	assert.equal(result.content[0].text.split("Output:\n")[1], "FINAL=42,HUMAN_DATA");
+	const entries = readReplSessionRecord(record.recordId).entries;
+	assert.equal(entries.at(-1).output, 'FINAL=42,HUMAN_DATA');
+	assert.equal(entries.at(-1).code, 'printf("FINAL=%d,%s",cpp_seed,cpp_input);');
+	assert.ok(entries.some((entry) => entry.status === 'timeout'));
+	await f.repl('export cpp');
+	assert.equal(f.notifications.at(-1).level, 'info');
+	await assertVerifiedStop(f);
+});
+
+for (const mode of ['abort', 'exit', 'interrupt', 'stop-busy']) test(`cpp adapter ${mode} retains or releases the actual send lease without replay`, {
+	timeout: 45000, skip: !(optionalRuntimes.has('all') || optionalRuntimes.has('cpp')),
+}, async (t) => {
+	const f = await fixture(t, { runtime: 'cpp', startWithTool: true });
+	if (!f) return;
+	await f.send('int cpp_lifetime=42;');
+	const record = (await f.status()).details.cpp;
+	const abort = new AbortController();
+	if (mode === 'abort' || mode === 'stop-busy') f.onEnter(() => abort.abort());
+	if (mode === 'interrupt') f.onEnter(async () => {
+		await eventually(() => existsSync(join(f.cwd, 'started')));
+		await f.tmux('send-keys', '-t', `${f.sessionName}:^`, 'C-c');
+	});
+	const code = mode === 'exit' ? 'std::exit(9);' : mode === 'abort' ? 'sleep(2);\nprintf("RETURNED=%d\\n",cpp_lifetime);' : 'close(open("started",O_CREAT|O_WRONLY,0600));\nwhile(true) {}';
+	await assert.rejects(f.send(code, { timeoutMs: 15000 }, abort.signal), mode === 'abort' || mode === 'stop-busy' ? /aborted/ : /session ended/);
+	f.onEnter(undefined);
+	if (mode === 'abort' || mode === 'stop-busy') {
+		assert.ok(readdirSync(process.env.PI_REPL_CONTROL_ROOT).length >= 3);
+		await assert.rejects(acquireReplSessionSendLease(record.recordId, { waitMs: 0 }), /busy/);
+	}
+	if (mode === 'stop-busy') await assertVerifiedStop(f);
+	await eventually(() => readdirSync(process.env.PI_REPL_CONTROL_ROOT).length === 0);
+	// File cleanup precedes the async lease release; observe both independently.
+	await eventually(async () => {
+		try { const lease = await acquireReplSessionSendLease(record.recordId, { waitMs: 0 }); await lease.release(); return true; }
+		catch (error) { if (/busy/.test(error.message)) return false; throw error; }
+	});
+	if (mode === 'abort') {
+		assert.match((await f.send('printf("STATE=%d\\n",cpp_lifetime);')).content[0].text, /Output:\nSTATE=42/);
+		await assertVerifiedStop(f);
+	} else assert.equal((await f.status()).details.cpp.running, false);
+});
+
+for (const extension of ['cpp', 'req']) test(`cpp adapter refuses replaced .${extension} controls and leaves the replacement untouched`, {
+	timeout: 30000, skip: !(optionalRuntimes.has('all') || optionalRuntimes.has('cpp')),
+}, async (t) => {
+	const f = await fixture(t, { runtime: 'cpp', startWithTool: true });
+	if (!f) return;
+	const record = (await f.status()).details.cpp;
+	let replaced;
+	f.onBeforePaste(() => {
+		f.onBeforePaste(undefined);
+		replaced = join(process.env.PI_REPL_CONTROL_ROOT, readdirSync(process.env.PI_REPL_CONTROL_ROOT).find((name) => name.endsWith('.'+extension)));
+		renameSync(replaced, join(f.cwd, 'original-control'));
+		writeFileSync(replaced, 'puts("UNEXPECTED_EXECUTION");', { mode: 0o600 });
+	});
+	if (extension === 'cpp') {
+		const result = await f.send('printf("INTENDED_EXECUTION\\n");');
+		assert.equal(result.details.cppResult, 5, result.content[0].text);
+		assert.match(result.content[0].text, /source identity or read failed/);
+		assert.doesNotMatch(result.content[0].text.split('Output:\n')[1], /UNEXPECTED_EXECUTION|INTENDED_EXECUTION/);
+	} else {
+		await assert.rejects(f.send('printf("INTENDED_EXECUTION\\n");', { timeoutMs: 1000 }), /Timed out/);
+		await assert.rejects(acquireReplSessionSendLease(record.recordId, { waitMs: 0 }), /busy/);
+		await eventually(async () => (await f.tmux('capture-pane', '-J', '-p', '-t', `${f.sessionName}:^`)).includes('request identity or read failed'));
+	}
+	assert.equal(readFileSync(replaced, 'utf8'), 'puts("UNEXPECTED_EXECUTION");');
+	await assertVerifiedStop(f);
+	await eventually(() => readdirSync(process.env.PI_REPL_CONTROL_ROOT).length === 1);
+	assert.equal(readFileSync(replaced, 'utf8'), 'puts("UNEXPECTED_EXECUTION");');
+	// Test-owned replacement, deliberately not removed by production cleanup.
+	unlinkSync(replaced);
+});
+
+test('cpp adapter settles native exit with a retained pane; stop remains conservative', {
+	timeout: 30000, skip: !(optionalRuntimes.has('all') || optionalRuntimes.has('cpp')),
+}, async (t) => {
+	const f = await fixture(t, { runtime: 'cpp', startWithTool: true });
+	if (!f) return;
+	const record = (await f.status()).details.cpp;
+	await f.tmux('set-option', '-w', '-t', `${f.sessionName}:^`, 'remain-on-exit', 'on');
+	await assert.rejects(f.send('std::exit(9);'), /session ended native execution/);
+	assert.equal(await f.tmux('display-message', '-p', '-t', `${f.sessionName}:^`, '#{pane_dead}|#{pane_dead_status}'), '1|9');
+	assert.equal(readdirSync(process.env.PI_REPL_CONTROL_ROOT).length, 0);
+	const lease = await acquireReplSessionSendLease(record.recordId, { waitMs: 0 }); await lease.release();
+	await assert.rejects(f.send('printf("NEVER_SENT\\n");'), /pane is ended/);
+	// Existing production stop requires a live, attributable pane owner. Do not
+	// weaken that check just to remove an already-dead retained tmux pane.
+	await f.repl('stop cpp');
+	assert.equal(f.notifications.at(-1).level, 'error');
+	assert.match(f.notifications.at(-1).message, /Cannot verify the runtime owner/);
+	assert.equal(await f.tmux('display-message', '-p', '-t', `${f.sessionName}:^`, '#{pane_dead}'), '1');
+	// The independent, pre-registered test-scope teardown removes this server.
+});
+
+test('cpp adapter PETSc keeps the same objects through direct edits and errors', {
+	timeout: 60000, skip: !process.env.PI_REPL_TEST_PETSC_PREFIX || !(optionalRuntimes.has('all') || optionalRuntimes.has('cpp')),
+}, async (t) => {
+	const f = await fixture(t, { runtime: 'cpp', startWithTool: true });
+	if (!f) return;
+	const prefix = process.env.PI_REPL_TEST_PETSC_PREFIX;
+	const library = join(prefix, 'lib', process.platform === 'darwin' ? 'libpetsc.dylib' : 'libpetsc.so');
+	const { cppStringLiteral, cppInclude } = await import('../shared/repl-cpp.js');
+	const source = join(f.cwd, 'scientific workbench.hpp');
+	writeFileSync(source, readFileSync(new URL('./fixtures/cpp-petsc.hpp', import.meta.url)));
+	const run = async (code) => {
+		const r = await f.send(code);
+		assert.equal(r.details.cppResult, 0, r.content[0].text);
+		return r.content[0].text.split('Output:\n')[1];
+	};
+	assert.match(await run(`printf("LOAD=%d\\n",(int)cling::runtime::gCling->loadLibrary(${cppStringLiteral(library)}));`), /LOAD=0/);
+	await run(`cling::runtime::gCling->AddIncludePath(${cppStringLiteral(join(prefix, 'include'))});`);
+	await run(cppInclude(source));
+	assert.match(await run('ierr=PetscInitializeNoArguments();\nprintf("INITIALIZE=%d Int=%zu Scalar=%zu\\n",ierr,sizeof(PetscInt),sizeof(PetscScalar));\nint mpi_size; MPI_Comm_size(PETSC_COMM_WORLD,&mpi_size);\nprintf("MPI_SIZE=%d\\n",mpi_size);'), /INITIALIZE=0 Int=4 Scalar=8[\s\S]*MPI_SIZE=1/);
+	assert.match(await run('ierr=build_problem();\nprintf("BUILD=%d\\n",ierr);'), /BUILD=0/);
+	let objects;
+	async function solve(label, iterations, first) {
+		const output = await run(`ierr=solve_and_report("${label}");\nprintf("SOLVE_ERROR=%d\\n",ierr);`);
+		const match = output.match(/its=(\d+) residual=(\S+) first=(\S+) mid=(\S+) last=(\S+) A=(\S+) KSP=(\S+)/);
+		assert.ok(match, output); assert.equal(Number(match[1]), iterations);
+		assert.ok(Number(match[2]) < 1e-10); assert.ok(Math.abs(Number(match[3])-first) < 1e-10);
+		assert.ok(Math.abs(Number(match[4])-first*3.5) < 1e-10); assert.ok(Math.abs(Number(match[5])-first) < 1e-10);
+		if (objects) assert.deepEqual(match.slice(6), objects); else objects=match.slice(6);
+		assert.match(output, /SOLVE_ERROR=0/);
+	}
+	await solve('none', 6, 6);
+	for (const [direct, label, first] of [['PCSetType(pc,PCICC);', 'icc', 6], ['VecScale(b,2.0);', 'scaled', 12]]) {
+		await f.tmux('send-keys', '-t', `${f.sessionName}:^`, '-l', direct);
+		await f.tmux('send-keys', '-t', `${f.sessionName}:^`, 'C-m');
+		await solve(label, 1, first);
+	}
+	assert.equal((await f.send('int petsc_compile_error=;')).details.cppResult, 1);
+	await solve('after_compile_error', 1, 12);
+	assert.match(await run('ierr=KSPSetType(ksp,"pi_repl_deliberately_invalid");\nprintf("PETSC_ERROR=%d\\n",ierr);'), /PETSC_ERROR=86/);
+	await solve('after_petsc_error', 1, 12);
+	assert.match(await run('ierr=destroy_problem();\nprintf("DESTROY=%d EMPTY=%d\\n",ierr,A==NULL && x==NULL && ksp==NULL);\nierr=PetscFinalize();\nint mpi_finalized; MPI_Finalized(&mpi_finalized);\nprintf("FINALIZE=%d MPI_FINALIZED=%d\\n",ierr,mpi_finalized);'), /DESTROY=0 EMPTY=1[\s\S]*FINALIZE=0 MPI_FINALIZED=1/);
+	await assertVerifiedStop(f);
+});
 
 test("production stop reaps resistant runtime children in all selected panes and preserves another session", { timeout: 30000 }, async (t) => {
 	const f = await fixture(t, { index: 1 });

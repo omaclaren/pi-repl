@@ -40,9 +40,10 @@ import { createPrivateReplHistoryFile } from "./shared/repl-history.js";
 import { stopVerifiedReplSession } from "./shared/repl-session-stop.js";
 import { mStringLiteral, buildMLanguageControlSource, buildMLanguageDriverSource } from "./shared/repl-m-language.js";
 import { buildGnuplotSubmissionLine, buildGnuplotGuardSource, buildGnuplotDriverSource } from "./shared/repl-gnuplot.js";
+import { cppInclude, buildCppDriverSource, buildCppRequest, createCppControlCleanup, prepareCppSubmission, readCppCompletion } from "./shared/repl-cpp.js";
 import { GNUPLOT_OWNER_ENV, GNUPLOT_OWNER_OPTION } from "./shared/repl-gnuplot-processes.js";
 
-const SUPPORTED_RUNTIMES = ["julia", "python", "ipython", "r", "ghci", "clojure", "clj", "ruby", "java", "octave", "matlab", "gnuplot", "bun"] as const;
+const SUPPORTED_RUNTIMES = ["julia", "python", "ipython", "r", "ghci", "clojure", "clj", "ruby", "java", "octave", "matlab", "gnuplot", "cpp", "bun"] as const;
 const DEFAULT_PYTHON_SESSION = "pi-repl-python";
 const DEFAULT_JULIA_SESSION = "pi-repl-julia";
 const DEFAULT_R_SESSION = "pi-repl-r";
@@ -53,6 +54,7 @@ const DEFAULT_JAVA_SESSION = "pi-repl-java";
 const DEFAULT_OCTAVE_SESSION = "pi-repl-octave";
 const DEFAULT_MATLAB_SESSION = "pi-repl-matlab";
 const DEFAULT_GNUPLOT_SESSION = "pi-repl-gnuplot";
+const DEFAULT_CPP_SESSION = "pi-repl-cpp";
 const DEFAULT_CAPTURE_LINES = 20;
 const DEFAULT_STARTUP_WAIT_MS = 20_000;
 const MAX_STARTUP_WAIT_MS = 120_000;
@@ -209,7 +211,7 @@ const REPL_HISTORY_OPTION = "@pi_repl_history_path";
 type SupportedRuntime = (typeof SUPPORTED_RUNTIMES)[number];
 type PythonRuntime = "python" | "ipython";
 type ClojureRuntime = "clojure" | "clj";
-type ManagedRuntime = PythonRuntime | "julia" | "r" | "ghci" | ClojureRuntime | "ruby" | "java" | "octave" | "matlab" | "gnuplot";
+type ManagedRuntime = PythonRuntime | "julia" | "r" | "ghci" | ClojureRuntime | "ruby" | "java" | "octave" | "matlab" | "gnuplot" | "cpp";
 type ImplementedRuntime = Exclude<ManagedRuntime, "clj">;
 type SessionSelector = Exclude<ImplementedRuntime, "ipython">;
 type ReplSubmissionEchoMode = "off" | "summary" | "full";
@@ -277,13 +279,14 @@ type ReplSendDetails = {
 	recordWarning?: string;
 	truncation?: TruncationResult;
 	fullOutputPath?: string;
+	cppResult?: number;
 };
 
 const REPL_SEND_PARAMS = Type.Object({
-	code: Type.String({ description: "Python, IPython, Julia, R, GHCi, Clojure, Ruby, Java, Octave, MATLAB, or gnuplot code to execute in the shared REPL session." }),
+	code: Type.String({ description: "Python, IPython, Julia, R, GHCi, Clojure, Ruby, Java, Octave, MATLAB, gnuplot, or C++ code to execute in the shared REPL session." }),
 	target: Type.Optional(
 		Type.String({
-			description: "Optional target REPL: python, julia, r, ghci, clojure, ruby, java, octave, matlab, or gnuplot. If omitted, repl_send uses the shared Python/IPython session.",
+			description: "Optional target REPL: python, julia, r, ghci, clojure, ruby, java, octave, matlab, gnuplot, or cpp. If omitted, repl_send uses the shared Python/IPython session.",
 		}),
 	),
 	timeoutMs: Type.Optional(
@@ -307,7 +310,7 @@ function resolveReplSubmissionEchoMode(value?: string): ReplSubmissionEchoMode {
 	return normalizeReplSubmissionEchoMode(value, replSubmissionEchoMode) as ReplSubmissionEchoMode;
 }
 
-const REPL_START_RUNTIMES = ["python", "ipython", "julia", "r", "ghci", "clojure", "ruby", "java", "octave", "matlab", "gnuplot"] as const;
+const REPL_START_RUNTIMES = ["python", "ipython", "julia", "r", "ghci", "clojure", "ruby", "java", "octave", "matlab", "gnuplot", "cpp"] as const;
 const REPL_START_PARAMS = Type.Object({
 	runtime: StringEnum(REPL_START_RUNTIMES, {
 		description: "Runtime to start explicitly. Python and IPython share one session; an existing session is reused without switching its interpreter.",
@@ -322,7 +325,7 @@ const REPL_START_PARAMS = Type.Object({
 const REPL_STATUS_PARAMS = Type.Object({
 	target: Type.Optional(
 		Type.String({
-			description: "Optional session target: python, julia, r, ghci, ruby, java, clojure, octave, matlab, or gnuplot. If omitted, report all shared REPL sessions.",
+			description: "Optional session target: python, julia, r, ghci, ruby, java, clojure, octave, matlab, gnuplot, or cpp. If omitted, report all shared REPL sessions.",
 		}),
 	),
 });
@@ -368,7 +371,7 @@ function toSessionSelector(runtime: ManagedRuntime): SessionSelector {
 	if (runtime === "clojure" || runtime === "clj") return "clojure";
 	if (runtime === "ruby") return "ruby";
 	if (runtime === "java") return "java";
-	if (runtime === "octave" || runtime === "matlab" || runtime === "gnuplot") return runtime;
+	if (runtime === "octave" || runtime === "matlab" || runtime === "gnuplot" || runtime === "cpp") return runtime;
 	return "python";
 }
 
@@ -382,6 +385,7 @@ function getSessionNameForSelector(selector: SessionSelector): string {
 	if (selector === "octave") return DEFAULT_OCTAVE_SESSION;
 	if (selector === "matlab") return DEFAULT_MATLAB_SESSION;
 	if (selector === "gnuplot") return DEFAULT_GNUPLOT_SESSION;
+	if (selector === "cpp") return DEFAULT_CPP_SESSION;
 	return DEFAULT_PYTHON_SESSION;
 }
 
@@ -416,14 +420,15 @@ function formatUsage(): string {
 		"  /repl octave",
 		"  /repl matlab",
 		"  /repl gnuplot",
+		"  /repl cpp",
 		"  /repl echo [off|summary|full]",
-		"  /repl status [python|julia|r|ghci|clojure|ruby|java|octave|matlab|gnuplot]",
+		"  /repl status [python|julia|r|ghci|clojure|ruby|java|octave|matlab|gnuplot|cpp]",
 		"  /repl env [python]",
-		"  /repl attach [python|julia|r|ghci|clojure|ruby|java|octave|matlab|gnuplot]",
-		"  /repl export [python|julia|r|ghci|clojure|ruby|java|octave|matlab|gnuplot]",
-		"  /repl stop [python|julia|r|ghci|clojure|ruby|java|octave|matlab|gnuplot]",
+		"  /repl attach [python|julia|r|ghci|clojure|ruby|java|octave|matlab|gnuplot|cpp]",
+		"  /repl export [python|julia|r|ghci|clojure|ruby|java|octave|matlab|gnuplot|cpp]",
+		"  /repl stop [python|julia|r|ghci|clojure|ruby|java|octave|matlab|gnuplot|cpp]",
 		"",
-		"Supported runtimes right now: python, ipython, julia, r, ghci, clojure, ruby, java, octave, matlab, gnuplot",
+		"Supported runtimes right now: python, ipython, julia, r, ghci, clojure, ruby, java, octave, matlab, gnuplot, cpp",
 		"For R, both /repl R and /repl r work. The same applies to /lab, /repl status, /repl attach, /repl export, and /repl stop.",
 		"For Clojure, /repl clojure is canonical and /repl clj also works. The same applies to /lab, /repl status, /repl attach, /repl export, and /repl stop.",
 		"For Ruby, /repl ruby starts irb. For Java, /repl java starts jshell.",
@@ -438,6 +443,7 @@ function formatUsage(): string {
 		"  - /repl java manages the shared tmux session pi-repl-java",
 		"  - /repl octave and /repl matlab manage separate terminal sessions; they never substitute for each other",
 		"  - /repl gnuplot manages the independent pi-repl-gnuplot session, retaining native plotting settings",
+		"  - /repl cpp starts an experimental Cling-based C++ REPL; send C++ prompt groups, not dot commands",
 		"  - /repl status, /repl attach, /repl export, and /repl stop can target any managed runtime",
 		"  - repl_start lets pi start or reuse a session with an explicit runtime; repl_send never auto-starts one",
 		"  - /repl echo controls the bounded submitted-code display in the raw pane; PI_REPL_ECHO_MODE sets the startup default",
@@ -605,6 +611,7 @@ function buildRuntimeLaunchCommand(runtime: ManagedRuntime): string {
 	if (runtime === "java") return "jshell";
 	if (runtime === "octave") return "octave-cli --quiet --interactive";
 	if (runtime === "matlab") return "matlab -nodesktop -nosplash";
+	if (runtime === "cpp") return "cling";
 	return runtime;
 }
 
@@ -896,6 +903,7 @@ function getSessionDisplayName(selector: SessionSelector, info?: SessionInfo | n
 	if (selector === "octave") return "Octave";
 	if (selector === "matlab") return "MATLAB";
 	if (selector === "gnuplot") return "gnuplot";
+	if (selector === "cpp") return "C++ (Cling)";
 	if (info?.runtime === "ipython") return "Python/IPython";
 	return "Python/IPython";
 }
@@ -919,7 +927,7 @@ async function listRunningSharedSessions(
 	if (rubyInfo) sessions.push({ selector: "ruby", info: rubyInfo });
 	const javaInfo = await readSessionInfo(pi, DEFAULT_JAVA_SESSION, cwd);
 	if (javaInfo) sessions.push({ selector: "java", info: javaInfo });
-	for (const selector of ["octave", "matlab", "gnuplot"] as const) {
+	for (const selector of ["octave", "matlab", "gnuplot", "cpp"] as const) {
 		const info = await readSessionInfo(pi, getSessionNameForSelector(selector), cwd);
 		if (info) sessions.push({ selector, info });
 	}
@@ -946,6 +954,7 @@ function hasNormalReplPrompt(info: SessionInfo, requested: ImplementedRuntime): 
 		octave: /(?:^|\n)octave:\d+>[ \t]*$/,
 		matlab: /(?:^|\n)>>[ \t]*$/,
 		gnuplot: /(?:^|\n)gnuplot>[ \t]*$/,
+		cpp: /(?:^|\n)\[cling\]\$[ \t]*$/,
 	};
 	if (!REPL_START_RUNTIMES.includes(runtime as ImplementedRuntime)) return false;
 	if (toSessionSelector(runtime as ImplementedRuntime) !== toSessionSelector(requested)) return false;
@@ -982,7 +991,14 @@ async function waitForReplSessionInfo(
 			throw new Error(`REPL session ${sessionName} changed while waiting for its prompt. No replacement was started; inspect it with repl_status.`);
 		}
 		identity = info;
-		if (hasNormalReplPrompt(info, runtime)) return { info, ready: true };
+		let livePane = true;
+		if (runtime === "cpp") {
+			const pane = await inspectCppPane(pi, await getPaneTarget(pi, sessionTarget, cwd), cwd);
+			if (pane?.dead) throw new Error(`REPL session ended native execution: ${sessionName}. Its dead tmux pane is retained; no replacement was started.`);
+			livePane = Boolean(pane);
+		}
+		checkStartAborted(signal, sessionName);
+		if (livePane && hasNormalReplPrompt(info, runtime)) return { info, ready: true };
 		if (Date.now() >= deadline) return { info, ready: false };
 		await sleep(Math.min(DEFAULT_STARTUP_POLL_MS, deadline - Date.now()));
 	}
@@ -1005,6 +1021,8 @@ type ReplSubmissionState = {
 	beforeCapture: string;
 	prepared: ReturnType<typeof prepareReplControlFiles>;
 	completionObserved: boolean;
+	runtimeEnded?: boolean;
+	cppPane?: { id: string; pid: string };
 };
 
 function getReplControlExtension(runtime: ImplementedRuntime): string {
@@ -1016,6 +1034,7 @@ function getReplControlExtension(runtime: ImplementedRuntime): string {
 	if (runtime === "java") return "java";
 	if (runtime === "octave" || runtime === "matlab") return "m";
 	if (runtime === "gnuplot") return "gp";
+	if (runtime === "cpp") return "cpp";
 	return "py";
 }
 
@@ -1258,6 +1277,7 @@ function buildReplControlSource(runtime: ImplementedRuntime, code: string, doneF
 	if (runtime === "java") return buildJavaControlSource(code, doneFile, display);
 	if (runtime === "octave" || runtime === "matlab") return buildMLanguageControlSource(code, display);
 	if (runtime === "gnuplot") return code + "\n";
+	if (runtime === "cpp") return code;
 	return buildPythonControlSource(runtime, code, doneFile, display);
 }
 
@@ -1346,7 +1366,8 @@ function prepareReplControlFiles(
 	runtime: ImplementedRuntime,
 	code: string,
 	details: { submissionId: string; echoMode: ReplSubmissionEchoMode },
-): { controlPaths: ReplControlPaths; guardPaths?: ReplControlPaths; driverPaths?: ReplControlPaths; submissionLine: string; completionLine?: string; previewComment?: string; submissionText: string; display: ReplSubmissionDisplay } {
+): { controlPaths: ReplControlPaths; guardPaths?: ReplControlPaths; driverPaths?: ReplControlPaths; submissionLine: string; completionLine?: string; previewComment?: string; submissionText: string; display: ReplSubmissionDisplay; cppCompletion?: ReturnType<typeof prepareCppSubmission>["completion"]; cppCleanup?: () => void } {
+	if (runtime === "cpp" && code.includes("\0")) throw new Error("C++ source cannot contain NUL bytes; no code was sent.");
 	const display = createReplSubmissionDisplay({
 		entryId: details.submissionId,
 		origin: "pi-repl",
@@ -1407,7 +1428,20 @@ function prepareReplControlFiles(
 				buildSource: () => buildGnuplotDriverSource(controlPaths.sourceFile, guard.sourceFile, guard.doneFile, controlPaths.doneFile, display),
 			});
 		}
-		const submissionLine = buildReplSubmissionLine(runtime, driverPaths?.sourceFile ?? controlPaths.sourceFile);
+		let cpp: ReturnType<typeof prepareCppSubmission> | undefined;
+		if (runtime === "cpp") {
+			const request = createPrivateReplControlFiles({
+				...controlOptions, extension: "req",
+				buildSource: () => buildCppRequest(controlPaths.sourceFile, controlPaths.doneFile, display),
+			});
+			guardPaths = request;
+			cpp = prepareCppSubmission(request.sourceFile, controlPaths.doneFile);
+			driverPaths = createPrivateReplControlFiles({
+				...controlOptions, extension: "hxx",
+				buildSource: () => buildCppDriverSource(request.sourceFile, controlPaths.doneFile),
+			});
+		}
+		const submissionLine = cpp && driverPaths ? cppInclude(driverPaths.sourceFile) : buildReplSubmissionLine(runtime, driverPaths?.sourceFile ?? controlPaths.sourceFile);
 		const completionLine = driverPaths ? undefined : buildReplCompletionLine(runtime, controlPaths.doneFile, display);
 		const previewComment = undefined;
 		return {
@@ -1418,6 +1452,8 @@ function prepareReplControlFiles(
 			completionLine,
 			previewComment,
 			display,
+			cppCompletion: cpp?.completion,
+			cppCleanup: cpp && guardPaths && driverPaths ? createCppControlCleanup(cpp.completion, [controlPaths.sourceFile, guardPaths.sourceFile, driverPaths.sourceFile]) : undefined,
 			submissionText: buildSubmissionText(submissionLine, previewComment, completionLine),
 		};
 	} catch (error) {
@@ -1506,13 +1542,15 @@ function extractPaneDelta(before: string, after: string): string {
 }
 
 export function cleanupReplDelta(delta: string, submissionLine: string, previewComment?: string, completionLine?: string, display?: ReplSubmissionDisplay): string {
+	const isCppSubmission = submissionLine.startsWith("#include ");
 	const isMLanguageSubmission = submissionLine.startsWith("eval(fileread(");
 	const isPrompt = (line: string) =>
 		/^(?:>>>|In \[\d+\]:|\.\.\.:|>|\+)\s*$/.test(line) ||
 		/^(ghci|Prelude|\*?[A-Za-z0-9_.:]+)>\s*$/.test(line) ||
 		/^[^\s>]+=>\s*$/.test(line) ||
 		/^irb\(.*\)[:\d]+[>*]\s*$/.test(line) ||
-		(isMLanguageSubmission && /^(?:octave:\d+>|>>)\s*$/.test(line));
+		(isMLanguageSubmission && /^(?:octave:\d+>|>>)\s*$/.test(line)) ||
+		(isCppSubmission && /^\[cling\]\$\s*$/.test(line));
 	const echoEnd = (line: string, command: string) => {
 		if (!command) return -1;
 		const index = line.indexOf(command);
@@ -1574,6 +1612,29 @@ export function cleanupReplDelta(delta: string, submissionLine: string, previewC
 	return stripBoundaryBlankLines(display ? stripReplSubmissionDisplay(scaffoldCleaned, display) : scaffoldCleaned);
 }
 
+function cleanupPreparedReplControlFiles(prepared?: ReturnType<typeof prepareReplControlFiles>): void {
+	if (prepared?.cppCleanup) return prepared.cppCleanup();
+	cleanupPrivateReplControlFiles(prepared?.controlPaths);
+	cleanupPrivateReplControlFiles(prepared?.guardPaths);
+	cleanupPrivateReplControlFiles(prepared?.driverPaths);
+}
+
+function submissionComplete(prepared: ReturnType<typeof prepareReplControlFiles>): boolean {
+	return prepared.cppCompletion ? readCppCompletion(prepared.cppCompletion) !== undefined : existsSync(prepared.controlPaths.doneFile);
+}
+
+async function inspectCppPane(pi: ExtensionAPI, id: string, cwd: string): Promise<{ id: string; pid: string; dead: boolean } | undefined> {
+	const result = await execTmux(pi, ["display-message", "-p", "-t", id, "#{pane_id}|#{pane_pid}|#{pane_dead}"], cwd, 3_000);
+	const match = result.stdout.trim().match(/^(%\d+)\|(\d+)\|([01])$/);
+	return result.code === 0 && match && match[1] === id ? { id, pid: match[2], dead: match[3] === "1" } : undefined;
+}
+
+async function cppPaneEnded(pi: ExtensionAPI, state: ReplSubmissionState): Promise<boolean> {
+	if (!state.cppPane) return false;
+	const current = await inspectCppPane(pi, state.cppPane.id, state.cwd);
+	return Boolean(current?.dead && current.pid === state.cppPane.pid);
+}
+
 async function waitForReplDoneFile(
 	pi: ExtensionAPI,
 	sessionName: string,
@@ -1583,7 +1644,7 @@ async function waitForReplDoneFile(
 	doneFile: string,
 	timeoutMs: number,
 	signal?: AbortSignal,
-	captureContext?: { beforeCapture: string; prepared: ReturnType<typeof prepareReplControlFiles> },
+	captureContext?: { beforeCapture: string; prepared: ReturnType<typeof prepareReplControlFiles>; state?: ReplSubmissionState },
 ): Promise<void> {
 	const deadline = Date.now() + timeoutMs;
 	let latestCapture = "";
@@ -1597,9 +1658,23 @@ async function waitForReplDoneFile(
 			throw new Error(`REPL session ended while waiting for output: ${sessionName}`);
 		}
 
-		if (existsSync(doneFile)) return;
+		if (captureContext ? submissionComplete(captureContext.prepared) : existsSync(doneFile)) return;
+		if (captureContext?.state && await cppPaneEnded(pi, captureContext.state)) {
+			captureContext.state.runtimeEnded = true;
+			throw new Error(`REPL session ended native execution while waiting for output: ${sessionName}. Its dead tmux pane is retained; no replacement was started.`);
+		}
 
-		latestCapture = await capturePaneOutput(pi, paneTarget, cwd);
+		try {
+			latestCapture = await capturePaneOutput(pi, paneTarget, cwd);
+		} catch (error) {
+			// Native exit can race the observational capture after has-session.
+			// Classify it consistently; the watcher still verifies settlement
+			// before releasing controls/lease (inspection errors are not ACKs).
+			if (captureContext?.state?.cppPane && !(await tmuxSessionExists(pi, sessionTarget, cwd))) {
+				throw new Error(`REPL session ended while waiting for output: ${sessionName}`);
+			}
+			throw error;
+		}
 		await sleep(REPL_SEND_POLL_MS);
 	}
 
@@ -1632,7 +1707,7 @@ function normalizeReplSendTarget(target?: string): SessionSelector | undefined {
 	if (trimmed === "clojure" || trimmed === "clj") return "clojure";
 	if (trimmed === "ruby" || trimmed === "irb") return "ruby";
 	if (trimmed === "java" || trimmed === "jshell") return "java";
-	if (trimmed === "octave" || trimmed === "matlab" || trimmed === "gnuplot") return trimmed;
+	if (trimmed === "octave" || trimmed === "matlab" || trimmed === "gnuplot" || trimmed === "cpp") return trimmed;
 	throw new Error(`Unknown repl_send target: ${target}`);
 }
 
@@ -1657,7 +1732,7 @@ async function runReplCode(
 	const sessionName = getSessionNameForSelector(target);
 
 	if (!(await tmuxSessionExists(pi, sessionName, ctx.cwd))) {
-		if (target === "octave" || target === "matlab" || target === "gnuplot") throw new Error(`No default ${getSessionDisplayName(target)} REPL session is running (${sessionName}). Start one with /repl ${target} first.`);
+		if (target === "octave" || target === "matlab" || target === "gnuplot" || target === "cpp") throw new Error(`No default ${getSessionDisplayName(target)} REPL session is running (${sessionName}). Start one with /repl ${target} first.`);
 		if (target === "julia") {
 			throw new Error(
 				`No default Julia REPL session is running (${DEFAULT_JULIA_SESSION}). Start one with /repl julia first.`,
@@ -1695,7 +1770,7 @@ async function runReplCode(
 
 	const sessionInfo = await readSessionInfo(pi, sessionName, ctx.cwd);
 	if (!sessionInfo) {
-		if (target === "octave" || target === "matlab" || target === "gnuplot") throw new Error(`Could not inspect the default ${getSessionDisplayName(target)} REPL session (${sessionName}). Inspect it with /repl status ${target}.`);
+		if (target === "octave" || target === "matlab" || target === "gnuplot" || target === "cpp") throw new Error(`Could not inspect the default ${getSessionDisplayName(target)} REPL session (${sessionName}). Inspect it with /repl status ${target}.`);
 		if (target === "julia") {
 			throw new Error(
 				`Could not inspect the default Julia REPL session (${DEFAULT_JULIA_SESSION}). Start it again with /repl julia.`,
@@ -1748,6 +1823,8 @@ async function runReplCode(
 	const sessionTarget = sessionInfo.tmuxSessionId || sessionName;
 	const paneTarget = await getPaneTarget(pi, sessionTarget, ctx.cwd);
 	const beforeCapture = await capturePaneOutput(pi, paneTarget, ctx.cwd);
+	const cppPane = runtime === "cpp" ? await inspectCppPane(pi, paneTarget, ctx.cwd) : undefined;
+	if (runtime === "cpp" && (!cppPane || cppPane.dead)) throw new Error("The C++ pane is ended or cannot be inspected; no code was sent and no replacement was started.");
 	const echoMode = resolveReplSubmissionEchoMode(params.echoMode);
 	const prepared = prepareReplControlFiles(runtime, code, {
 		submissionId: options.submissionId || `pi-repl:local:${randomUUID()}`,
@@ -1764,6 +1841,7 @@ async function runReplCode(
 		beforeCapture,
 		prepared,
 		completionObserved: false,
+		cppPane,
 	};
 
 	let submissionStarted = false;
@@ -1781,15 +1859,14 @@ async function runReplCode(
 			prepared.controlPaths.doneFile,
 			timeoutMs,
 			signal,
-			{ beforeCapture, prepared },
+			{ beforeCapture, prepared, state: submissionState },
 		);
 		submissionState.completionObserved = true;
 		const afterCapture = await capturePaneOutput(pi, paneTarget, ctx.cwd);
+		const cppResult = prepared.cppCompletion ? readCppCompletion(prepared.cppCompletion) : undefined;
 		const delta = extractPaneDelta(beforeCapture, afterCapture);
 		const output = cleanupReplDelta(delta, prepared.submissionLine, prepared.previewComment, prepared.completionLine, prepared.display);
-		cleanupPrivateReplControlFiles(prepared.controlPaths);
-		cleanupPrivateReplControlFiles(prepared.guardPaths);
-		cleanupPrivateReplControlFiles(prepared.driverPaths);
+		cleanupPreparedReplControlFiles(prepared);
 
 		return {
 			output,
@@ -1799,17 +1876,16 @@ async function runReplCode(
 				target,
 				timeoutMs,
 				submittedCode: code,
+				cppResult,
 				echoMode,
 				submissionAnchorId: prepared.display.enabled ? prepared.display.anchorId : undefined,
 				previewComment: prepared.previewComment,
 			},
 		};
 	} catch (error) {
-		if (existsSync(prepared.controlPaths.doneFile)) submissionState.completionObserved = true;
-		if (!submissionStarted || submissionState.completionObserved) {
-			cleanupPrivateReplControlFiles(prepared.controlPaths);
-			cleanupPrivateReplControlFiles(prepared.guardPaths);
-			cleanupPrivateReplControlFiles(prepared.driverPaths);
+		if (submissionComplete(prepared)) submissionState.completionObserved = true;
+		if (!submissionStarted || submissionState.completionObserved || submissionState.runtimeEnded) {
+			cleanupPreparedReplControlFiles(prepared);
 		} else if (!options.onSubmissionStarted) {
 			retainReplSubmissionUntilSettled(pi, submissionState, null);
 		}
@@ -1835,9 +1911,10 @@ function retainReplSubmissionUntilSettled(
 	void (async () => {
 		let missingChecks = 0;
 		try {
-			while (!existsSync(state.prepared.controlPaths.doneFile)) {
-				if (!existsSync(state.prepared.controlPaths.sourceFile)) return;
+			while (!submissionComplete(state.prepared)) {
+				if (!state.prepared.cppCompletion && !existsSync(state.prepared.controlPaths.sourceFile)) return;
 				try {
+					if (await cppPaneEnded(pi, state)) { state.runtimeEnded = true; return; }
 					const current = await readSessionInfo(pi, state.sessionName, state.cwd);
 					if (
 						current
@@ -1857,9 +1934,7 @@ function retainReplSubmissionUntilSettled(
 				await sleepWithoutKeepingProcessAlive(REPL_SEND_POLL_MS);
 			}
 		} finally {
-			cleanupPrivateReplControlFiles(state.prepared.controlPaths);
-			cleanupPrivateReplControlFiles(state.prepared.guardPaths);
-			cleanupPrivateReplControlFiles(state.prepared.driverPaths);
+			cleanupPreparedReplControlFiles(state.prepared);
 			await lease?.release().catch(() => undefined);
 		}
 	})();
@@ -1971,13 +2046,12 @@ async function runRecordedReplCode(
 		if (
 			submissionState
 			&& !submissionState.completionObserved
-			&& !existsSync(submissionState.prepared.controlPaths.doneFile)
+			&& !submissionState.runtimeEnded
+			&& !submissionComplete(submissionState.prepared)
 		) {
 			retainReplSubmissionUntilSettled(pi, submissionState, lease);
 		} else {
-			cleanupPrivateReplControlFiles(submissionState?.prepared.controlPaths);
-			cleanupPrivateReplControlFiles(submissionState?.prepared.guardPaths);
-			cleanupPrivateReplControlFiles(submissionState?.prepared.driverPaths);
+			cleanupPreparedReplControlFiles(submissionState?.prepared);
 			await lease.release().catch(() => undefined);
 		}
 	}
@@ -2169,7 +2243,7 @@ async function startReplCommand(pi: ExtensionAPI, ctx: ExtensionCommandContext, 
 }
 
 function formatNoSessionRunning(selector: SessionSelector): string {
-	if (selector === "octave" || selector === "matlab" || selector === "gnuplot") return `No default ${getSessionDisplayName(selector)} REPL session is running (${getSessionNameForSelector(selector)}).\nStart one with /repl ${selector} or /lab ${selector}.`;
+	if (selector === "octave" || selector === "matlab" || selector === "gnuplot" || selector === "cpp") return `No default ${getSessionDisplayName(selector)} REPL session is running (${getSessionNameForSelector(selector)}).\nStart one with /repl ${selector} or /lab ${selector}.`;
 	if (selector === "julia") {
 		return [
 			`No default Julia REPL session is running (${DEFAULT_JULIA_SESSION}).`,
@@ -2228,7 +2302,7 @@ function buildReplStatusDetails(
 	const clojure = sessions.find((session) => session.selector === "clojure")?.info;
 	const ruby = sessions.find((session) => session.selector === "ruby")?.info;
 	const java = sessions.find((session) => session.selector === "java")?.info;
-	const additionalRuntimeDetails = Object.fromEntries((["octave", "matlab", "gnuplot"] as const).map((selector) => {
+	const additionalRuntimeDetails = Object.fromEntries((["octave", "matlab", "gnuplot", "cpp"] as const).map((selector) => {
 		const info = sessions.find((session) => session.selector === selector)?.info;
 		return [selector, {
 			running: Boolean(info), sessionName: info?.sessionName ?? getSessionNameForSelector(selector),
@@ -2433,6 +2507,7 @@ async function stopReplSession(
 					"/repl stop octave",
 					"/repl stop matlab",
 					"/repl stop gnuplot",
+					"/repl stop cpp",
 				].join("\n"),
 				"warning",
 			);
@@ -2526,7 +2601,7 @@ async function exportReplRecord(
 				ctx,
 				[
 					"Multiple shared REPL sessions are running.",
-					"Choose one with /repl export python, julia, r, ghci, clojure, ruby, java, octave, matlab, or gnuplot.",
+					"Choose one with /repl export python, julia, r, ghci, clojure, ruby, java, octave, matlab, gnuplot, or cpp.",
 				].join("\n"),
 				"warning",
 			);
@@ -2704,7 +2779,7 @@ async function handleRepl(pi: ExtensionAPI, args: string, ctx: ExtensionCommandC
 				return;
 			}
 
-			if (parsed.runtime === "octave" || parsed.runtime === "matlab" || parsed.runtime === "gnuplot") {
+			if (parsed.runtime === "octave" || parsed.runtime === "matlab" || parsed.runtime === "gnuplot" || parsed.runtime === "cpp") {
 				if (parsed.name) {
 					notify(ctx, `Named ${getSessionDisplayName(parsed.runtime)} sessions are not implemented yet. For now, use /repl ${parsed.runtime} with no --name.`, "warning");
 					return;
@@ -2721,7 +2796,7 @@ async function handleRepl(pi: ExtensionAPI, args: string, ctx: ExtensionCommandC
 					"Scaffold only: parsed REPL start request.",
 					`Runtime: ${parsed.runtime}`,
 					`tmux session: ${sessionName}${nameNote}`,
-					"Only Python, IPython, Julia, R, GHCi, Clojure, Ruby, Java, Octave, MATLAB, and gnuplot session management are implemented so far.",
+					"Only Python, IPython, Julia, R, GHCi, Clojure, Ruby, Java, Octave, MATLAB, gnuplot, and C++ session management are implemented so far.",
 				].join("\n"),
 				"info",
 			);
@@ -2772,11 +2847,11 @@ export default function (pi: ExtensionAPI) {
 	pi.registerTool({
 		name: "repl_status",
 		label: "REPL Status",
-		description: "Inspect shared REPL session state for Python/IPython, Julia, R, Haskell (GHCi), Clojure, Ruby, Java, Octave, MATLAB, and gnuplot.",
-		promptSnippet: "Check whether the shared Python/IPython, Julia, R, Haskell (GHCi), Clojure, Ruby, Java, Octave, MATLAB, and gnuplot REPL sessions are running.",
+		description: "Inspect shared REPL session state for Python/IPython, Julia, R, Haskell (GHCi), Clojure, Ruby, Java, Octave, MATLAB, gnuplot, and C++.",
+		promptSnippet: "Check whether the shared Python/IPython, Julia, R, Haskell (GHCi), Clojure, Ruby, Java, Octave, MATLAB, gnuplot, and C++ REPL sessions are running.",
 		promptGuidelines: [
 			"Use repl_status before claiming whether a shared REPL is running, especially after a previous failure or status change.",
-			"For Octave use repl_status target='octave'; for MATLAB use target='matlab'; for gnuplot use target='gnuplot'. They use separate shared sessions.",
+			"For Octave use repl_status target='octave'; for MATLAB use target='matlab'; for gnuplot use target='gnuplot'; for C++ use target='cpp'. They use separate shared sessions.",
 			"If the user asks specifically about Julia, use target='julia'. If they ask specifically about R, use target='r'. If they ask specifically about GHCi or Haskell, use target='ghci'. If they ask specifically about Clojure, use target='clojure'. If they ask specifically about Ruby or IRB, use target='ruby'. If they ask specifically about Java or jshell, use target='java'. If they ask specifically about Python or IPython, use target='python'.",
 			"If you need context about prior direct REPL interaction, inspect repl_status details and read the session history file listed there.",
 		],
@@ -2791,7 +2866,7 @@ export default function (pi: ExtensionAPI) {
 				else if (targetRaw === "clojure" || targetRaw === "clj") target = "clojure";
 				else if (targetRaw === "ruby" || targetRaw === "irb") target = "ruby";
 				else if (targetRaw === "java" || targetRaw === "jshell") target = "java";
-				else if (targetRaw === "octave" || targetRaw === "matlab" || targetRaw === "gnuplot") target = targetRaw;
+				else if (targetRaw === "octave" || targetRaw === "matlab" || targetRaw === "gnuplot" || targetRaw === "cpp") target = targetRaw;
 				else if (targetRaw === "python" || targetRaw === "ipython") target = "python";
 				else throw new Error(`Unknown repl_status target: ${targetRaw}`);
 			}
@@ -2850,11 +2925,11 @@ export default function (pi: ExtensionAPI) {
 	pi.registerTool({
 		name: "repl_send",
 		label: "REPL Send",
-		description: `Execute code in the shared default Python/IPython, Julia, R, Haskell (GHCi), Clojure, Ruby, Java, Octave, MATLAB, or gnuplot tmux REPL sessions (${DEFAULT_PYTHON_SESSION}, ${DEFAULT_JULIA_SESSION}, ${DEFAULT_R_SESSION}, ${DEFAULT_GHCI_SESSION}, ${DEFAULT_CLOJURE_SESSION}, ${DEFAULT_RUBY_SESSION}, ${DEFAULT_JAVA_SESSION}, ${DEFAULT_OCTAVE_SESSION}, ${DEFAULT_MATLAB_SESSION}, ${DEFAULT_GNUPLOT_SESSION}). The complete response (submitted code and output) is truncated to ${DEFAULT_MAX_LINES} lines or ${formatSize(DEFAULT_MAX_BYTES)} (whichever is hit first); the full response is saved privately when truncated.`,
-		promptSnippet: "Execute a small snippet in the shared Python/IPython, Julia, R, Haskell (GHCi), Clojure, Ruby, Java, Octave, MATLAB, or gnuplot REPL and return its output.",
+		description: `Execute code in the shared default Python/IPython, Julia, R, Haskell (GHCi), Clojure, Ruby, Java, Octave, MATLAB, gnuplot, or C++ tmux REPL sessions (${DEFAULT_PYTHON_SESSION}, ${DEFAULT_JULIA_SESSION}, ${DEFAULT_R_SESSION}, ${DEFAULT_GHCI_SESSION}, ${DEFAULT_CLOJURE_SESSION}, ${DEFAULT_RUBY_SESSION}, ${DEFAULT_JAVA_SESSION}, ${DEFAULT_OCTAVE_SESSION}, ${DEFAULT_MATLAB_SESSION}, ${DEFAULT_GNUPLOT_SESSION}, ${DEFAULT_CPP_SESSION}). The complete response (submitted code and output) is truncated to ${DEFAULT_MAX_LINES} lines or ${formatSize(DEFAULT_MAX_BYTES)} (whichever is hit first); the full response is saved privately when truncated.`,
+		promptSnippet: "Execute a small snippet in the shared Python/IPython, Julia, R, Haskell (GHCi), Clojure, Ruby, Java, Octave, MATLAB, gnuplot, or C++ REPL and return its output.",
 		promptGuidelines: [
 			"Use repl_send only after the relevant session has been started with repl_start, /repl, or /lab and is at a normal prompt. repl_send never auto-starts a missing session.",
-			"If the user asks to run code in Julia or in the shared Julia REPL, use target='julia'. If they ask to run code in R or in the shared R REPL, use target='r'. If they ask to run code in GHCi, Haskell, or the shared Haskell REPL, use target='ghci'. If they ask to run code in Clojure or in the shared Clojure REPL, use target='clojure'. If they ask to run code in Ruby or IRB or the shared Ruby REPL, use target='ruby'. If they ask to run code in Java or jshell or the shared Java REPL, use target='java'. For Octave use target='octave', for MATLAB use target='matlab', and for gnuplot use target='gnuplot'. Otherwise use the shared Python/IPython session.",
+			"If the user asks to run code in Julia or in the shared Julia REPL, use target='julia'. If they ask to run code in R or in the shared R REPL, use target='r'. If they ask to run code in GHCi, Haskell, or the shared Haskell REPL, use target='ghci'. If they ask to run code in Clojure or in the shared Clojure REPL, use target='clojure'. If they ask to run code in Ruby or IRB or the shared Ruby REPL, use target='ruby'. If they ask to run code in Java or jshell or the shared Java REPL, use target='java'. For Octave use target='octave', for MATLAB use target='matlab', for gnuplot use target='gnuplot', and for C++ use target='cpp'. Otherwise use the shared Python/IPython session.",
 			"Use repl_status before claiming whether the shared REPL is active if there has been a prior failure or a possible state change.",
 			"If you need context about prior direct REPL interaction, inspect repl_status details and read the session history file listed there.",
 			"The session history file is raw tmux pane output, so expect prompts and echoed input as well as results.",
@@ -2866,6 +2941,7 @@ export default function (pi: ExtensionAPI) {
 			"In Ruby, definitions persist in the active IRB workspace and are shared with direct terminal input. Use normal Ruby source, including string interpolation.",
 			"In Java, use top-level JShell snippets: imports, variables, methods, classes, expressions, or statements. Use System.out.println(...) for visible values; /open does not echo expression results. Submit complete snippets; native /open may discard an unfinished fragment. JShell commands such as /reset and /exit change or end the live session.",
 			"For Octave use repl_send target='octave'; for MATLAB use target='matlab'. They are separate runtimes: do not silently substitute one for the other. Send complete code; use disp or fprintf for explicit output. Code executes in the base workspace, with native semicolon and ans behaviour. MATLAB function definitions belong in .m files; run scripts or call functions from the current path. clear, clear all, exit and quit are deliberate state-changing actions. This does not control an existing MATLAB desktop session.",
+			"For C++ use target='cpp': an experimental Cling-based C++ REPL. Submit complete native prompt groups (put a function's opening brace on its declaration line); include ordinary definition/header files separately. Dot commands are terminal-only; use /repl stop cpp to stop. Earlier groups may run before a later error. Compiler/link diagnostics and caught C++ exceptions are retained; there is no replay. Exit, crashes and busy Ctrl-C can end the workspace. Completion means the evaluator returned, not that library calls succeeded. Do not queue control commands behind stdin reads or restart after timeout. Cling with matching development headers must already be on your login-shell PATH; no automatic installation or alternate-runtime fallback.",
 			"For gnuplot use repl_send target='gnuplot'. This is its own persistent runtime, not another REPL's plotting backend. Send complete native scripts; use print for console results. Preserve the user's terminal, output, print destination and settings; export figures only when requested. reset and reset session deliberately change state. In a loaded script, exit/quit returns from that script; exit gnuplot ends the process. Avoid pause/input waits unless explicitly wanted.",
 			"Avoid blocking interactive input() prompts or long-running code unless the user explicitly wants that.",
 		],

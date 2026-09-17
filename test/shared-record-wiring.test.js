@@ -30,7 +30,8 @@ test("repl_send holds the shared lease across execution and records its result",
 test("repl_send uses compact private request-unique control files and cleans them after settlement", () => {
 	assert.match(source, /createPrivateReplControlFiles\(\{/);
 	assert.match(source, /getReplControlExtension\(runtime\)/);
-	assert.match(source, /cleanupPrivateReplControlFiles\(state\.prepared\.controlPaths\)/);
+	assert.match(source, /cleanupPreparedReplControlFiles\(state\.prepared\)/);
+	assert.match(source, /cleanupPrivateReplControlFiles\(prepared\?\.controlPaths\)/);
 	assert.match(source, /retainReplSubmissionUntilSettled\(pi, submissionState, lease\)/);
 	assert.doesNotMatch(source, /sourceFile: join\(REPL_CONTROL_ROOT, "pr\.py"\)/);
 });

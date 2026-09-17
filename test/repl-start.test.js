@@ -20,7 +20,7 @@ const runtimes = [
 	["julia", "julia", "julia>"], ["r", "R", ">"], ["ghci", "ghci", "ghci>"],
 	["clojure", "clojure", "user=>"], ["ruby", "irb", "irb(main):001:0>"], ["java", "jshell", "jshell>"],
 	["octave", "octave-cli --quiet --interactive", "octave:1>"], ["matlab", "matlab -nodesktop -nosplash", ">>"],
-	["gnuplot", "gnuplot", "gnuplot>"],
+	["gnuplot", "gnuplot", "gnuplot>"], ["cpp", "cling", "[cling]$"],
 ];
 
 function fixture({ runtime = "python", exists = false, prompt = ">>>", ...options } = {}) {
@@ -52,6 +52,7 @@ function fixture({ runtime = "python", exists = false, prompt = ">>>", ...option
 			}
 			if (args[0] === "list-panes") return state.exists ? ok("1\t1\t%9") : fail();
 			if (args[0] === "display-message") {
+				if (args.at(-1) === "#{pane_id}|#{pane_pid}|#{pane_dead}") return ok(`%9|123|${state.dead ? 1 : 0}`);
 				if (args.at(-1) === "#{cursor_y}") return ok("3");
 				return ok(`${sessionName}\t${state.id}\t${state.createdAt}\t${runtime}\t${root}`);
 			}
@@ -75,6 +76,12 @@ function fixture({ runtime = "python", exists = false, prompt = ">>>", ...option
 		command: (args, name = "repl") => commands.get(name).handler(args, ctx),
 	};
 }
+
+test('cpp startup refuses a retained dead pane even when its cursor still looks like a prompt', async () => {
+	const f = fixture({ runtime: 'cpp', exists: true, prompt: '[cling]$', dead: true });
+	await assert.rejects(f.start(), /session ended native execution/);
+	assert.ok(f.calls.every((call) => !['new-session', 'send-keys', 'paste-buffer', 'respawn-pane'].includes(call.args[0])));
+});
 
 for (const [runtime, executable, prompt] of runtimes) {
 	test(`repl_start creates ${runtime} and commands reuse the same session without mutations`, async () => {
@@ -193,7 +200,7 @@ test("startup waits through a process/banner/continuation until a normal cursor-
 	assert.equal(f.calls.filter((call) => call.args[0] === "capture-pane" && call.args.includes("-E")).length, 3);
 });
 
-for (const [runtime, prompt] of [["python", ""], ["ruby", "irb(main):001:1>"], ["ruby", "irb(main):001:0*"], ["ghci", "ghci|"], ["java", "   ...>"], ["r", "+"], ["julia", "custom-prompt:"], ["octave", ">"], ["matlab", "K>>"], ["matlab", ">> unfinished"], ["gnuplot", "more>"], ["gnuplot", "gnuplot> unfinished"]]) {
+for (const [runtime, prompt] of [["python", ""], ["ruby", "irb(main):001:1>"], ["ruby", "irb(main):001:0*"], ["ghci", "ghci|"], ["java", "   ...>"], ["r", "+"], ["julia", "custom-prompt:"], ["octave", ">"], ["matlab", "K>>"], ["matlab", ">> unfinished"], ["gnuplot", "more>"], ["gnuplot", "gnuplot> unfinished"], ["cpp", "[cling]$ unfinished"], ["cpp", "[cling]$?"]]) {
 	test(`${runtime} unconfirmed prompt ${JSON.stringify(prompt)} times out without sending input or stopping`, async () => {
 		const f = fixture({ runtime, prompt, exists: true, tail: runtimes.find(([name]) => name === runtime)[2] });
 		const result = await f.start({ runtime, timeoutMs: 1000 });
