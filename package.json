@@ -1,6 +1,6 @@
 {
   "name": "pi-repl",
-  "version": "0.7.0",
+  "version": "0.8.0",
   "description": "Collaborative tmux-backed REPL sessions for pi",
   "type": "module",
   "license": "MIT",
@@ -30,7 +30,9 @@
     "jshell",
     "octave",
     "matlab",
-    "gnuplot"
+    "gnuplot",
+    "cpp",
+    "cling"
   ],
   "files": [
     "index.ts",
