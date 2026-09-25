@@ -22,6 +22,8 @@ test("repl_send holds the shared lease across execution and records its result",
 	assert.match(source, /runReplCode\(pi, params, ctx, signal, \{[\s\S]*?expectedSession: identity,[\s\S]*?onSubmissionStarted:/);
 	assert.match(source, /pasteTextToTmuxPane\(pi, paneTarget/);
 	assert.match(source, /status: "captured"/);
+	assert.match(source, /label: getToolSubmissionLabel\(\)/);
+	assert.match(source, /process\.env\.PI_REPL_AGENT_LABEL\?\.trim\(\) \|\| "Pi"/);
 	assert.match(source, /retainReplSubmissionUntilSettled/);
 	assert.match(source, /!submissionState\.completionObserved/);
 	assert.match(source, /await lease\.release\(\)\.catch/);

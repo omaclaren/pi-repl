@@ -310,6 +310,12 @@ function resolveReplSubmissionEchoMode(value?: string): ReplSubmissionEchoMode {
 	return normalizeReplSubmissionEchoMode(value, replSubmissionEchoMode) as ReplSubmissionEchoMode;
 }
 
+// Clean-record label for repl_send submissions. A host running these tools
+// outside Pi can name its agent; read on each send so it can be set after startup.
+function getToolSubmissionLabel(): string {
+	return process.env.PI_REPL_AGENT_LABEL?.trim() || "Pi";
+}
+
 const REPL_START_RUNTIMES = ["python", "ipython", "julia", "r", "ghci", "clojure", "ruby", "java", "octave", "matlab", "gnuplot", "cpp"] as const;
 const REPL_START_PARAMS = Type.Object({
 	runtime: StringEnum(REPL_START_RUNTIMES, {
@@ -2104,7 +2110,7 @@ async function executeReplSend(
 ): Promise<{ content: Array<{ type: "text"; text: string }>; details: ReplSendDetails }> {
 	const execution = await runRecordedReplCode(pi, params, ctx, signal, {
 		requestId: `tool:${toolCallId}`,
-		label: "Pi",
+		label: getToolSubmissionLabel(),
 		mode: "agent",
 	});
 	const formatted = formatReplSendResult(execution.output, execution.details);

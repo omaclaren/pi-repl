@@ -403,6 +403,7 @@ Example requests once the REPL is running:
 - Newly started sessions use unique mode-`0600` raw logs in the current-user-owned mode-`0700` directory `<os temporary directory>/pi-repl-history-<uid>/`. Restarting a session or using another tmux server does not truncate a previous log. Symlinked, foreign-owned, or permissive history roots are refused.
 - Existing sessions and legacy `/tmp/pi-repl/*.history.log` files are left untouched. The new storage applies when you next start a REPL session; restarting a REPL discards its in-memory variables, so do this only when finished with that session. Logs are not automatically deleted.
 - `/repl env` is currently implemented for Python/IPython only.
+- `repl_send` submissions are labelled `Pi` in the clean record and its exports. A host that runs these tools outside Pi can set `PI_REPL_AGENT_LABEL` to name its agent instead.
 
 ## Development and local checks
 

@@ -527,6 +527,25 @@ test("loader-looking output survives capture, clean records and export", { timeo
 	await assertVerifiedStop(f);
 });
 
+test("tool submissions are recorded as Pi unless PI_REPL_AGENT_LABEL names the agent", { timeout: 30000 }, async (t) => {
+	const f = await fixture(t);
+	if (!f) return;
+	const original = process.env.PI_REPL_AGENT_LABEL;
+	t.after(() => {
+		if (original === undefined) delete process.env.PI_REPL_AGENT_LABEL;
+		else process.env.PI_REPL_AGENT_LABEL = original;
+	});
+	const labels = [];
+	for (const value of [undefined, "  Claude Code\n", "   "]) {
+		if (value === undefined) delete process.env.PI_REPL_AGENT_LABEL;
+		else process.env.PI_REPL_AGENT_LABEL = value;
+		await f.send("print(1)");
+		labels.push(readReplSessionRecord((await f.status()).details.python.recordId).entries.at(-1).label);
+	}
+	assert.deepEqual(labels, ["Pi", "Claude Code", "Pi"]);
+	await assertVerifiedStop(f);
+});
+
 for (const runtime of ["python", "gnuplot"]) {
 	test(`${runtime} Summary shows 20 source lines without truncating execution or clean records`, {
 		timeout: 30000,
