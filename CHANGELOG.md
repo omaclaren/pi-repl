@@ -4,6 +4,11 @@ All notable changes to `pi-repl` are documented here.
 
 ## [Unreleased]
 
+## [0.8.1] — 2026-09-25
+
+### Added
+- Read the clean-record label for `repl_send` submissions from `PI_REPL_AGENT_LABEL` on each send, so a host running these tools outside Pi can record which agent sent them. Blank or unset values keep the `Pi` label; record and display formats are unchanged.
+
 ## [0.8.0] — 2026-09-17
 
 ### Added
