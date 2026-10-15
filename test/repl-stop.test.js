@@ -10,7 +10,7 @@ const paneRow = (p) => [p.serverPid, p.sessionId, p.sessionName, p.createdAt, p.
 
 function fixture(options = {}) {
 	const protectedPane = pane({ sessionId: "$2", sessionName: "unrelated", paneId: "%2", pid: 2001, tty: "/dev/ttys200", windowId: "@2" });
-	const sessionName = options.gnuplot ? "pi-repl-gnuplot" : "pi-repl-python";
+	const sessionName = options.sessionName ?? (options.gnuplot ? "pi-repl-gnuplot" : "pi-repl-python");
 	const owner = "c".repeat(32);
 	const state = {
 		markers: new Map(),
@@ -39,6 +39,7 @@ function fixture(options = {}) {
 		state,
 		stop: () => stopVerifiedReplSession({
 			tmux, sessionName, currentPid: 9999, uid: 501, graceMs: 0, termMs: 0, killMs: 10,
+			...(options.sessionNamePattern ? { sessionNamePattern: options.sessionNamePattern } : {}),
 			snapshotSockets: async () => [],
 			findMarked: async (table, marker) => {
 				state.onMarked?.(++state.markerReads || (state.markerReads = 1));
@@ -225,3 +226,19 @@ for (const marker of [undefined, "bad", qtOwner + "\n"]) {
 		assert.ok(!f.state.signals.some((s) => s.pid === 3001));
 	});
 }
+
+test("a host can name its own sessions; the default still accepts only pi-repl's", async () => {
+	const studio = /^pi-studio-repl-python$/;
+	await assert.rejects(fixture({ sessionName: "pi-studio-repl-python" }).stop(), /requires a supported local Unix session/);
+	const f = fixture({ sessionName: "pi-studio-repl-python", sessionNamePattern: studio });
+	f.state.afterStop = () => { f.state.table = f.state.table.filter((p) => ![1001, 1002].includes(p.pid)); };
+	assert.equal((await f.stop()).processCount, 2);
+	const other = fixture({ sessionNamePattern: studio });
+	await assert.rejects(other.stop(), /requires a supported local Unix session/, "the host's pattern replaces the default");
+	assert.deepEqual(other.state.calls, []);
+	for (const pattern of [/^pi-studio-repl-python$/g, /^pi-studio-repl-python$/y, "pi-studio-repl-python"]) {
+		const bad = fixture({ sessionName: "pi-studio-repl-python", sessionNamePattern: pattern });
+		await assert.rejects(bad.stop(), /plain session-name pattern/);
+		assert.deepEqual(bad.state.calls, []);
+	}
+});

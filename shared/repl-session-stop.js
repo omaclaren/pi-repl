@@ -152,9 +152,16 @@ export class SessionStopProcesses {
 	}
 }
 
-/** Explicit stop only. Never used by send, startup, reload, or shutdown hooks. */
-export async function stopVerifiedReplSession({ tmux, sessionName, snapshot = readStopProcessTable, signal = (pid, value) => process.kill(pid, value), currentPid = process.pid, uid = process.getuid?.(), graceMs = 500, termMs = 1000, killMs = 2000, findMarked = findOwnedGnuplotProcesses, snapshotSockets = snapshotGnuplotSockets, cleanupSockets = cleanupGnuplotSockets }) {
-	if (typeof uid !== "number" || !/^pi-repl-(python|julia|r|ghci|clojure|ruby|java|octave|matlab|gnuplot|cpp)$/.test(sessionName)) throw new Error("Verified REPL shutdown requires a supported local Unix session.");
+export const PI_REPL_STOP_SESSION_NAME = /^pi-repl-(python|julia|r|ghci|clojure|ruby|java|octave|matlab|gnuplot|cpp)$/;
+
+/**
+ * Explicit stop only. Never used by send, startup, reload, or shutdown hooks.
+ * sessionNamePattern names the sessions this host owns; pi-studio passes its own.
+ */
+export async function stopVerifiedReplSession({ tmux, sessionName, sessionNamePattern = PI_REPL_STOP_SESSION_NAME, snapshot = readStopProcessTable, signal = (pid, value) => process.kill(pid, value), currentPid = process.pid, uid = process.getuid?.(), graceMs = 500, termMs = 1000, killMs = 2000, findMarked = findOwnedGnuplotProcesses, snapshotSockets = snapshotGnuplotSockets, cleanupSockets = cleanupGnuplotSockets }) {
+	// A global or sticky pattern keeps state between tests; refuse it rather than misjudge a name.
+	if (!(sessionNamePattern instanceof RegExp) || sessionNamePattern.global || sessionNamePattern.sticky) throw new Error("Verified REPL shutdown needs a plain session-name pattern.");
+	if (typeof uid !== "number" || typeof sessionName !== "string" || !sessionNamePattern.test(sessionName)) throw new Error("Verified REPL shutdown requires a supported local Unix session.");
 	const panes = await readPanes(tmux);
 	const selected = panes.filter((p) => p.sessionName === sessionName);
 	if (!selected.length) throw new Error("The selected session ended or changed before shutdown; no processes were signalled.");
