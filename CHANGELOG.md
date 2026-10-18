@@ -4,6 +4,9 @@ All notable changes to `pi-repl` are documented here.
 
 ## [Unreleased]
 
+### Fixed
+- IPython shows an expression's value once, as `Out[N]: …`. The wrapper used to print it again as a bare `repr`.
+
 ## [0.8.1] — 2026-09-25
 
 ### Added

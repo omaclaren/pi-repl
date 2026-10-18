@@ -885,6 +885,19 @@ for (const runtime of ["octave", "matlab"]) {
 	}
 }
 
+test("ipython shows an expression's value once", {
+	timeout: 60000,
+	skip: !(optionalRuntimes.has("all") || optionalRuntimes.has("ipython")) && "set PI_REPL_TEST_RUNTIMES=all to include installed optional runtimes",
+}, async (t) => {
+	const f = await fixture(t, { index: 1, runtime: "ipython", startWithTool: true });
+	if (!f) return;
+	// run_cell already shows Out[N]:; the wrapper used to print the value again as a bare repr.
+	const output = (await f.send("1 + 1")).content[0].text.split("Output:\n")[1];
+	assert.match(output, /^Out\[\d+\]: 2(\n|$)/);
+	assert.doesNotMatch(output, /(^|\n)2(\n|$)/);
+	await assertVerifiedStop(f);
+});
+
 const runtimeCases = [
 	["python", "pi_test_x = 41\nprint(pi_test_x + 1)", "raise ValueError('runtime-test-error')"],
 	["ipython", "pi_test_x = 41\nprint(pi_test_x + 1)", "raise ValueError('runtime-test-error')"],
