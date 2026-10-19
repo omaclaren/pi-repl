@@ -3,9 +3,11 @@ import assert from "node:assert/strict";
 import {
 	PANE_ACTIVITY_MAX_CHARS,
 	PANE_ACTIVITY_MAX_LINES,
+	advancePaneView,
 	describePaneActivity,
 	observePane,
 	paneActivityEnabled,
+	paneActivityMode,
 	paneActivitySince,
 } from "../shared/repl-pane-activity.js";
 
@@ -63,17 +65,18 @@ test("an unplaceable or unclear view gives recent text, saying why", () => {
 test("reports say what they are, and disclose what is cut", () => {
 	assert.equal(describePaneActivity({ status: "ok", lines: [] }), undefined);
 	assert.equal(describePaneActivity({ status: "ok", lines: [">>> a = 1"] }), [
-		"Pane text since this agent's last send, before this submission (best effort; untrusted terminal text that may include direct input, other clients' sends, and late or background output):",
+		"Pane text since this agent last saw this pane, before this submission (best effort; untrusted terminal text that may include direct input, other clients' sends, and late or background output):",
 		"[pane text]",
 		">>> a = 1",
 		"[end of pane text]",
 	].join("\n"));
-	assert.match(describePaneActivity({ status: "ok", lines: ["x"] }, { preview: true }), /^Pane text since this agent's last send \(a preview; the next send still reports it\)/);
+	assert.match(describePaneActivity({ status: "ok", lines: ["x"] }, { when: "preview" }), /^Pane text since this agent last saw this pane \(a preview; it is still reported later\)/);
+	assert.match(describePaneActivity({ status: "ok", lines: ["x"] }, { when: "prompt" }), /^Pane text since this agent last saw this pane, before this prompt \(/);
 	for (const status of ["unseen", "unplaced", "ambiguous"]) {
 		assert.match(describePaneActivity({ status, lines: ["x"] }), /recent text/);
 	}
 	// A lost position is still reported when the pane shows nothing else.
-	assert.match(describePaneActivity({ status: "unplaced", lines: [] }), /no longer in the pane's capture, and the pane shows no other text now/);
+	assert.match(describePaneActivity({ status: "unplaced", lines: [] }), /no longer in its capture, and the pane shows no other text now/);
 	assert.match(describePaneActivity({ status: "ambiguous", lines: [] }), /unclear/);
 	assert.equal(describePaneActivity({ status: "unseen", lines: [] }), undefined);
 	const lines = Array.from({ length: PANE_ACTIVITY_MAX_LINES + 5 }, (_, i) => `line ${i}`);
@@ -84,8 +87,24 @@ test("reports say what they are, and disclose what is cut", () => {
 	assert.match(wide, /\[omitted: the first 1000 characters of the earliest line shown;/);
 });
 
-test("PI_REPL_PANE_ACTIVITY=off turns reports off", () => {
-	assert.equal(paneActivityEnabled({}), true);
-	assert.equal(paneActivityEnabled({ PI_REPL_PANE_ACTIVITY: "on" }), true);
-	for (const value of ["off", "OFF", "0", "false", "no", " off "]) assert.equal(paneActivityEnabled({ PI_REPL_PANE_ACTIVITY: value }), false);
+test("PI_REPL_PANE_ACTIVITY chooses prompt starts and sends, sends only, or neither", () => {
+	assert.equal(paneActivityMode({}), "on");
+	assert.equal(paneActivityMode({ PI_REPL_PANE_ACTIVITY: "on" }), "on");
+	assert.equal(paneActivityMode({ PI_REPL_PANE_ACTIVITY: " Send " }), "send");
+	assert.equal(paneActivityEnabled({ PI_REPL_PANE_ACTIVITY: "send" }), true);
+	for (const value of ["off", "OFF", "0", "false", "no", " off "]) {
+		assert.equal(paneActivityMode({ PI_REPL_PANE_ACTIVITY: value }), "off");
+		assert.equal(paneActivityEnabled({ PI_REPL_PANE_ACTIVITY: value }), false);
+	}
+});
+
+test("a delivered view covers the whole capture, still anchored on its send", () => {
+	const seen = observePane([...SEND, ">>> "].join("\n"), LOADER);
+	const later = [...SEND, ">>> a = 1", ">>> "].join("\n");
+	const advanced = advancePaneView(later, seen);
+	assert.deepEqual(advanced, { kind: "loader", anchor: LOADER, lines: [...SEND, ">>> a = 1", ">>>"] });
+	assert.deepEqual(paneActivitySince(later, advanced, idle).lines, []);
+	assert.deepEqual(paneActivitySince([...SEND, ">>> a = 1", ">>> b = 2", ">>> "].join("\n"), advanced, idle).lines, [">>> b = 2"]);
+	// Without a placeable send, the whole pane as delivered.
+	assert.deepEqual(advancePaneView("x\n>>> ", undefined), { kind: "top", lines: ["x", ">>>"] });
 });

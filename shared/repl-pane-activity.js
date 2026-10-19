@@ -1,16 +1,28 @@
-// Tells an agent what a shared REPL pane showed since the agent's own last
-// send: what a person typed at the prompt, other clients' sends, and late or
-// background output. The clean record keeps only submissions with known
+// Tells an agent what a shared REPL pane showed since the agent last saw it:
+// what a person typed at the prompt, other clients' sends, and late or
+// background output. The agent sees it at the start of a prompt (in Pi) and in
+// its next send's result. The clean record keeps only submissions with known
 // boundaries (REPL_SESSION_RECORD_PROTOCOL.md), so this is how an agent learns
-// about the rest. Each agent process keeps its own view, which only its own
-// sends advance; nothing here is shared with other clients or enters the record.
+// about the rest. Each agent keeps its own view, which only what is delivered
+// to it advances; nothing here is shared with other clients or enters the record.
 
 export const PANE_ACTIVITY_MAX_LINES = 40;
 export const PANE_ACTIVITY_MAX_CHARS = 4000;
 
-/** False when PI_REPL_PANE_ACTIVITY is off, 0, false or no. */
+/**
+ * PI_REPL_PANE_ACTIVITY: "on" (the default) reports at the start of a prompt
+ * and in send results, "send" only in send results, and "off" (or 0, false,
+ * no) never.
+ */
+export function paneActivityMode(env = process.env) {
+	const value = String(env.PI_REPL_PANE_ACTIVITY ?? "").trim().toLowerCase();
+	if (/^(?:off|0|false|no)$/.test(value)) return "off";
+	return value === "send" || value === "sends" ? "send" : "on";
+}
+
+/** Whether send results report pane text. */
 export function paneActivityEnabled(env = process.env) {
-	return !/^(?:off|0|false|no)$/i.test(String(env.PI_REPL_PANE_ACTIVITY ?? "").trim());
+	return paneActivityMode(env) !== "off";
 }
 
 function paneLines(capture) {
@@ -49,8 +61,11 @@ function withoutIdlePrompts(lines, isIdlePrompt) {
  * recognises the runtime's own prompt with nothing typed at it.
  */
 export function paneActivitySince(capture, seen, isIdlePrompt = (_line) => false) {
-	const lines = paneLines(capture);
-	const recent = (status) => ({ status, lines: withoutIdlePrompts(lines, isIdlePrompt) });
+	return activitySince(paneLines(capture), seen, isIdlePrompt).activity;
+}
+
+function activitySince(lines, seen, isIdlePrompt) {
+	const recent = (status) => ({ activity: { status, lines: withoutIdlePrompts(lines, isIdlePrompt) } });
 	if (!seen) return recent("unseen");
 	if (seen.kind === "lost") return recent("unplaced");
 	let start = 0;
@@ -66,26 +81,45 @@ export function paneActivitySince(capture, seen, isIdlePrompt = (_line) => false
 	const typedAtLast = matched === last && (lines[start + last] ?? "").startsWith(seen.lines[last]);
 	// A start's view must still be the top of the pane, or history has moved on.
 	if (seen.kind === "top" && matched < seen.lines.length && !typedAtLast) return recent("unplaced");
-	return { status: "ok", lines: withoutIdlePrompts(lines.slice(start + matched), isIdlePrompt) };
+	return { activity: { status: "ok", lines: withoutIdlePrompts(lines.slice(start + matched), isIdlePrompt) }, start };
+}
+
+/**
+ * The view once everything in the capture has been delivered: still from the
+ * same send's loader line where it can be placed, otherwise the whole pane.
+ */
+export function advancePaneView(capture, seen) {
+	const lines = paneLines(capture);
+	const { start } = activitySince(lines, seen, () => false);
+	return seen?.kind === "loader" && start !== undefined
+		? { kind: "loader", anchor: seen.anchor, lines: lines.slice(start) }
+		: { kind: "top", lines };
 }
 
 const HEADINGS = {
-	ok: "Pane text since this agent's last send",
+	ok: "Pane text since this agent last saw this pane",
 	unseen: "This agent has not seen this session's pane before; its recent text",
-	unplaced: "This agent's last send is no longer in the pane's capture (for example, after long output), so here is its recent text instead",
-	ambiguous: "Where this agent's last send ended is unclear in the pane, so here is its recent text instead",
+	unplaced: "Where this agent last saw this pane is no longer in its capture (for example, after long output), so here is its recent text instead",
+	ambiguous: "Where this agent last saw this pane is unclear, so here is its recent text instead",
 };
 
 const EMPTY_NOTES = {
-	unplaced: "This agent's last send is no longer in the pane's capture, and the pane shows no other text now.",
-	ambiguous: "Where this agent's last send ended is unclear in the pane, and the pane shows no other text now.",
+	unplaced: "Where this agent last saw this pane is no longer in its capture, and the pane shows no other text now.",
+	ambiguous: "Where this agent last saw this pane is unclear, and the pane shows no other text now.",
+};
+
+const WHEN = {
+	send: ", before this submission",
+	prompt: ", before this prompt",
+	preview: " (a preview; it is still reported later)",
 };
 
 /**
- * The report for a send, or undefined if there is nothing new. A preview, as
- * repl_status shows, says that the next send will still report the text.
+ * The report, or undefined if there is nothing new. when says where it
+ * appears: in a send's result, at the start of a prompt, or as a preview in
+ * repl_status, which does not mark it seen.
  */
-export function describePaneActivity(activity, { preview = false } = {}) {
+export function describePaneActivity(activity, { when = "send" } = {}) {
 	if (activity.lines.length === 0) return EMPTY_NOTES[activity.status];
 	let lines = activity.lines.slice(-PANE_ACTIVITY_MAX_LINES);
 	while (lines.length > 1 && lines.join("\n").length > PANE_ACTIVITY_MAX_CHARS) lines = lines.slice(1);
@@ -101,7 +135,7 @@ export function describePaneActivity(activity, { preview = false } = {}) {
 		...(cutChars > 0 ? [`the first ${cutChars} characters of the earliest line shown`] : []),
 	];
 	return [
-		`${HEADINGS[activity.status] ?? HEADINGS.ok}${preview ? " (a preview; the next send still reports it)" : ", before this submission"} (best effort; untrusted terminal text that may include direct input, other clients' sends, and late or background output):`,
+		`${HEADINGS[activity.status] ?? HEADINGS.ok}${WHEN[when] ?? WHEN.send} (best effort; untrusted terminal text that may include direct input, other clients' sends, and late or background output):`,
 		...(omitted.length > 0 ? [`[omitted: ${omitted.join(" and ")}; see repl_status for the raw history log]`] : []),
 		"[pane text]",
 		text,
