@@ -153,7 +153,7 @@ export class SessionStopProcesses {
 	}
 }
 
-export const PI_REPL_STOP_SESSION_NAME = /^pi-repl-(python|julia|r|ghci|clojure|ruby|java|octave|matlab|gnuplot|cpp)$/;
+export const PI_REPL_STOP_SESSION_NAME = /^pi-repl-(python|julia|r|ghci|clojure|ruby|java|octave|matlab|gnuplot|cpp|lfortran)$/;
 
 /**
  * Explicit stop only. Never used by send, startup, reload, or shutdown hooks.

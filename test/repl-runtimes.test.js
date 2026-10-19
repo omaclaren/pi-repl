@@ -28,7 +28,7 @@ function fixture() {
 	};
 }
 
-for (const [runtime, alias, executable] of [["ruby", " IRB ", "irb"], ["java", " JShell ", "jshell"], ["octave", " OCTAVE ", "octave-cli --quiet --interactive"], ["matlab", " MATLAB ", "matlab -nodesktop -nosplash"], ["gnuplot", " GNUPLOT ", "gnuplot"], ["cpp", " CPP ", "cling"]]) {
+for (const [runtime, alias, executable] of [["ruby", " IRB ", "irb"], ["java", " JShell ", "jshell"], ["octave", " OCTAVE ", "octave-cli --quiet --interactive"], ["matlab", " MATLAB ", "matlab -nodesktop -nosplash"], ["gnuplot", " GNUPLOT ", "gnuplot"], ["cpp", " CPP ", "cling"], ["lfortran", " FORTRAN ", "lfortran"]]) {
 	test(`${runtime} command and tool routing never fall back to Python`, async () => {
 		const f = fixture();
 		for (const target of [runtime, alias]) {
@@ -48,7 +48,7 @@ for (const [runtime, alias, executable] of [["ruby", " IRB ", "irb"], ["java", "
 		const launch = f.calls.find((call) => call.args[0] === "new-session");
 		assert.ok(launch);
 		assert.ok(launch.args.includes(`pi-repl-${runtime}`));
-		assert.match(launch.args.at(-1), new RegExp(`'${executable}${runtime === "matlab" ? " -sd " : "'$"}`));
+		assert.match(launch.args.at(-1), new RegExp(`'${executable}${runtime === "matlab" ? " -sd " : runtime === "lfortran" ? " --status-file " : "'$"}`));
 		const count = f.calls.length;
 		await f.command(`${runtime} --name example`);
 		assert.match(f.notifications.at(-1).message, /Named .* sessions are not implemented/);
@@ -88,10 +88,10 @@ test("help and schemas advertise Ruby, Java, exports and existing echo controls"
 	const f = fixture();
 	await f.command("");
 	const help = f.notifications.at(-1).message;
-	for (const name of ["ruby", "java", "octave", "matlab", "gnuplot", "cpp"]) {
+	for (const name of ["ruby", "java", "octave", "matlab", "gnuplot", "cpp", "lfortran"]) {
 		assert.match(help, new RegExp(`/repl ${name}`));
 		assert.match(f.tools.get("repl_send").parameters.properties.target.description, new RegExp(name));
 	}
 	assert.match(help, /\/repl echo \[off\|summary\|full\]/);
-	assert.match(help, /\/repl export \[python\|julia\|r\|ghci\|clojure\|ruby\|java\|octave\|matlab\|gnuplot\|cpp\]/);
+	assert.match(help, /\/repl export \[python\|julia\|r\|ghci\|clojure\|ruby\|java\|octave\|matlab\|gnuplot\|cpp\|lfortran\]/);
 });

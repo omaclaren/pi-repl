@@ -4,6 +4,9 @@ All notable changes to `pi-repl` are documented here.
 
 ## [Unreleased]
 
+### Added
+- Add experimental `lfortran`, the native LFortran prompt, for an LFortran with the proposed `--status-file` option ([lfortran/lfortran#15512](https://github.com/lfortran/lfortran/issues/15512)). Each send runs as one `include`d cell and settles on that cell's line in the session's private status file, so compile errors are reported (`lfortranResult`) and terminal `READ`s are never fed completion commands.
+
 ## [0.8.3] — 2026-10-19
 
 ### Fixed

@@ -32,7 +32,9 @@
     "matlab",
     "gnuplot",
     "cpp",
-    "cling"
+    "cling",
+    "fortran",
+    "lfortran"
   ],
   "files": [
     "index.ts",

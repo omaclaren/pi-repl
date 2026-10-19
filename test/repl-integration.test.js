@@ -67,7 +67,7 @@ async function fixture(t, { index = 0, runtime = "python", controlName, startWit
 		python: "-I -q -i", ipython: "--no-banner --no-confirm-exit --simple-prompt --HistoryManager.enabled=False",
 		julia: "--startup-file=no --history-file=no -i", r: "--vanilla --quiet", ghci: "-ignore-dot-ghci -v0", clojure: "",
 		ruby: "-f --noreadline", java: `-J-Duser.home=${quote(home)} -J-Djava.util.prefs.userRoot=${quote(join(home, "java-prefs"))}`,
-		octave: "--no-init-file --no-history --no-line-editing", matlab: "", gnuplot: "-d", cpp: "",
+		octave: "--no-init-file --no-history --no-line-editing", matlab: "", gnuplot: "-d", cpp: "", lfortran: "",
 	}[runtime];
 	const launcher = runtime === "r" ? "R" : runtime === "ruby" ? "irb" : runtime === "java" ? "jshell" : runtime === "octave" ? "octave-cli" : runtime === "cpp" ? "cling" : runtime;
 	// A distinct socket/server and empty config: never target the user's tmux.
@@ -168,7 +168,7 @@ async function fixture(t, { index = 0, runtime = "python", controlName, startWit
 		await repl(runtime);
 	}
 	assert.equal(notifications.some((n) => n.level === "error" || n.level === "warning"), false, JSON.stringify(notifications));
-	const prompt = { python: />>>/, ipython: /In \[\d+\]:/, julia: /julia>/, r: /(^|\n)>/, ghci: /ghci>/, clojure: /user=>/, ruby: /irb\(.*\).*?>/, java: /jshell>/, octave: /octave:\d+>/, matlab: /(^|\n)>>/, gnuplot: /gnuplot>/, cpp: /\[cling\]\$/ }[runtime];
+	const prompt = { python: />>>/, ipython: /In \[\d+\]:/, julia: /julia>/, r: /(^|\n)>/, ghci: /ghci>/, clojure: /user=>/, ruby: /irb\(.*\).*?>/, java: /jshell>/, octave: /octave:\d+>/, matlab: /(^|\n)>>/, gnuplot: /gnuplot>/, cpp: /\[cling\]\$/, lfortran: />>>/ }[runtime];
 	let startupOutput = "";
 	try {
 		await eventually(async () => {
@@ -288,6 +288,70 @@ test("cpp adapter preserves native state, errors, stdin boundaries and verified 
 	await f.repl('export cpp');
 	assert.equal(f.notifications.at(-1).level, 'info');
 	await assertVerifiedStop(f);
+});
+
+async function lfortranStatusLines(f) {
+	const path = await f.tmux("show-options", "-v", "-t", f.sessionName, "@pi_repl_lfortran_status_path");
+	return readFileSync(path, "utf8").split("\n").filter(Boolean).map((line) => JSON.parse(line));
+}
+
+test("lfortran adapter reports each cell's status, waits through READs and stops verified", {
+	timeout: 90000, skip: !(optionalRuntimes.has("all") || optionalRuntimes.has("lfortran")),
+}, async (t) => {
+	const f = await fixture(t, { runtime: "lfortran", startWithTool: true, controlName: "controls space \"quoted\" #{raise}" });
+	if (!f) return;
+	const output = (result) => result.content[0].text.split("Output:\n")[1];
+	let result = await f.send("integer :: seed = 41\nprint *, 'SEED=', seed", { echoMode: "summary" });
+	assert.deepEqual(result.details.lfortranResult, { cell: 1, status: "ok" }, result.content[0].text);
+	assert.equal(result.details.echoMode, "off");
+	assert.equal(output(result), "SEED= 41");
+	// A cell typed at the terminal is numbered and reported like any other.
+	await f.tmux("send-keys", "-t", `${f.sessionName}:^`, "-l", "seed = seed + 1");
+	await f.tmux("send-keys", "-t", `${f.sessionName}:^`, "C-m");
+	await eventually(async () => (await lfortranStatusLines(f)).length === 2);
+	result = await f.send("print *, 'DIRECT=', seed");
+	assert.deepEqual(result.details.lfortranResult, { cell: 3, status: "ok" });
+	assert.equal(output(result), "DIRECT= 42");
+	// A cell that does not compile is reported, with its diagnostic.
+	result = await f.send("integer :: broken =");
+	assert.deepEqual(result.details.lfortranResult, { cell: 4, status: "error" });
+	assert.match(output(result), /^syntax error: /);
+	// The whole cell is compiled first, so its valid first line does not run.
+	result = await f.send("seed = seed + 100\ninteger :: also_broken =");
+	assert.equal(result.details.lfortranResult.status, "error");
+	assert.equal(output(await f.send("print *, 'RECOVER=', seed")), "RECOVER= 42");
+	// A READ waits for the person; the send waits for the cell, not the prompt.
+	const reading = f.send("block\n  integer :: n\n  read(*,*) n\n  print *, 'READ=', n + seed\nend block", { timeoutMs: 30000 });
+	await eventually(async () => /include '[^\n]*\n?\s*$/.test(await f.tmux("capture-pane", "-p", "-t", `${f.sessionName}:^`)) || (await lfortranStatusLines(f)).length === 7);
+	await new Promise((resolve) => setTimeout(resolve, 500));
+	assert.equal((await lfortranStatusLines(f)).length, 6, "the READ cell must not be reported before its input");
+	await f.tmux("send-keys", "-t", `${f.sessionName}:^`, "-l", "7");
+	await f.tmux("send-keys", "-t", `${f.sessionName}:^`, "C-m");
+	result = await reading;
+	assert.deepEqual(result.details.lfortranResult, { cell: 7, status: "ok" });
+	assert.match(output(result), /READ= 49$/);
+	const record = (await f.status()).details.lfortran;
+	const entries = readReplSessionRecord(record.recordId).entries;
+	assert.equal(entries.at(-1).code, "block\n  integer :: n\n  read(*,*) n\n  print *, 'READ=', n + seed\nend block");
+	assert.match(entries.at(-1).output, /READ= 49$/);
+	assert.equal(readdirSync(process.env.PI_REPL_CONTROL_ROOT).length, 0);
+	await f.repl("export lfortran");
+	assert.equal(f.notifications.at(-1).level, "info");
+	await assertVerifiedStop(f);
+});
+
+test("lfortran runtime error ends the session without a status line or replay", {
+	timeout: 60000, skip: !(optionalRuntimes.has("all") || optionalRuntimes.has("lfortran")),
+}, async (t) => {
+	const f = await fixture(t, { runtime: "lfortran", startWithTool: true, controlName: "controls space \"quoted\" #{raise}" });
+	if (!f) return;
+	assert.equal((await f.send("integer :: kept = 5")).details.lfortranResult.status, "ok");
+	const lines = await lfortranStatusLines(f);
+	await assert.rejects(f.send("block\n  integer :: u\n  open(newunit=u, file='missing.txt', status='old')\nend block"), /REPL session ended/);
+	assert.deepEqual(lines, [{ cell: 1, status: "ok" }]);
+	assert.equal((await f.status()).details.lfortran.running, false);
+	// The send settles once the ended session has been confirmed.
+	await eventually(() => readdirSync(process.env.PI_REPL_CONTROL_ROOT).length === 0);
 });
 
 for (const mode of ['abort', 'exit', 'interrupt', 'stop-busy']) test(`cpp adapter ${mode} retains or releases the actual send lease without replay`, {

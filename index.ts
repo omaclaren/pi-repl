@@ -10,7 +10,7 @@ import type { ExtensionAPI, ExtensionCommandContext, ExtensionContext } from "@e
 import { StringEnum } from "@earendil-works/pi-ai";
 import { Type } from "typebox";
 import { randomUUID } from "node:crypto";
-import { existsSync, mkdtempSync, writeFileSync } from "node:fs";
+import { existsSync, mkdtempSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import {
@@ -41,9 +41,10 @@ import { stopVerifiedReplSession } from "./shared/repl-session-stop.js";
 import { mStringLiteral, buildMLanguageControlSource, buildMLanguageDriverSource } from "./shared/repl-m-language.js";
 import { buildGnuplotSubmissionLine, buildGnuplotGuardSource, buildGnuplotDriverSource } from "./shared/repl-gnuplot.js";
 import { cppInclude, buildCppDriverSource, buildCppRequest, createCppControlCleanup, prepareCppSubmission, readCppCompletion } from "./shared/repl-cpp.js";
+import { LFORTRAN_PROMPT, LFORTRAN_STATUS_OPTION, createLfortranStatusFile, isLfortranEchoPrefix, lfortranInclude, prepareLfortranSubmission, readLfortranCompletion, stripLfortranEditorPosition } from "./shared/repl-lfortran.js";
 import { GNUPLOT_OWNER_ENV, GNUPLOT_OWNER_OPTION } from "./shared/repl-gnuplot-processes.js";
 
-const SUPPORTED_RUNTIMES = ["julia", "python", "ipython", "r", "ghci", "clojure", "clj", "ruby", "java", "octave", "matlab", "gnuplot", "cpp", "bun"] as const;
+const SUPPORTED_RUNTIMES = ["julia", "python", "ipython", "r", "ghci", "clojure", "clj", "ruby", "java", "octave", "matlab", "gnuplot", "cpp", "lfortran", "bun"] as const;
 const DEFAULT_PYTHON_SESSION = "pi-repl-python";
 const DEFAULT_JULIA_SESSION = "pi-repl-julia";
 const DEFAULT_R_SESSION = "pi-repl-r";
@@ -55,6 +56,7 @@ const DEFAULT_OCTAVE_SESSION = "pi-repl-octave";
 const DEFAULT_MATLAB_SESSION = "pi-repl-matlab";
 const DEFAULT_GNUPLOT_SESSION = "pi-repl-gnuplot";
 const DEFAULT_CPP_SESSION = "pi-repl-cpp";
+const DEFAULT_LFORTRAN_SESSION = "pi-repl-lfortran";
 const DEFAULT_CAPTURE_LINES = 20;
 const DEFAULT_STARTUP_WAIT_MS = 20_000;
 const MAX_STARTUP_WAIT_MS = 120_000;
@@ -211,7 +213,7 @@ const REPL_HISTORY_OPTION = "@pi_repl_history_path";
 type SupportedRuntime = (typeof SUPPORTED_RUNTIMES)[number];
 type PythonRuntime = "python" | "ipython";
 type ClojureRuntime = "clojure" | "clj";
-type ManagedRuntime = PythonRuntime | "julia" | "r" | "ghci" | ClojureRuntime | "ruby" | "java" | "octave" | "matlab" | "gnuplot" | "cpp";
+type ManagedRuntime = PythonRuntime | "julia" | "r" | "ghci" | ClojureRuntime | "ruby" | "java" | "octave" | "matlab" | "gnuplot" | "cpp" | "lfortran";
 type ImplementedRuntime = Exclude<ManagedRuntime, "clj">;
 type SessionSelector = Exclude<ImplementedRuntime, "ipython">;
 type ReplSubmissionEchoMode = "off" | "summary" | "full";
@@ -280,13 +282,14 @@ type ReplSendDetails = {
 	truncation?: TruncationResult;
 	fullOutputPath?: string;
 	cppResult?: number;
+	lfortranResult?: { cell: number; status: "ok" | "error" };
 };
 
 const REPL_SEND_PARAMS = Type.Object({
-	code: Type.String({ description: "Python, IPython, Julia, R, GHCi, Clojure, Ruby, Java, Octave, MATLAB, gnuplot, or C++ code to execute in the shared REPL session." }),
+	code: Type.String({ description: "Python, IPython, Julia, R, GHCi, Clojure, Ruby, Java, Octave, MATLAB, gnuplot, C++, or Fortran code to execute in the shared REPL session." }),
 	target: Type.Optional(
 		Type.String({
-			description: "Optional target REPL: python, julia, r, ghci, clojure, ruby, java, octave, matlab, gnuplot, or cpp. If omitted, repl_send uses the shared Python/IPython session.",
+			description: "Optional target REPL: python, julia, r, ghci, clojure, ruby, java, octave, matlab, gnuplot, cpp, or lfortran. If omitted, repl_send uses the shared Python/IPython session.",
 		}),
 	),
 	timeoutMs: Type.Optional(
@@ -316,7 +319,7 @@ function getToolSubmissionLabel(): string {
 	return process.env.PI_REPL_AGENT_LABEL?.trim() || "Pi";
 }
 
-const REPL_START_RUNTIMES = ["python", "ipython", "julia", "r", "ghci", "clojure", "ruby", "java", "octave", "matlab", "gnuplot", "cpp"] as const;
+const REPL_START_RUNTIMES = ["python", "ipython", "julia", "r", "ghci", "clojure", "ruby", "java", "octave", "matlab", "gnuplot", "cpp", "lfortran"] as const;
 const REPL_START_PARAMS = Type.Object({
 	runtime: StringEnum(REPL_START_RUNTIMES, {
 		description: "Runtime to start explicitly. Python and IPython share one session; an existing session is reused without switching its interpreter.",
@@ -331,7 +334,7 @@ const REPL_START_PARAMS = Type.Object({
 const REPL_STATUS_PARAMS = Type.Object({
 	target: Type.Optional(
 		Type.String({
-			description: "Optional session target: python, julia, r, ghci, ruby, java, clojure, octave, matlab, gnuplot, or cpp. If omitted, report all shared REPL sessions.",
+			description: "Optional session target: python, julia, r, ghci, ruby, java, clojure, octave, matlab, gnuplot, cpp, or lfortran. If omitted, report all shared REPL sessions.",
 		}),
 	),
 });
@@ -377,7 +380,7 @@ function toSessionSelector(runtime: ManagedRuntime): SessionSelector {
 	if (runtime === "clojure" || runtime === "clj") return "clojure";
 	if (runtime === "ruby") return "ruby";
 	if (runtime === "java") return "java";
-	if (runtime === "octave" || runtime === "matlab" || runtime === "gnuplot" || runtime === "cpp") return runtime;
+	if (runtime === "octave" || runtime === "matlab" || runtime === "gnuplot" || runtime === "cpp" || runtime === "lfortran") return runtime;
 	return "python";
 }
 
@@ -392,6 +395,7 @@ function getSessionNameForSelector(selector: SessionSelector): string {
 	if (selector === "matlab") return DEFAULT_MATLAB_SESSION;
 	if (selector === "gnuplot") return DEFAULT_GNUPLOT_SESSION;
 	if (selector === "cpp") return DEFAULT_CPP_SESSION;
+	if (selector === "lfortran") return DEFAULT_LFORTRAN_SESSION;
 	return DEFAULT_PYTHON_SESSION;
 }
 
@@ -427,14 +431,15 @@ function formatUsage(): string {
 		"  /repl matlab",
 		"  /repl gnuplot",
 		"  /repl cpp",
+		"  /repl lfortran",
 		"  /repl echo [off|summary|full]",
-		"  /repl status [python|julia|r|ghci|clojure|ruby|java|octave|matlab|gnuplot|cpp]",
+		"  /repl status [python|julia|r|ghci|clojure|ruby|java|octave|matlab|gnuplot|cpp|lfortran]",
 		"  /repl env [python]",
-		"  /repl attach [python|julia|r|ghci|clojure|ruby|java|octave|matlab|gnuplot|cpp]",
-		"  /repl export [python|julia|r|ghci|clojure|ruby|java|octave|matlab|gnuplot|cpp]",
-		"  /repl stop [python|julia|r|ghci|clojure|ruby|java|octave|matlab|gnuplot|cpp]",
+		"  /repl attach [python|julia|r|ghci|clojure|ruby|java|octave|matlab|gnuplot|cpp|lfortran]",
+		"  /repl export [python|julia|r|ghci|clojure|ruby|java|octave|matlab|gnuplot|cpp|lfortran]",
+		"  /repl stop [python|julia|r|ghci|clojure|ruby|java|octave|matlab|gnuplot|cpp|lfortran]",
 		"",
-		"Supported runtimes right now: python, ipython, julia, r, ghci, clojure, ruby, java, octave, matlab, gnuplot, cpp",
+		"Supported runtimes right now: python, ipython, julia, r, ghci, clojure, ruby, java, octave, matlab, gnuplot, cpp, lfortran",
 		"For R, both /repl R and /repl r work. The same applies to /lab, /repl status, /repl attach, /repl export, and /repl stop.",
 		"For Clojure, /repl clojure is canonical and /repl clj also works. The same applies to /lab, /repl status, /repl attach, /repl export, and /repl stop.",
 		"For Ruby, /repl ruby starts irb. For Java, /repl java starts jshell.",
@@ -450,6 +455,7 @@ function formatUsage(): string {
 		"  - /repl octave and /repl matlab manage separate terminal sessions; they never substitute for each other",
 		"  - /repl gnuplot manages the independent pi-repl-gnuplot session, retaining native plotting settings",
 		"  - /repl cpp starts an experimental Cling-based C++ REPL; send C++ prompt groups, not dot commands",
+		"  - /repl lfortran starts an experimental LFortran prompt; it needs an LFortran with --status-file",
 		"  - /repl status, /repl attach, /repl export, and /repl stop can target any managed runtime",
 		"  - repl_start lets pi start or reuse a session with an explicit runtime; repl_send never auto-starts one",
 		"  - /repl echo controls the bounded submitted-code display in the raw pane; PI_REPL_ECHO_MODE sets the startup default",
@@ -620,12 +626,15 @@ function buildRuntimeLaunchCommand(runtime: ManagedRuntime): string {
 	if (runtime === "octave") return "octave-cli --quiet --interactive";
 	if (runtime === "matlab") return "matlab -nodesktop -nosplash";
 	if (runtime === "cpp") return "cling";
+	if (runtime === "lfortran") return "lfortran";
 	return runtime;
 }
 
-function buildDefaultShellRuntimeCommand(runtime: ManagedRuntime, cwd?: string): { shell: string; command: string } {
+function buildDefaultShellRuntimeCommand(runtime: ManagedRuntime, cwd?: string, statusFile?: string): { shell: string; command: string } {
 	const shell = process.env.SHELL?.trim() || "/bin/sh";
-	const runtimeCommand = buildRuntimeLaunchCommand(runtime) + (runtime === "matlab" && cwd ? ` -sd ${shellQuote(cwd)}` : "");
+	const runtimeCommand = buildRuntimeLaunchCommand(runtime)
+		+ (runtime === "matlab" && cwd ? ` -sd ${shellQuote(cwd)}` : "")
+		+ (runtime === "lfortran" && statusFile ? ` --status-file ${shellQuote(statusFile)}` : "");
 	return {
 		shell,
 		command: `${shellQuote(shell)} -i -l -c ${shellQuote(runtimeCommand)}`,
@@ -922,6 +931,7 @@ function getSessionDisplayName(selector: SessionSelector, info?: SessionInfo | n
 	if (selector === "matlab") return "MATLAB";
 	if (selector === "gnuplot") return "gnuplot";
 	if (selector === "cpp") return "C++ (Cling)";
+	if (selector === "lfortran") return "Fortran (LFortran)";
 	if (info?.runtime === "ipython") return "Python/IPython";
 	return "Python/IPython";
 }
@@ -945,7 +955,7 @@ async function listRunningSharedSessions(
 	if (rubyInfo) sessions.push({ selector: "ruby", info: rubyInfo });
 	const javaInfo = await readSessionInfo(pi, DEFAULT_JAVA_SESSION, cwd);
 	if (javaInfo) sessions.push({ selector: "java", info: javaInfo });
-	for (const selector of ["octave", "matlab", "gnuplot", "cpp"] as const) {
+	for (const selector of ["octave", "matlab", "gnuplot", "cpp", "lfortran"] as const) {
 		const info = await readSessionInfo(pi, getSessionNameForSelector(selector), cwd);
 		if (info) sessions.push({ selector, info });
 	}
@@ -973,6 +983,7 @@ function hasNormalReplPrompt(info: SessionInfo, requested: ImplementedRuntime): 
 		matlab: /(?:^|\n)>>[ \t]*$/,
 		gnuplot: /(?:^|\n)gnuplot>[ \t]*$/,
 		cpp: /(?:^|\n)\[cling\]\$[ \t]*$/,
+		lfortran: /(?:^|\n)>>>(?:[ \t]+\d+,\d+[ \t]+\])?[ \t]*$/,
 	};
 	if (!REPL_START_RUNTIMES.includes(runtime as ImplementedRuntime)) return false;
 	if (toSessionSelector(runtime as ImplementedRuntime) !== toSessionSelector(requested)) return false;
@@ -1010,8 +1021,8 @@ async function waitForReplSessionInfo(
 		}
 		identity = info;
 		let livePane = true;
-		if (runtime === "cpp") {
-			const pane = await inspectCppPane(pi, await getPaneTarget(pi, sessionTarget, cwd), cwd);
+		if (runtime === "cpp" || runtime === "lfortran") {
+			const pane = await inspectNativePane(pi, await getPaneTarget(pi, sessionTarget, cwd), cwd);
 			if (pane?.dead) throw new Error(`REPL session ended native execution: ${sessionName}. Its dead tmux pane is retained; no replacement was started.`);
 			livePane = Boolean(pane);
 		}
@@ -1040,7 +1051,7 @@ type ReplSubmissionState = {
 	prepared: ReturnType<typeof prepareReplControlFiles>;
 	completionObserved: boolean;
 	runtimeEnded?: boolean;
-	cppPane?: { id: string; pid: string };
+	nativePane?: { id: string; pid: string };
 };
 
 function getReplControlExtension(runtime: ImplementedRuntime): string {
@@ -1053,6 +1064,7 @@ function getReplControlExtension(runtime: ImplementedRuntime): string {
 	if (runtime === "octave" || runtime === "matlab") return "m";
 	if (runtime === "gnuplot") return "gp";
 	if (runtime === "cpp") return "cpp";
+	if (runtime === "lfortran") return "f90";
 	return "py";
 }
 
@@ -1295,6 +1307,7 @@ function buildReplControlSource(runtime: ImplementedRuntime, code: string, doneF
 	if (runtime === "octave" || runtime === "matlab") return buildMLanguageControlSource(code, display);
 	if (runtime === "gnuplot") return code + "\n";
 	if (runtime === "cpp") return code;
+	if (runtime === "lfortran") return code.endsWith("\n") ? code : code + "\n";
 	return buildPythonControlSource(runtime, code, doneFile, display);
 }
 
@@ -1382,9 +1395,11 @@ function buildSubmissionText(submissionLine: string, previewComment?: string, co
 function prepareReplControlFiles(
 	runtime: ImplementedRuntime,
 	code: string,
-	details: { submissionId: string; echoMode: ReplSubmissionEchoMode },
-): { controlPaths: ReplControlPaths; guardPaths?: ReplControlPaths; driverPaths?: ReplControlPaths; submissionLine: string; completionLine?: string; previewComment?: string; submissionText: string; display: ReplSubmissionDisplay; cppCompletion?: ReturnType<typeof prepareCppSubmission>["completion"]; cppCleanup?: () => void } {
+	details: { submissionId: string; echoMode: ReplSubmissionEchoMode; lfortranStatusFile?: string },
+): { controlPaths: ReplControlPaths; guardPaths?: ReplControlPaths; driverPaths?: ReplControlPaths; submissionLine: string; completionLine?: string; previewComment?: string; submissionText: string; display: ReplSubmissionDisplay; cppCompletion?: ReturnType<typeof prepareCppSubmission>["completion"]; cppCleanup?: () => void; lfortranCompletion?: ReturnType<typeof prepareLfortranSubmission> } {
 	if (runtime === "cpp" && code.includes("\0")) throw new Error("C++ source cannot contain NUL bytes; no code was sent.");
+	if (runtime === "lfortran" && code.includes("\0")) throw new Error("Fortran source cannot contain NUL bytes; no code was sent.");
+	if (runtime === "lfortran" && !details.lfortranStatusFile) throw new Error("The LFortran session has no status file; no code was sent.");
 	const display = createReplSubmissionDisplay({
 		entryId: details.submissionId,
 		origin: "pi-repl",
@@ -1458,7 +1473,13 @@ function prepareReplControlFiles(
 				buildSource: () => buildCppDriverSource(request.sourceFile, controlPaths.doneFile),
 			});
 		}
-		const submissionLine = cpp && driverPaths ? cppInclude(driverPaths.sourceFile) : buildReplSubmissionLine(runtime, driverPaths?.sourceFile ?? controlPaths.sourceFile);
+		// The code is sent as one include line, which LFortran runs as one
+		// cell and reports to the status file once it has finished, so no
+		// completion command follows it into stdin.
+		const lfortranCompletion = runtime === "lfortran" ? prepareLfortranSubmission(details.lfortranStatusFile) : undefined;
+		const submissionLine = cpp && driverPaths ? cppInclude(driverPaths.sourceFile)
+			: runtime === "lfortran" ? lfortranInclude(controlPaths.sourceFile)
+			: buildReplSubmissionLine(runtime, driverPaths?.sourceFile ?? controlPaths.sourceFile);
 		const completionLine = driverPaths ? undefined : buildReplCompletionLine(runtime, controlPaths.doneFile, display);
 		const previewComment = undefined;
 		return {
@@ -1471,6 +1492,7 @@ function prepareReplControlFiles(
 			display,
 			cppCompletion: cpp?.completion,
 			cppCleanup: cpp && guardPaths && driverPaths ? createCppControlCleanup(cpp.completion, [controlPaths.sourceFile, guardPaths.sourceFile, driverPaths.sourceFile]) : undefined,
+			lfortranCompletion,
 			submissionText: buildSubmissionText(submissionLine, previewComment, completionLine),
 		};
 	} catch (error) {
@@ -1561,13 +1583,15 @@ function extractPaneDelta(before: string, after: string): string {
 export function cleanupReplDelta(delta: string, submissionLine: string, previewComment?: string, completionLine?: string, display?: ReplSubmissionDisplay): string {
 	const isCppSubmission = submissionLine.startsWith("#include ");
 	const isMLanguageSubmission = submissionLine.startsWith("eval(fileread(");
+	const isLfortranSubmission = submissionLine.startsWith("include '");
 	const isPrompt = (line: string) =>
 		/^(?:>>>|In \[\d+\]:|\.\.\.:|>|\+)\s*$/.test(line) ||
 		/^(ghci|Prelude|\*?[A-Za-z0-9_.:]+)>\s*$/.test(line) ||
 		/^[^\s>]+=>\s*$/.test(line) ||
 		/^irb\(.*\)[:\d]+[>*]\s*$/.test(line) ||
 		(isMLanguageSubmission && /^(?:octave:\d+>|>>)\s*$/.test(line)) ||
-		(isCppSubmission && /^\[cling\]\$\s*$/.test(line));
+		(isCppSubmission && /^\[cling\]\$\s*$/.test(line)) ||
+		(isLfortranSubmission && LFORTRAN_PROMPT.test(line));
 	const echoEnd = (line: string, command: string) => {
 		if (!command) return -1;
 		const index = line.indexOf(command);
@@ -1586,12 +1610,14 @@ export function cleanupReplDelta(delta: string, submissionLine: string, previewC
 			removedPreview = true;
 			continue;
 		}
+		if (isLfortranSubmission && isLfortranEchoPrefix(lines[0], submissionLine)) { lines.shift(); break; }
 		const end = echoEnd(lines[0], submissionLine);
 		if (end < 0) break;
 		// Some input editors join output/header to the loader echo. Preserve
 		// the remainder, including its spaces, and consume at most ONE echo:
 		// printing that same command again is legitimate user output.
-		const remainder = lines[0].slice(end);
+		// LFortran's editor also draws the cursor position after the echo.
+		const remainder = isLfortranSubmission ? stripLfortranEditorPosition(lines[0].slice(end)) : lines[0].slice(end);
 		if (remainder.trim()) lines[0] = remainder;
 		else lines.shift();
 		break;
@@ -1637,19 +1663,33 @@ function cleanupPreparedReplControlFiles(prepared?: ReturnType<typeof prepareRep
 }
 
 function submissionComplete(prepared: ReturnType<typeof prepareReplControlFiles>): boolean {
+	if (prepared.lfortranCompletion) return readLfortranCompletion(prepared.lfortranCompletion) !== undefined;
 	return prepared.cppCompletion ? readCppCompletion(prepared.cppCompletion) !== undefined : existsSync(prepared.controlPaths.doneFile);
 }
 
-async function inspectCppPane(pi: ExtensionAPI, id: string, cwd: string): Promise<{ id: string; pid: string; dead: boolean } | undefined> {
+async function inspectNativePane(pi: ExtensionAPI, id: string, cwd: string): Promise<{ id: string; pid: string; dead: boolean } | undefined> {
 	const result = await execTmux(pi, ["display-message", "-p", "-t", id, "#{pane_id}|#{pane_pid}|#{pane_dead}"], cwd, 3_000);
 	const match = result.stdout.trim().match(/^(%\d+)\|(\d+)\|([01])$/);
 	return result.code === 0 && match && match[1] === id ? { id, pid: match[2], dead: match[3] === "1" } : undefined;
 }
 
-async function cppPaneEnded(pi: ExtensionAPI, state: ReplSubmissionState): Promise<boolean> {
-	if (!state.cppPane) return false;
-	const current = await inspectCppPane(pi, state.cppPane.id, state.cwd);
-	return Boolean(current?.dead && current.pid === state.cppPane.pid);
+// LFortran writes a cell's status line once the cell's output is flushed, but
+// tmux may not have drawn that output yet. The next prompt follows it, so wait
+// briefly for the prompt before capturing. It is not taken as completion.
+async function captureAfterLfortranPrompt(pi: ExtensionAPI, paneTarget: string, cwd: string): Promise<string> {
+	const deadline = Date.now() + 1_000;
+	while (true) {
+		const capture = await capturePaneOutput(pi, paneTarget, cwd);
+		const last = capture.trimEnd().split("\n").at(-1)?.trim() ?? "";
+		if (LFORTRAN_PROMPT.test(last) || Date.now() >= deadline) return capture;
+		await sleep(REPL_SEND_POLL_MS / 2);
+	}
+}
+
+async function nativePaneEnded(pi: ExtensionAPI, state: ReplSubmissionState): Promise<boolean> {
+	if (!state.nativePane) return false;
+	const current = await inspectNativePane(pi, state.nativePane.id, state.cwd);
+	return Boolean(current?.dead && current.pid === state.nativePane.pid);
 }
 
 async function waitForReplDoneFile(
@@ -1676,7 +1716,7 @@ async function waitForReplDoneFile(
 		}
 
 		if (captureContext ? submissionComplete(captureContext.prepared) : existsSync(doneFile)) return;
-		if (captureContext?.state && await cppPaneEnded(pi, captureContext.state)) {
+		if (captureContext?.state && await nativePaneEnded(pi, captureContext.state)) {
 			captureContext.state.runtimeEnded = true;
 			throw new Error(`REPL session ended native execution while waiting for output: ${sessionName}. Its dead tmux pane is retained; no replacement was started.`);
 		}
@@ -1687,7 +1727,7 @@ async function waitForReplDoneFile(
 			// Native exit can race the observational capture after has-session.
 			// Classify it consistently; the watcher still verifies settlement
 			// before releasing controls/lease (inspection errors are not ACKs).
-			if (captureContext?.state?.cppPane && !(await tmuxSessionExists(pi, sessionTarget, cwd))) {
+			if (captureContext?.state?.nativePane && !(await tmuxSessionExists(pi, sessionTarget, cwd))) {
 				throw new Error(`REPL session ended while waiting for output: ${sessionName}`);
 			}
 			throw error;
@@ -1724,7 +1764,8 @@ function normalizeReplSendTarget(target?: string): SessionSelector | undefined {
 	if (trimmed === "clojure" || trimmed === "clj") return "clojure";
 	if (trimmed === "ruby" || trimmed === "irb") return "ruby";
 	if (trimmed === "java" || trimmed === "jshell") return "java";
-	if (trimmed === "octave" || trimmed === "matlab" || trimmed === "gnuplot" || trimmed === "cpp") return trimmed;
+	if (trimmed === "octave" || trimmed === "matlab" || trimmed === "gnuplot" || trimmed === "cpp" || trimmed === "lfortran") return trimmed;
+	if (trimmed === "fortran") return "lfortran";
 	throw new Error(`Unknown repl_send target: ${target}`);
 }
 
@@ -1749,7 +1790,7 @@ async function runReplCode(
 	const sessionName = getSessionNameForSelector(target);
 
 	if (!(await tmuxSessionExists(pi, sessionName, ctx.cwd))) {
-		if (target === "octave" || target === "matlab" || target === "gnuplot" || target === "cpp") throw new Error(`No default ${getSessionDisplayName(target)} REPL session is running (${sessionName}). Start one with /repl ${target} first.`);
+		if (target === "octave" || target === "matlab" || target === "gnuplot" || target === "cpp" || target === "lfortran") throw new Error(`No default ${getSessionDisplayName(target)} REPL session is running (${sessionName}). Start one with /repl ${target} first.`);
 		if (target === "julia") {
 			throw new Error(
 				`No default Julia REPL session is running (${DEFAULT_JULIA_SESSION}). Start one with /repl julia first.`,
@@ -1787,7 +1828,7 @@ async function runReplCode(
 
 	const sessionInfo = await readSessionInfo(pi, sessionName, ctx.cwd);
 	if (!sessionInfo) {
-		if (target === "octave" || target === "matlab" || target === "gnuplot" || target === "cpp") throw new Error(`Could not inspect the default ${getSessionDisplayName(target)} REPL session (${sessionName}). Inspect it with /repl status ${target}.`);
+		if (target === "octave" || target === "matlab" || target === "gnuplot" || target === "cpp" || target === "lfortran") throw new Error(`Could not inspect the default ${getSessionDisplayName(target)} REPL session (${sessionName}). Inspect it with /repl status ${target}.`);
 		if (target === "julia") {
 			throw new Error(
 				`Could not inspect the default Julia REPL session (${DEFAULT_JULIA_SESSION}). Start it again with /repl julia.`,
@@ -1840,12 +1881,20 @@ async function runReplCode(
 	const sessionTarget = sessionInfo.tmuxSessionId || sessionName;
 	const paneTarget = await getPaneTarget(pi, sessionTarget, ctx.cwd);
 	const beforeCapture = await capturePaneOutput(pi, paneTarget, ctx.cwd);
-	const cppPane = runtime === "cpp" ? await inspectCppPane(pi, paneTarget, ctx.cwd) : undefined;
-	if (runtime === "cpp" && (!cppPane || cppPane.dead)) throw new Error("The C++ pane is ended or cannot be inspected; no code was sent and no replacement was started.");
-	const echoMode = resolveReplSubmissionEchoMode(params.echoMode);
+	const nativeRuntime = runtime === "cpp" || runtime === "lfortran";
+	const nativePane = nativeRuntime ? await inspectNativePane(pi, paneTarget, ctx.cwd) : undefined;
+	if (nativeRuntime && (!nativePane || nativePane.dead)) throw new Error(`The ${runtime === "cpp" ? "C++" : "LFortran"} pane is ended or cannot be inspected; no code was sent and no replacement was started.`);
+	// An LFortran cell runs as an include, so the pane shows that line rather
+	// than the code; a display printed by the cell would be lost to a compile
+	// error, so none is added.
+	const echoMode = runtime === "lfortran" ? "off" : resolveReplSubmissionEchoMode(params.echoMode);
+	const lfortranStatusFile = runtime === "lfortran"
+		? await readTmuxSessionOption(pi, sessionInfo.tmuxSessionId, LFORTRAN_STATUS_OPTION, ctx.cwd)
+		: undefined;
 	const prepared = prepareReplControlFiles(runtime, code, {
 		submissionId: options.submissionId || `pi-repl:local:${randomUUID()}`,
 		echoMode,
+		lfortranStatusFile,
 	});
 	const submissionState: ReplSubmissionState = {
 		recordId: sessionInfo.recordId,
@@ -1858,7 +1907,7 @@ async function runReplCode(
 		beforeCapture,
 		prepared,
 		completionObserved: false,
-		cppPane,
+		nativePane,
 	};
 
 	let submissionStarted = false;
@@ -1879,7 +1928,10 @@ async function runReplCode(
 			{ beforeCapture, prepared, state: submissionState },
 		);
 		submissionState.completionObserved = true;
-		const afterCapture = await capturePaneOutput(pi, paneTarget, ctx.cwd);
+		const lfortranResult = prepared.lfortranCompletion ? readLfortranCompletion(prepared.lfortranCompletion) : undefined;
+		const afterCapture = lfortranResult
+			? await captureAfterLfortranPrompt(pi, paneTarget, ctx.cwd)
+			: await capturePaneOutput(pi, paneTarget, ctx.cwd);
 		const cppResult = prepared.cppCompletion ? readCppCompletion(prepared.cppCompletion) : undefined;
 		const delta = extractPaneDelta(beforeCapture, afterCapture);
 		const output = cleanupReplDelta(delta, prepared.submissionLine, prepared.previewComment, prepared.completionLine, prepared.display);
@@ -1894,6 +1946,7 @@ async function runReplCode(
 				timeoutMs,
 				submittedCode: code,
 				cppResult,
+				lfortranResult,
 				echoMode,
 				submissionAnchorId: prepared.display.enabled ? prepared.display.anchorId : undefined,
 				previewComment: prepared.previewComment,
@@ -1931,7 +1984,7 @@ function retainReplSubmissionUntilSettled(
 			while (!submissionComplete(state.prepared)) {
 				if (!state.prepared.cppCompletion && !existsSync(state.prepared.controlPaths.sourceFile)) return;
 				try {
-					if (await cppPaneEnded(pi, state)) { state.runtimeEnded = true; return; }
+					if (await nativePaneEnded(pi, state)) { state.runtimeEnded = true; return; }
 					const current = await readSessionInfo(pi, state.sessionName, state.cwd);
 					if (
 						current
@@ -2181,7 +2234,9 @@ async function startDefaultReplSession(
 	checkStartAborted(signal, sessionName);
 	const exists = await tmuxSessionExists(pi, sessionName, cwd);
 	checkStartAborted(signal, sessionName);
-	const shellLaunch = buildDefaultShellRuntimeCommand(runtime, cwd);
+	// A new LFortran session reports each finished cell to its own private file.
+	const lfortranStatusFile = runtime === "lfortran" && !exists ? createLfortranStatusFile(sessionName) : undefined;
+	const shellLaunch = buildDefaultShellRuntimeCommand(runtime, cwd, lfortranStatusFile);
 	let created = false;
 	let sessionTarget = sessionName;
 	const warnings: string[] = [];
@@ -2194,6 +2249,8 @@ async function startDefaultReplSession(
 			...(gnuplotOwner ? ["-e", `${GNUPLOT_OWNER_ENV}=${gnuplotOwner}`] : []), shellLaunch.command,
 		], cwd, 10_000);
 		if (result.code !== 0) {
+			// The status file belongs to the session that was not created.
+			if (lfortranStatusFile) rmSync(lfortranStatusFile, { force: true });
 			if (!(await tmuxSessionExists(pi, sessionName, cwd))) {
 				const reason = result.stderr.trim() || result.stdout.trim() || `exit code ${result.code}`;
 				throw new Error(`Failed to create tmux session ${sessionName}: ${reason}`);
@@ -2209,6 +2266,9 @@ async function startDefaultReplSession(
 			}
 			if (!(await setTmuxSessionOption(pi, sessionTarget, REPL_RUNTIME_OPTION, runtime, cwd))) {
 				warnings.push(`Could not record the runtime for ${sessionName}.`);
+			}
+			if (lfortranStatusFile && !(await setTmuxSessionOption(pi, sessionTarget, LFORTRAN_STATUS_OPTION, lfortranStatusFile, cwd))) {
+				warnings.push(`Could not record the status file for ${sessionName}; code cannot be sent to it.`);
 			}
 			const history = await enableSessionHistoryLogging(pi, sessionName, cwd, sessionTarget);
 			if (history.warning) warnings.push(history.warning);
@@ -2226,6 +2286,7 @@ async function startDefaultReplSession(
 			...(target === "python" ? ["This respects your normal shell-level Python setup (aliases, pyenv/virtualenv/conda activation, shell init, etc.)."] : []),
 			...(target === "clojure" ? ["`clojure` is used without rlwrap; `/repl clj` remains an alias."] : []),
 			...(target === "gnuplot" ? ["An inherited ownership marker identifies this session's interpreter and Qt helpers during explicit stop; plotting settings are unchanged."] : []),
+			...(target === "lfortran" ? ["LFortran writes a line to a private status file (--status-file) as each cell finishes; pi-repl waits for that line, not the prompt."] : []),
 		] : []),
 		ready ? "Readiness: normal prompt observed (snapshot only, not a reservation)." : "Readiness: unconfirmed.",
 		...warnings.map((warning) => `Warning: ${warning}`),
@@ -2260,7 +2321,7 @@ async function startReplCommand(pi: ExtensionAPI, ctx: ExtensionCommandContext, 
 }
 
 function formatNoSessionRunning(selector: SessionSelector): string {
-	if (selector === "octave" || selector === "matlab" || selector === "gnuplot" || selector === "cpp") return `No default ${getSessionDisplayName(selector)} REPL session is running (${getSessionNameForSelector(selector)}).\nStart one with /repl ${selector} or /lab ${selector}.`;
+	if (selector === "octave" || selector === "matlab" || selector === "gnuplot" || selector === "cpp" || selector === "lfortran") return `No default ${getSessionDisplayName(selector)} REPL session is running (${getSessionNameForSelector(selector)}).\nStart one with /repl ${selector} or /lab ${selector}.`;
 	if (selector === "julia") {
 		return [
 			`No default Julia REPL session is running (${DEFAULT_JULIA_SESSION}).`,
@@ -2319,7 +2380,7 @@ function buildReplStatusDetails(
 	const clojure = sessions.find((session) => session.selector === "clojure")?.info;
 	const ruby = sessions.find((session) => session.selector === "ruby")?.info;
 	const java = sessions.find((session) => session.selector === "java")?.info;
-	const additionalRuntimeDetails = Object.fromEntries((["octave", "matlab", "gnuplot", "cpp"] as const).map((selector) => {
+	const additionalRuntimeDetails = Object.fromEntries((["octave", "matlab", "gnuplot", "cpp", "lfortran"] as const).map((selector) => {
 		const info = sessions.find((session) => session.selector === selector)?.info;
 		return [selector, {
 			running: Boolean(info), sessionName: info?.sessionName ?? getSessionNameForSelector(selector),
@@ -2525,6 +2586,7 @@ async function stopReplSession(
 					"/repl stop matlab",
 					"/repl stop gnuplot",
 					"/repl stop cpp",
+					"/repl stop lfortran",
 				].join("\n"),
 				"warning",
 			);
@@ -2618,7 +2680,7 @@ async function exportReplRecord(
 				ctx,
 				[
 					"Multiple shared REPL sessions are running.",
-					"Choose one with /repl export python, julia, r, ghci, clojure, ruby, java, octave, matlab, gnuplot, or cpp.",
+					"Choose one with /repl export python, julia, r, ghci, clojure, ruby, java, octave, matlab, gnuplot, cpp, or lfortran.",
 				].join("\n"),
 				"warning",
 			);
@@ -2796,7 +2858,7 @@ async function handleRepl(pi: ExtensionAPI, args: string, ctx: ExtensionCommandC
 				return;
 			}
 
-			if (parsed.runtime === "octave" || parsed.runtime === "matlab" || parsed.runtime === "gnuplot" || parsed.runtime === "cpp") {
+			if (parsed.runtime === "octave" || parsed.runtime === "matlab" || parsed.runtime === "gnuplot" || parsed.runtime === "cpp" || parsed.runtime === "lfortran") {
 				if (parsed.name) {
 					notify(ctx, `Named ${getSessionDisplayName(parsed.runtime)} sessions are not implemented yet. For now, use /repl ${parsed.runtime} with no --name.`, "warning");
 					return;
@@ -2813,7 +2875,7 @@ async function handleRepl(pi: ExtensionAPI, args: string, ctx: ExtensionCommandC
 					"Scaffold only: parsed REPL start request.",
 					`Runtime: ${parsed.runtime}`,
 					`tmux session: ${sessionName}${nameNote}`,
-					"Only Python, IPython, Julia, R, GHCi, Clojure, Ruby, Java, Octave, MATLAB, gnuplot, and C++ session management are implemented so far.",
+					"Only Python, IPython, Julia, R, GHCi, Clojure, Ruby, Java, Octave, MATLAB, gnuplot, C++, and Fortran (LFortran) session management are implemented so far.",
 				].join("\n"),
 				"info",
 			);
@@ -2864,11 +2926,11 @@ export default function (pi: ExtensionAPI) {
 	pi.registerTool({
 		name: "repl_status",
 		label: "REPL Status",
-		description: "Inspect shared REPL session state for Python/IPython, Julia, R, Haskell (GHCi), Clojure, Ruby, Java, Octave, MATLAB, gnuplot, and C++.",
-		promptSnippet: "Check whether the shared Python/IPython, Julia, R, Haskell (GHCi), Clojure, Ruby, Java, Octave, MATLAB, gnuplot, and C++ REPL sessions are running.",
+		description: "Inspect shared REPL session state for Python/IPython, Julia, R, Haskell (GHCi), Clojure, Ruby, Java, Octave, MATLAB, gnuplot, C++, and Fortran (LFortran).",
+		promptSnippet: "Check whether the shared Python/IPython, Julia, R, Haskell (GHCi), Clojure, Ruby, Java, Octave, MATLAB, gnuplot, C++, and Fortran (LFortran) REPL sessions are running.",
 		promptGuidelines: [
 			"Use repl_status before claiming whether a shared REPL is running, especially after a previous failure or status change.",
-			"For Octave use repl_status target='octave'; for MATLAB use target='matlab'; for gnuplot use target='gnuplot'; for C++ use target='cpp'. They use separate shared sessions.",
+			"For Octave use repl_status target='octave'; for MATLAB use target='matlab'; for gnuplot use target='gnuplot'; for C++ use target='cpp'; for Fortran use target='lfortran'. They use separate shared sessions.",
 			"If the user asks specifically about Julia, use target='julia'. If they ask specifically about R, use target='r'. If they ask specifically about GHCi or Haskell, use target='ghci'. If they ask specifically about Clojure, use target='clojure'. If they ask specifically about Ruby or IRB, use target='ruby'. If they ask specifically about Java or jshell, use target='java'. If they ask specifically about Python or IPython, use target='python'.",
 			"If you need context about prior direct REPL interaction, inspect repl_status details and read the session history file listed there.",
 		],
@@ -2883,7 +2945,8 @@ export default function (pi: ExtensionAPI) {
 				else if (targetRaw === "clojure" || targetRaw === "clj") target = "clojure";
 				else if (targetRaw === "ruby" || targetRaw === "irb") target = "ruby";
 				else if (targetRaw === "java" || targetRaw === "jshell") target = "java";
-				else if (targetRaw === "octave" || targetRaw === "matlab" || targetRaw === "gnuplot" || targetRaw === "cpp") target = targetRaw;
+				else if (targetRaw === "octave" || targetRaw === "matlab" || targetRaw === "gnuplot" || targetRaw === "cpp" || targetRaw === "lfortran") target = targetRaw;
+				else if (targetRaw === "fortran") target = "lfortran";
 				else if (targetRaw === "python" || targetRaw === "ipython") target = "python";
 				else throw new Error(`Unknown repl_status target: ${targetRaw}`);
 			}
@@ -2942,11 +3005,11 @@ export default function (pi: ExtensionAPI) {
 	pi.registerTool({
 		name: "repl_send",
 		label: "REPL Send",
-		description: `Execute code in the shared default Python/IPython, Julia, R, Haskell (GHCi), Clojure, Ruby, Java, Octave, MATLAB, gnuplot, or C++ tmux REPL sessions (${DEFAULT_PYTHON_SESSION}, ${DEFAULT_JULIA_SESSION}, ${DEFAULT_R_SESSION}, ${DEFAULT_GHCI_SESSION}, ${DEFAULT_CLOJURE_SESSION}, ${DEFAULT_RUBY_SESSION}, ${DEFAULT_JAVA_SESSION}, ${DEFAULT_OCTAVE_SESSION}, ${DEFAULT_MATLAB_SESSION}, ${DEFAULT_GNUPLOT_SESSION}, ${DEFAULT_CPP_SESSION}). The complete response (submitted code and output) is truncated to ${DEFAULT_MAX_LINES} lines or ${formatSize(DEFAULT_MAX_BYTES)} (whichever is hit first); the full response is saved privately when truncated.`,
-		promptSnippet: "Execute a small snippet in the shared Python/IPython, Julia, R, Haskell (GHCi), Clojure, Ruby, Java, Octave, MATLAB, gnuplot, or C++ REPL and return its output.",
+		description: `Execute code in the shared default Python/IPython, Julia, R, Haskell (GHCi), Clojure, Ruby, Java, Octave, MATLAB, gnuplot, C++, or Fortran (LFortran) tmux REPL sessions (${DEFAULT_PYTHON_SESSION}, ${DEFAULT_JULIA_SESSION}, ${DEFAULT_R_SESSION}, ${DEFAULT_GHCI_SESSION}, ${DEFAULT_CLOJURE_SESSION}, ${DEFAULT_RUBY_SESSION}, ${DEFAULT_JAVA_SESSION}, ${DEFAULT_OCTAVE_SESSION}, ${DEFAULT_MATLAB_SESSION}, ${DEFAULT_GNUPLOT_SESSION}, ${DEFAULT_CPP_SESSION}, ${DEFAULT_LFORTRAN_SESSION}). The complete response (submitted code and output) is truncated to ${DEFAULT_MAX_LINES} lines or ${formatSize(DEFAULT_MAX_BYTES)} (whichever is hit first); the full response is saved privately when truncated.`,
+		promptSnippet: "Execute a small snippet in the shared Python/IPython, Julia, R, Haskell (GHCi), Clojure, Ruby, Java, Octave, MATLAB, gnuplot, C++, or Fortran REPL and return its output.",
 		promptGuidelines: [
 			"Use repl_send only after the relevant session has been started with repl_start, /repl, or /lab and is at a normal prompt. repl_send never auto-starts a missing session.",
-			"If the user asks to run code in Julia or in the shared Julia REPL, use target='julia'. If they ask to run code in R or in the shared R REPL, use target='r'. If they ask to run code in GHCi, Haskell, or the shared Haskell REPL, use target='ghci'. If they ask to run code in Clojure or in the shared Clojure REPL, use target='clojure'. If they ask to run code in Ruby or IRB or the shared Ruby REPL, use target='ruby'. If they ask to run code in Java or jshell or the shared Java REPL, use target='java'. For Octave use target='octave', for MATLAB use target='matlab', for gnuplot use target='gnuplot', and for C++ use target='cpp'. Otherwise use the shared Python/IPython session.",
+			"If the user asks to run code in Julia or in the shared Julia REPL, use target='julia'. If they ask to run code in R or in the shared R REPL, use target='r'. If they ask to run code in GHCi, Haskell, or the shared Haskell REPL, use target='ghci'. If they ask to run code in Clojure or in the shared Clojure REPL, use target='clojure'. If they ask to run code in Ruby or IRB or the shared Ruby REPL, use target='ruby'. If they ask to run code in Java or jshell or the shared Java REPL, use target='java'. For Octave use target='octave', for MATLAB use target='matlab', for gnuplot use target='gnuplot', for C++ use target='cpp', and for Fortran use target='lfortran'. Otherwise use the shared Python/IPython session.",
 			"Use repl_status before claiming whether the shared REPL is active if there has been a prior failure or a possible state change.",
 			"If you need context about prior direct REPL interaction, inspect repl_status details and read the session history file listed there.",
 			"The session history file is raw tmux pane output, so expect prompts and echoed input as well as results.",
@@ -2959,6 +3022,7 @@ export default function (pi: ExtensionAPI) {
 			"In Java, use top-level JShell snippets: imports, variables, methods, classes, expressions, or statements. Use System.out.println(...) for visible values; /open does not echo expression results. Submit complete snippets; native /open may discard an unfinished fragment. JShell commands such as /reset and /exit change or end the live session.",
 			"For Octave use repl_send target='octave'; for MATLAB use target='matlab'. They are separate runtimes: do not silently substitute one for the other. Send complete code; use disp or fprintf for explicit output. Code executes in the base workspace, with native semicolon and ans behaviour. MATLAB function definitions belong in .m files; run scripts or call functions from the current path. clear, clear all, exit and quit are deliberate state-changing actions. This does not control an existing MATLAB desktop session.",
 			"For C++ use target='cpp': an experimental Cling-based C++ REPL. Submit complete native prompt groups (put a function's opening brace on its declaration line); include ordinary definition/header files separately. Dot commands are terminal-only; use /repl stop cpp to stop. Earlier groups may run before a later error. Compiler/link diagnostics and caught C++ exceptions are retained; there is no replay. Exit, crashes and busy Ctrl-C can end the workspace. Completion means the evaluator returned, not that library calls succeeded. Do not queue control commands behind stdin reads or restart after timeout. Cling with matching development headers must already be on your login-shell PATH; no automatic installation or alternate-runtime fallback.",
+			"For Fortran use target='lfortran': the native LFortran prompt (experimental), which needs an LFortran with --status-file on your login-shell PATH. Each send is compiled and run as one cell, so a compile error anywhere in it means none of it runs; declarations and variables persist, also from direct terminal input. lfortranResult gives the cell number and ok (it ran) or error (it did not compile), with LFortran's diagnostics in the output. A runtime error or Ctrl-C ends the session, with no restart or replay. A READ from the terminal waits for the person; do not send its input as code.",
 			"For gnuplot use repl_send target='gnuplot'. This is its own persistent runtime, not another REPL's plotting backend. Send complete native scripts; use print for console results. Preserve the user's terminal, output, print destination and settings; export figures only when requested. reset and reset session deliberately change state. In a loaded script, exit/quit returns from that script; exit gnuplot ends the process. Avoid pause/input waits unless explicitly wanted.",
 			"Avoid blocking interactive input() prompts or long-running code unless the user explicitly wants that.",
 		],

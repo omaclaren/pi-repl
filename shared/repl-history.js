@@ -9,7 +9,7 @@ export function getPrivateReplHistoryRoot() {
 }
 
 /** Allocate a private raw log without reusing or truncating a prior session's log. */
-export function createPrivateReplHistoryFile(sessionName, root = getPrivateReplHistoryRoot()) {
+export function createPrivateReplHistoryFile(sessionName, root = getPrivateReplHistoryRoot(), suffix = "history.log") {
 	if (typeof sessionName !== "string" || !/^[a-z0-9-]{1,100}$/.test(sessionName)) {
 		throw new Error("Invalid REPL history session name.");
 	}
@@ -31,7 +31,7 @@ export function createPrivateReplHistoryFile(sessionName, root = getPrivateReplH
 
 	// The random, exclusively created filename isolates session lifetimes and
 	// tmux servers, even when their session names/IDs/creation seconds coincide.
-	const path = join(root, `${sessionName}-${randomUUID()}.history.log`);
+	const path = join(root, `${sessionName}-${randomUUID()}.${suffix}`);
 	closeSync(openSync(path, "wx", 0o600));
 	return path;
 }
