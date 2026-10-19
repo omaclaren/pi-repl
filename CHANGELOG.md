@@ -4,6 +4,8 @@ All notable changes to `pi-repl` are documented here.
 
 ## [Unreleased]
 
+## [0.10.0] — 2026-10-20
+
 ### Added
 - In Pi, the agent is told what its REPL panes showed since it last saw them before it plans: when a run starts, a message with that text is added, for the sessions it has started or sent to, within 6,000 characters and 3 seconds in all; panes left out or not checked in time are named. It counts as seen once the run starts, so the next send doesn't repeat it, and nothing is added when nothing changed. Prompts sent while the agent is working join the run without a new message. `PI_REPL_PANE_ACTIVITY=send` keeps the 0.9.0 behaviour of reporting only in send results; `off` still stops both. Attach instructions say which applies, and that the text reaches the model provider.
 
