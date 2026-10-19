@@ -4,6 +4,8 @@ All notable changes to `pi-repl` are documented here.
 
 ## [Unreleased]
 
+## [0.9.0] — 2026-10-20
+
 ### Added
 - `repl_send` starts its result with the pane text the agent has not seen since its own last send: typing at the prompt, other clients' sends, and late or background output. Each agent process keeps its own view, which only its sends advance, anchored on each send's unique loader line. `repl_status` previews the same text. Reports are bounded, labelled as untrusted terminal text, and stay out of the clean record. Attach instructions mention it, and `PI_REPL_PANE_ACTIVITY=off` turns it off.
 
