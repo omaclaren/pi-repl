@@ -65,6 +65,10 @@ The clean record includes submissions whose semantic boundaries are known to a c
 
 Canonical Markdown exports identify origin, mode, status, runtime, and timestamp and include this direct-input limitation.
 
+### Optional pane activity mark (outside protocol v1)
+
+So that an agent still learns about direct input, `pi-repl` keeps the tmux session option `@pi_repl_activity_mark`: base64 JSON `{"anchor": [...], "prompt": "..."}` naming the last pane lines when a send completed. Its next send reports, as raw text outside the record, what the pane shows after those lines. `shared/repl-pane-activity.js` implements the mark and the report. A client that updates the mark after its own sends keeps them out of the next report; a client that ignores the option is unaffected, and its sends appear in the report as another client's.
+
 ## Optional raw-history display and alignment anchors
 
 Compatible clients may add protocol-independent submission displays to the raw pane while retaining the same clean record. Display version 1 derives a non-secret 12-hex-character anchor as the first 12 characters of SHA-256 over `pi-repl-submission-display-v1`, a NUL byte, and the stable clean-record entry ID. The entry ID itself is not written to the pane. The short hash is labelled `id:` in both the input and completion markers; it is a correlation aid, not an execution signal. The hash derivation and record protocol remain unchanged.

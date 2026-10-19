@@ -37,6 +37,7 @@ import {
 } from "./shared/repl-control-files.js";
 
 import { createPrivateReplHistoryFile } from "./shared/repl-history.js";
+import { PANE_ACTIVITY_OPTION, decodePaneActivityMark, describePaneActivity, encodePaneActivityMark, markPaneActivity, paneActivitySince } from "./shared/repl-pane-activity.js";
 import { stopVerifiedReplSession } from "./shared/repl-session-stop.js";
 import { mStringLiteral, buildMLanguageControlSource, buildMLanguageDriverSource } from "./shared/repl-m-language.js";
 import { buildGnuplotSubmissionLine, buildGnuplotGuardSource, buildGnuplotDriverSource } from "./shared/repl-gnuplot.js";
@@ -280,6 +281,7 @@ type ReplSendDetails = {
 	truncation?: TruncationResult;
 	fullOutputPath?: string;
 	cppResult?: number;
+	paneActivity?: string;
 };
 
 const REPL_SEND_PARAMS = Type.Object({
@@ -699,6 +701,15 @@ async function readTmuxSessionOption(
 
 	const value = result.stdout.trim();
 	return value || undefined;
+}
+
+/** Records where the pane stands, for the next send to report what follows. */
+async function markPaneActivityAfter(pi: ExtensionAPI, sessionTarget: string, capture: string, cwd: string, onlyIfAbsent: boolean): Promise<void> {
+	const mark = markPaneActivity(capture);
+	if (!mark) return;
+	const value = encodePaneActivityMark(mark);
+	if (onlyIfAbsent) await setTmuxSessionOptionIfAbsent(pi, sessionTarget, PANE_ACTIVITY_OPTION, value, cwd);
+	else await setTmuxSessionOption(pi, sessionTarget, PANE_ACTIVITY_OPTION, value, cwd);
 }
 
 async function setTmuxSessionOptionIfAbsent(
@@ -1958,6 +1969,8 @@ async function runReplCode(
 	const sessionTarget = sessionInfo.tmuxSessionId || sessionName;
 	const paneTarget = await getPaneTarget(pi, sessionTarget, ctx.cwd);
 	const beforeCapture = await capturePaneOutput(pi, paneTarget, ctx.cwd);
+	const activityMark = decodePaneActivityMark(await readTmuxSessionOption(pi, sessionTarget, PANE_ACTIVITY_OPTION, ctx.cwd));
+	const paneActivity = activityMark ? describePaneActivity(paneActivitySince(beforeCapture, activityMark)) : undefined;
 	const cppPane = runtime === "cpp" ? await inspectCppPane(pi, paneTarget, ctx.cwd) : undefined;
 	if (runtime === "cpp" && (!cppPane || cppPane.dead)) throw new Error("The C++ pane is ended or cannot be inspected; no code was sent and no replacement was started.");
 	const echoMode = resolveReplSubmissionEchoMode(params.echoMode);
@@ -1998,6 +2011,8 @@ async function runReplCode(
 		);
 		submissionState.completionObserved = true;
 		const afterCapture = await capturePaneOutput(pi, paneTarget, ctx.cwd);
+		// The code has run, so a failed mark must not lose its result.
+		await markPaneActivityAfter(pi, sessionTarget, afterCapture, ctx.cwd, false).catch(() => undefined);
 		const cppResult = prepared.cppCompletion ? readCppCompletion(prepared.cppCompletion) : undefined;
 		const delta = extractPaneDelta(beforeCapture, afterCapture);
 		const output = cleanupReplDelta(delta, prepared.submissionLine, prepared.previewComment, prepared.completionLine, prepared.display);
@@ -2015,6 +2030,7 @@ async function runReplCode(
 				echoMode,
 				submissionAnchorId: prepared.display.enabled ? prepared.display.anchorId : undefined,
 				previewComment: prepared.previewComment,
+				paneActivity,
 			},
 		};
 	} catch (error) {
@@ -2194,6 +2210,7 @@ async function runRecordedReplCode(
 
 export function formatReplSendResult(output: string, details: ReplSendDetails): { text: string; details: ReplSendDetails } {
 	const fullText = [
+		...(details.paneActivity ? [details.paneActivity, ""] : []),
 		"Submitted code:",
 		details.submittedCode.trimEnd(),
 		"",
@@ -2333,6 +2350,16 @@ async function startDefaultReplSession(
 		}
 	}
 	const { info, ready } = await waitForReplSessionInfo(pi, cwd, sessionTarget, sessionName, runtime, timeoutMs, signal);
+	if (created && ready) {
+		// Typing between now and the first send is reported by that send. A
+		// reused session is left unchanged; its next send marks it.
+		try {
+			const target = info.tmuxSessionId || sessionTarget;
+			await markPaneActivityAfter(pi, target, await capturePaneOutput(pi, target, cwd), cwd, true);
+		} catch {
+			// Without a mark, the first send reports nothing; startup is unaffected.
+		}
+	}
 	if (!ready) warnings.push(`No normal prompt was confirmed within ${timeoutMs}ms. The session is left running; it may be busy, awaiting input, or using a custom prompt. Inspect it before sending code.`);
 	if (info.runtime && info.runtime !== runtime) warnings.push(`Requested ${runtime}, but the existing session reports ${info.runtime}. Its interpreter and state were preserved.`);
 	const text = [

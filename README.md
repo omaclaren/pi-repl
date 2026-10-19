@@ -25,6 +25,7 @@ With `pi-repl` you can:
 - start, attach to, inspect, and stop a shared Haskell (GHCi) REPL
 - start, attach to, inspect, and stop a shared Clojure, Ruby, Java, Octave, MATLAB, gnuplot, or C++ REPL
 - let pi read the raw shared REPL transcript for extra context when needed
+- tell pi, with its next send, what was typed in the shared REPL since its last one
 - keep a bounded clean record of compatible-client submissions and captured output, synchronized automatically with a compatible `pi-studio` using the same tmux session
 - show bounded, request-specific submitted code and compact alignment anchors in the raw pane by default, with Summary previews, Off for quiet output, and Full as an explicit opt-in
 - export that clean record as canonical Markdown
@@ -279,6 +280,8 @@ Custom launchers must preserve the reserved marker. Do not copy it or manually s
 Compatible clients publish a versioned opaque ID in tmux and store the bounded JSON snapshot in a private per-user temporary directory. The record is tied to the exact tmux session ID and creation time, uses atomic locked updates, and holds a shared send lease from pre-send capture through completion capture. If `repl_send` times out or is aborted after submission, that live client retains the lease until the runtime completion signal appears or the exact tmux session ends; caller cancellation does not stop code already running in the REPL. This serializes compatible Studio and `pi-repl` sends so they do not claim each other's output.
 
 The clean record does **not** infer semantic boundaries for commands typed directly into an attached tmux pane. Direct interaction remains in the raw pane/history mirror. `/repl export [target]` writes the canonical clean-record Markdown to a new no-clobber file in Pi's current working directory; its metadata identifies entry origin, mode, status, runtime, and timestamp and states the direct-input limitation.
+
+Instead, `repl_send` tells the agent what it missed. Each completed send marks where the pane stood, in the tmux session option `@pi_repl_activity_mark`; a session `pi-repl` creates is marked once its prompt is ready. The next send's result starts with whatever the pane shows after that mark: typing at the prompt, another client's sends, or late output from a send that timed out. The report holds at most 40 lines or 4,000 characters, is not parsed into code and output, and never enters the clean record.
 
 Existing sessions attach lazily. Unsupported versions and invalid or stale session identities are left untouched, with ordinary `pi-repl` behavior and raw history still available. See [`shared/REPL_SESSION_RECORD_PROTOCOL.md`](./shared/REPL_SESSION_RECORD_PROTOCOL.md) for protocol, safety, retention, and compatibility details.
 

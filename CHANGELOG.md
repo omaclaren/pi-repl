@@ -4,6 +4,9 @@ All notable changes to `pi-repl` are documented here.
 
 ## [Unreleased]
 
+### Added
+- `repl_send` reports what the pane showed since the last completed send: typing at the prompt, another client's sends, or late output from a send that timed out. The report comes before the submitted code, holds at most 40 lines or 4,000 characters, and stays out of the clean record. A session `pi-repl` creates is marked once its prompt is ready, so typing before the first send is reported too.
+
 ## [0.8.6] — 2026-10-19
 
 ### Fixed

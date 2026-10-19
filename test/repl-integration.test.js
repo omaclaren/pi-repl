@@ -709,6 +709,31 @@ test("repl_start leaves unfinished direct input alone and can confirm readiness 
 	assert.match((await f.send("print(pi_start_i)")).content[0].text, /Output:\n42/);
 });
 
+test("repl_send reports what was typed at the prompt since the last send", { timeout: 30000 }, async (t) => {
+	const f = await fixture(t, { startWithTool: true });
+	if (!f) return;
+	const pane = `${f.sessionName}:^`;
+	const type = async (line) => {
+		await f.tmux("send-keys", "-t", pane, "-l", line);
+		await f.tmux("send-keys", "-t", pane, "Enter");
+	};
+	await type("pi_direct = 41");
+	await type("pi_direct + 1");
+	await eventually(async () => /^42\n>>>$/m.test(await f.tmux("capture-pane", "-p", "-t", pane)));
+	// Typing since repl_start is reported, but not the startup banner.
+	const first = (await f.send("print(pi_direct * 2)")).content[0].text;
+	assert.match(first, /^Since the last completed send, the pane shows \(typed directly, another client's sends, or late output of a send that timed out\):\n>>> pi_direct = 41\n>>> pi_direct \+ 1\n42\n\nSubmitted code:\nprint\(pi_direct \* 2\)\n\nOutput:\n82$/);
+	assert.doesNotMatch(first, /Type "help"/);
+	// Nothing happened since that send.
+	assert.match((await f.send("print('quiet')")).content[0].text, /^Submitted code:\nprint\('quiet'\)\n\nOutput:\nquiet$/);
+	// Typing after a send is reported by the next send, also with echo off.
+	await type("pi_direct = 7");
+	await eventually(async () => (await f.tmux("capture-pane", "-p", "-t", pane)).trimEnd().endsWith(">>>"));
+	const later = (await f.send("print(pi_direct)", { echoMode: "off" })).content[0].text;
+	assert.match(later, /^Since the last completed send[^\n]*\n>>> pi_direct = 7\n\nSubmitted code:/);
+	assert.match(later, /Output:\n7$/);
+});
+
 test("a send pins its pane ID even if a lower-numbered window appears during execution", { timeout: 30000 }, async (t) => {
 	const f = await fixture(t, { index: 1 });
 	if (!f) return;
@@ -784,7 +809,9 @@ for (const mode of ["timeout", "abort", "session-ended"]) {
 		if (mode !== "session-ended") {
 			const result = await f.send("print('next request')");
 			assert.match(result.content[0].text, /Output:\nnext request/);
-			assert.doesNotMatch(result.content[0].text, /late result/);
+			// The late output is not this send's, but its report shows it.
+			assert.doesNotMatch(result.content[0].text.split("Output:\n")[1], /late result/);
+			assert.match(result.content[0].text.split("Submitted code:")[0], /late result/);
 		}
 	});
 }
@@ -1007,7 +1034,9 @@ for (const runtime of ["ruby", "java"]) {
 			await f.tmux("send-keys", "-t", `${f.sessionName}:^`, "C-m");
 			const shared = await f.send(runtime === "ruby" ? "pi_human_value" : "System.out.println(pi_human_value);");
 			assert.match(shared.content[0].text.split("Output:\n")[1], /51/);
-			assert.doesNotMatch(shared.content[0].text, /──|│|=> nil/);
+			assert.doesNotMatch(shared.content[0].text.split("Submitted code:")[1], /──|│|=> nil/);
+			// The direct input is reported, apart from the send's own output.
+			assert.match(shared.content[0].text.split("Submitted code:")[0], /^Since the last completed send[\s\S]*pi_human_value = pi_value \+ 10/);
 			status = (await f.status()).details[runtime];
 			assert.equal(status.recordEntries.length, 3);
 			assert.equal(status.recordEntries.at(-1).status, "captured");
@@ -1463,7 +1492,9 @@ for (const runtime of ["ghci", "ruby", "java"]) {
 			if (mode !== "session-ended") {
 				const next = await f.send({ ruby: 'puts "next request"', java: 'System.out.println("next request");', ghci: 'putStrLn "next request"' }[runtime]);
 				assert.match(next.content[0].text, /next request/);
-				assert.doesNotMatch(next.content[0].text, /late result/);
+				// The late output is not this send's, but its report shows it.
+				assert.doesNotMatch(next.content[0].text.split("Output:\n")[1], /late result/);
+				assert.match(next.content[0].text.split("Submitted code:")[0], /late result/);
 			}
 		});
 	}
