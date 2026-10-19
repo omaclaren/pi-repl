@@ -1084,7 +1084,9 @@ function buildClojureDisplayStatements(display: ReplSubmissionDisplay, indent = 
 // Prints the pane's cursor column, or exits non-zero; tmux gets 500 ms. A
 // wrapper runs it with Node and ends a line before its footer unless it
 // prints 0. Only the wrapper reads its output, so it never reaches the pane.
-const CURSOR_COLUMN_QUERY = 'try { process.stdout.write(require("node:child_process").execFileSync("tmux", ["-N", "display-message", "-p", "-t", process.env.TMUX_PANE, "#{cursor_x}"], { encoding: "utf8", timeout: 500, killSignal: "SIGKILL", maxBuffer: 128, stdio: ["ignore", "pipe", "ignore"] }).trim()); } catch { process.exitCode = 1; }';
+// process.exit ends Node even if a startup hook in NODE_OPTIONS would keep it
+// running, and each wrapper also limits the whole helper to 5 s.
+const CURSOR_COLUMN_QUERY = 'let code = 1; try { require("node:fs").writeSync(1, require("node:child_process").execFileSync("tmux", ["-N", "display-message", "-p", "-t", process.env.TMUX_PANE, "#{cursor_x}"], { encoding: "utf8", timeout: 500, killSignal: "SIGKILL", maxBuffer: 128, stdio: ["ignore", "pipe", "ignore"] }).trim()); code = 0; } catch {} process.exit(code);';
 
 function buildPythonFooter(display: ReplSubmissionDisplay): string[] {
 	if (!display.enabled) return [];
@@ -1150,12 +1152,21 @@ function buildJuliaFooter(display: ReplSubmissionDisplay): string[] {
 	const query = `Cmd([${juliaStringLiteral(process.execPath)}, "-e", ${juliaStringLiteral(CURSOR_COLUMN_QUERY)}])`;
 	return [
 		'    local __pi_repl_column = ""',
-		// read throws if the query fails; catch also takes an interrupt here.
+		"    local __pi_repl_query = nothing",
+		// The wait, not the read, is bounded: a child the helper started could
+		// keep the pipe open after the helper is killed. catch also takes an
+		// interrupt; on every path a helper still running is killed.
 		"    try",
 		"        flush(stdout)",
 		"        flush(stderr)",
-		`        __pi_repl_column = strip(read(pipeline(${query}, stdin=devnull, stderr=devnull), String))`,
+		`        __pi_repl_query = open(pipeline(${query}, stdin=devnull, stderr=devnull), "r")`,
+		"        __pi_repl_reader = @async read(__pi_repl_query, String)",
+		"        if timedwait(() -> istaskdone(__pi_repl_reader) && process_exited(__pi_repl_query), 5; pollint=0.01) === :ok && success(__pi_repl_query)",
+		"            __pi_repl_column = strip(fetch(__pi_repl_reader))",
+		"        end",
 		"    catch",
+		"    finally",
+		"        isnothing(__pi_repl_query) || process_exited(__pi_repl_query) || kill(__pi_repl_query, Base.SIGKILL)",
 		"    end",
 		'    __pi_repl_column == "0" || Base.println()',
 		...display.suffixLines.map((line) => `    Base.println(${juliaStringLiteral(line)})`),
@@ -1184,9 +1195,10 @@ function buildRFooter(display: ReplSubmissionDisplay): string[] {
 	if (!display.enabled) return [];
 	return [
 		"    try({ flush(stdout()); flush(stderr()) }, silent = TRUE)",
-		// system2 quotes the command but not its arguments. A failed query
-		// sets a status; an error or Ctrl-C here gives NULL, not a lost done file.
-		`    .__pi_repl_column <- tryCatch(suppressWarnings(system2(${JSON.stringify(process.execPath)}, c("-e", ${JSON.stringify(shellQuote(CURSOR_COLUMN_QUERY))}), stdout = TRUE, stderr = FALSE)), error = function(e) NULL, interrupt = function(e) NULL)`,
+		// system2 quotes the command but not its arguments, and kills it after
+		// 5 s. A failed query sets a status; an error or Ctrl-C here gives
+		// NULL, not a lost done file.
+		`    .__pi_repl_column <- tryCatch(suppressWarnings(system2(${JSON.stringify(process.execPath)}, c("-e", ${JSON.stringify(shellQuote(CURSOR_COLUMN_QUERY))}), stdout = TRUE, stderr = FALSE, timeout = 5)), error = function(e) NULL, interrupt = function(e) NULL)`,
 		'    if (!is.null(attr(.__pi_repl_column, "status")) || !identical(trimws(paste(.__pi_repl_column, collapse = "")), "0")) base::cat("\\n")',
 		...display.suffixLines.map((line) => `    base::cat(${JSON.stringify(`${line}\n`)})`),
 	];
@@ -1326,16 +1338,27 @@ function buildClojureFooter(display: ReplSubmissionDisplay): string[] {
 	return [
 		"      (try (.flush *out*) (.flush *err*) (catch Throwable _))",
 		// An interrupt left pending by the code would end the wait at once, so
-		// it is cleared for the query and restored afterwards, as is one that
-		// arrives during the wait. The query is killed on every path.
+		// it is cleared for the query and restored afterwards. One that arrives
+		// during the wait is noted and the wait goes on: killing Node early
+		// would leave its tmux child running. The query is killed after 5 s.
 		"      (let [pi-repl-interrupted (volatile! (Thread/interrupted))",
 		`            pi-repl-query (try (.start (.redirectError ${builder} java.lang.ProcessBuilder$Redirect/DISCARD)) (catch Throwable _ nil))`,
+		"            pi-repl-deadline (+ (System/nanoTime) 5000000000)",
 		"            pi-repl-column (when pi-repl-query",
 		"                             (try",
 		"                               (.close (.getOutputStream pi-repl-query))",
-		"                               (when (and (.waitFor pi-repl-query 5 java.util.concurrent.TimeUnit/SECONDS) (zero? (.exitValue pi-repl-query)))",
-		"                                 (.trim ^String (slurp (.getInputStream pi-repl-query))))",
-		"                               (catch InterruptedException _ (vreset! pi-repl-interrupted true) nil)",
+		"                               (when (and (loop []",
+		"                                            (let [left (- pi-repl-deadline (System/nanoTime))",
+		"                                                  exited (when (pos? left)",
+		"                                                           (try (.waitFor pi-repl-query left java.util.concurrent.TimeUnit/NANOSECONDS)",
+		"                                                             (catch InterruptedException _ (vreset! pi-repl-interrupted true) :interrupted)))]",
+		"                                              (if (= exited :interrupted) (recur) exited)))",
+		"                                          (zero? (.exitValue pi-repl-query)))",
+		// Only what is waiting: a child of Node could hold the pipe open.
+		"                                 (let [in (.getInputStream pi-repl-query)",
+		"                                       bytes (byte-array (min 32 (.available in)))",
+		"                                       n (.read in bytes)]",
+		'                                   (.trim (String. bytes 0 (int (max 0 n)) "UTF-8"))))',
 		"                               (catch Throwable _ nil)",
 		"                               (finally (.destroyForcibly pi-repl-query))))]",
 		"        (when @pi-repl-interrupted (.interrupt (Thread/currentThread)))",
