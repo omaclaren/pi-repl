@@ -34,6 +34,11 @@ function fixture({ runtime = "python", exists = false, prompt = ">>>", ...option
 		registerTool: (tool) => tools.set(tool.name, tool),
 		registerCommand: (name, command) => commands.set(name, command),
 		async exec(command, args) {
+			// Every tmux command needs -u, or a non-UTF-8 locale turns tabs into `_`.
+			if (command === "tmux") {
+				assert.equal(args[0], "-u", `tmux without -u: ${args.join(" ")}`);
+				args = args.slice(1);
+			}
 			calls.push({ command, args: [...args] });
 			const ok = (stdout = "") => ({ code: 0, stdout, stderr: "" });
 			const fail = (stderr = "test: missing session") => ({ code: 1, stdout: "", stderr });

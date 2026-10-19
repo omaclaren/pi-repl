@@ -135,7 +135,8 @@ export function createTestTmux(t, { cwd, env, config, trackDetachedGnuplot = fal
 	const ledgerPath = join(socketDir, "processes.log");
 	writeFileSync(ledgerPath, "", { mode: 0o600, flag: "wx" });
 	const processes = new OwnedTestProcesses({ ledgerPath, discoverDetached: trackDetachedGnuplot ? createDetachedGnuplotTestObserver(cwd) : undefined });
-	const raw = (args, options = {}) => exec("tmux", [...(args[0] === "new-session" ? [] : ["-N"]), "-S", socketPath, "-f", config, ...args], {
+	// -u keeps the tabs in -F output under any locale, as pi-repl does.
+	const raw = (args, options = {}) => exec("tmux", ["-u", ...(args[0] === "new-session" ? [] : ["-N"]), "-S", socketPath, "-f", config, ...args], {
 		env, cwd, timeout: 10000, maxBuffer: 8 * 1024 * 1024, ...options,
 	});
 	async function observe() {

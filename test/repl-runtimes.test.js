@@ -11,6 +11,10 @@ function fixture() {
 		registerTool: (tool) => tools.set(tool.name, tool),
 		registerCommand: (name, command) => commands.set(name, command),
 		async exec(command, args) {
+			if (command === "tmux") {
+				assert.equal(args[0], "-u", `tmux without -u: ${args.join(" ")}`);
+				args = args.slice(1);
+			}
 			calls.push({ command, args });
 			return { code: command === "tmux" ? 1 : 0, stdout: "", stderr: "test: no session" };
 		},
@@ -61,6 +65,8 @@ for (const outcome of ['ended', 'still-live', 'inspection-error']) {
 			registerCommand() {},
 			async exec(command, args) {
 				assert.equal(command, 'tmux');
+				assert.equal(args[0], '-u');
+				args = args.slice(1);
 				if (args[0] === 'has-session') {
 					if (!args.includes('=pi-repl-matlab')) return { code: 1, stdout: '', stderr: "can't find session" };
 					checks++;

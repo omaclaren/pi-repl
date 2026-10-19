@@ -580,7 +580,9 @@ async function execTmux(
 	cwd: string,
 	timeout = 5_000,
 ): Promise<{ code: number; stdout: string; stderr: string }> {
-	const result = await pi.exec("tmux", args, { cwd, timeout });
+	// Unless the locale is UTF-8 (LANG is unset in some terminals), tmux prints
+	// the tabs in -F output as `_`; -u keeps them, so pane listings parse.
+	const result = await pi.exec("tmux", ["-u", ...args], { cwd, timeout });
 	return {
 		code: result.code ?? 1,
 		stdout: result.stdout ?? "",

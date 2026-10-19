@@ -118,6 +118,11 @@ async function fixture(t, { index = 0, runtime = "python", controlName, startWit
 		registerTool: (tool) => tools.set(tool.name, tool),
 		registerCommand: (name, definition) => commands.set(name, definition),
 		async exec(command, args, options) {
+			// pi-repl passes -u to every tmux command; the harness adds its own.
+			if (command === "tmux") {
+				assert.equal(args[0], "-u", `tmux without -u: ${args.join(" ")}`);
+				args = args.slice(1);
+			}
 			calls.push({ command, args: [...args] });
 			try {
 				if (command === "tmux" && args[0] === "if-shell" && beforeStop) await beforeStop();
