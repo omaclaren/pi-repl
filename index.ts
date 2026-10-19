@@ -772,7 +772,7 @@ async function preparePromptStartPaneActivity(pi: ExtensionAPI, cwd: string): Pr
 			views.delete(key);
 			continue;
 		}
-		if (!sessionId || !/^\d+$/.test(createdAt ?? "")) {
+		if (!/^\$\d+$/.test(sessionId ?? "") || !/^\d+$/.test(createdAt ?? "")) {
 			unchecked.push(view.sessionName);
 			continue;
 		}
@@ -800,11 +800,17 @@ async function preparePromptStartPaneActivity(pi: ExtensionAPI, cwd: string): Pr
 	}
 	if (sections.length === 0 && tooLong.length === 0 && unchecked.length === 0) return undefined;
 	const later = "The next send to each, or repl_status, shows its text.";
+	// Old views of restarted sessions share names, so list each name once,
+	// and only a few, to keep within the room kept for these notes.
+	const names = (list: string[]) => {
+		const unique = [...new Set(list)];
+		return unique.length > 5 ? `${unique.slice(0, 5).join(", ")} and ${unique.length - 5} more` : unique.join(", ");
+	};
 	const content = [
 		PROMPT_START_INTRO,
 		...sections,
-		...(tooLong.length > 0 ? [`[Left out for length: ${tooLong.join(", ")}. ${later}]`] : []),
-		...(unchecked.length > 0 ? [`[Not checked in time, or could not be read: ${unchecked.join(", ")}. ${later}]`] : []),
+		...(tooLong.length > 0 ? [`[Left out for length: ${names(tooLong)}. ${later}]`] : []),
+		...(unchecked.length > 0 ? [`[Not checked in time, or could not be read: ${names(unchecked)}. ${later}]`] : []),
 	].join("\n\n");
 	return { message: { customType: "pi-repl-pane-activity", content, display: true }, views: advanced };
 }

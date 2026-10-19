@@ -862,6 +862,9 @@ test("a pane that can't be checked when a run starts is named and kept, within t
 	// tmux failing for another reason than a missing pane.
 	f.onExec(async (command, args) => (command === "tmux" && owner(args) ? { stdout: "", stderr: "server exited unexpectedly", code: 1, killed: false } : undefined));
 	assert.match(await promptStart(), notChecked);
+	// An answer that isn't a session identity.
+	f.onExec(async (command, args) => (command === "tmux" && owner(args) ? { stdout: "not-a-session-id\t1001", stderr: "", code: 0, killed: false } : undefined));
+	assert.match(await promptStart(), notChecked);
 	// A capture killed at its timeout, which Pi reports with code 0.
 	f.onExec(async (command, args) => (command === "tmux" && args[0] === "capture-pane" ? { stdout: "", stderr: "", code: 0, killed: true } : undefined));
 	assert.match(await promptStart(), notChecked);
