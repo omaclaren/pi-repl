@@ -1094,24 +1094,32 @@ test("ruby preserves interpolation, literal hashes, Unicode, escapes and error r
 	assert.equal(readdirSync(process.env.PI_REPL_CONTROL_ROOT).length, 0);
 });
 
-for (const runtime of ["ghci", "ruby", "java"]) {
+// Output that does not end a line still ends before the done marker.
+const footerCases = [
+	{ expected: "42\n", ruby: 'puts "42"', java: 'System.out.println("42");', ghci: 'putStrLn "42"', python: 'print("42")', julia: 'println("42")', r: 'cat("42\\n")', clojure: '(println "42")' },
+	{ expected: "no newline\n", ruby: 'print "no newline"', java: 'System.out.print("no newline");', ghci: 'putStr "no newline"', python: 'print("no newline", end="")', julia: 'print("no newline")', r: 'cat("no newline")', clojure: '(print "no newline")' },
+	{ expected: "stderr tail\n", ruby: '$stderr.print "stderr tail"', java: 'System.err.print("stderr tail");', ghci: 'System.IO.hPutStr System.IO.stderr "stderr tail"', python: 'import sys; print("stderr tail", end="", file=sys.stderr)', julia: 'print(stderr, "stderr tail")', r: 'cat("stderr tail", file = stderr())', clojure: '(binding [*out* *err*] (print "stderr tail"))' },
+	{ expected: "λ 🧪\n", ruby: 'print "λ 🧪"', java: 'System.out.print("λ 🧪");', ghci: 'putStr "λ 🧪"', python: 'print("λ 🧪", end="")', julia: 'print("λ 🧪")', r: 'cat("λ 🧪")', clojure: '(print "λ 🧪")' },
+	{ expected: "x".repeat(80) + "\n", ruby: `print "${"x".repeat(80)}"`, java: `System.out.print("${"x".repeat(80)}");`, ghci: `putStr "${"x".repeat(80)}"`, python: 'print("x" * 80, end="")', julia: 'print("x" ^ 80)', r: 'cat(strrep("x", 80))', clojure: '(print (apply str (repeat 80 "x")))' },
+	{ expected: "first\n\nlast\n\n", ruby: 'print "first\\n\\nlast\\n\\n"', java: 'System.out.print("first\\n\\nlast\\n\\n");', ghci: 'putStr "first\\n\\nlast\\n\\n"', python: 'print("first\\n\\nlast\\n\\n", end="")', julia: 'print("first\\n\\nlast\\n\\n")', r: 'cat("first\\n\\nlast\\n\\n")', clojure: '(print "first\\n\\nlast\\n\\n")' },
+	{ expected: "", ruby: 'nil', java: ';', ghci: 'let pi_quiet = 1', python: 'pass', julia: 'nothing', r: 'invisible(NULL)', clojure: 'nil' },
+];
+const footerFallbackCode = { ruby: 'print "query fallback"', java: 'System.out.print("query fallback");', ghci: 'putStr "query fallback"', python: 'print("query fallback", end="")', ipython: 'print("query fallback", end="")', julia: 'print("query fallback")', r: 'cat("query fallback")', clojure: '(print "query fallback")' };
+
+for (const runtime of ["ghci", "ruby", "java", "python", "ipython", "julia", "r", "clojure"]) {
+	const optional = runtime !== "python" && !(optionalRuntimes.has("all") || optionalRuntimes.has(runtime));
 	test(`${runtime} compact display preserves non-newline output and user blank lines`, {
-		timeout: 60000, skip: !(optionalRuntimes.has("all") || optionalRuntimes.has(runtime)),
+		timeout: 60000, skip: optional,
 	}, async (t) => {
 		const f = await fixture(t, { runtime, index: 1 });
 		if (!f) return;
-		const cases = [
-			['puts "42"', 'System.out.println("42");', "42\n", 'putStrLn "42"'],
-			['print "no newline"', 'System.out.print("no newline");', "no newline\n", 'putStr "no newline"'],
-			['$stderr.print "stderr tail"', 'System.err.print("stderr tail");', "stderr tail\n", 'System.IO.hPutStr System.IO.stderr "stderr tail"'],
-			['print "λ 🧪"', 'System.out.print("λ 🧪");', "λ 🧪\n", 'putStr "λ 🧪"'],
-			[`print "${"x".repeat(80)}"`, `System.out.print("${"x".repeat(80)}");`, "x".repeat(80) + "\n", `putStr "${"x".repeat(80)}"`],
-			['print "first\\n\\nlast\\n\\n"', 'System.out.print("first\\n\\nlast\\n\\n");', "first\n\nlast\n\n", 'putStr "first\\n\\nlast\\n\\n"'],
-			['nil', ';', "", 'let pi_quiet = 1'],
-		];
+		// Julia redraws a wrapped include line, leaving copies of it in the
+		// output; that is a separate problem from the footer.
+		if (runtime === "julia") await f.tmux("resize-window", "-t", `${f.sessionName}:^`, "-x", "320");
 		for (const echoMode of ["summary", "full"]) {
-			for (const [ruby, java, expected, ghci] of cases) {
-				const result = await f.send({ ruby, java, ghci }[runtime], { echoMode });
+			for (const footerCase of footerCases) {
+				const { expected } = footerCase;
+				const result = await f.send(footerCase[runtime === "ipython" ? "python" : runtime], { echoMode });
 				assert.equal(result.content[0].text.split("Output:\n")[1], expected.trim() || "(no output)");
 				const pane = await f.tmux("capture-pane", "-p", "-J", "-t", `${f.sessionName}:^`, "-S", "-1000");
 				const begin = `── pi-repl · input · 1 line · id: ${result.details.submissionAnchorId} ──`;
@@ -1132,17 +1140,17 @@ for (const runtime of ["ghci", "ruby", "java"]) {
 
 	for (const failure of ["unavailable", "timeout"]) {
 		test(`${runtime} footer falls back safely when its cursor query is ${failure}`, {
-			timeout: 30000, skip: !(optionalRuntimes.has("all") || optionalRuntimes.has(runtime)),
+			timeout: 30000, skip: optional,
 		}, async (t) => {
 			const f = await fixture(t, { runtime });
 			if (!f) return;
+			if (runtime === "julia") await f.tmux("resize-window", "-t", `${f.sessionName}:^`, "-x", "320");
 			const realTmux = binary("tmux");
 			const pidPath = join(f.cwd, "query.pid");
 			// Only the runtime's own query sees TMUX_PANE. Harness calls still
 			// reach the real tmux on this fixture's isolated server.
 			writeFileSync(join(f.cwd, "bin", "tmux"), `#!/bin/sh\nif [ -n "\${TMUX_PANE:-}" ]; then\n  echo $$ > ${quote(pidPath)}\n  ${failure === "timeout" ? 'exec /bin/sleep 10' : 'exit 23'}\nfi\nexec ${quote(realTmux)} "$@"\n`, { mode: 0o700 });
-			const code = { ruby: 'print "query fallback"', java: 'System.out.print("query fallback");', ghci: 'putStr "query fallback"' }[runtime];
-			const result = await f.send(code, { timeoutMs: 4000 });
+			const result = await f.send(footerFallbackCode[runtime], { timeoutMs: 4000 });
 			assert.equal(result.content[0].text.split("Output:\n")[1], "query fallback");
 			const pane = await f.tmux("capture-pane", "-p", "-J", "-t", `${f.sessionName}:^`, "-S", "-80");
 			assert.match(pane, /── output ──\nquery fallback\n── done/);

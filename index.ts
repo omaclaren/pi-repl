@@ -1081,9 +1081,35 @@ function buildClojureDisplayStatements(display: ReplSubmissionDisplay, indent = 
 	return display.prefixLines.map((line) => `${indent}(clojure.core/println ${JSON.stringify(line)})`);
 }
 
+// Prints the pane's cursor column, or exits non-zero; tmux gets 500 ms. A
+// wrapper runs it with Node and ends a line before its footer unless it
+// prints 0. Only the wrapper reads its output, so it never reaches the pane.
+const CURSOR_COLUMN_QUERY = 'try { process.stdout.write(require("node:child_process").execFileSync("tmux", ["-N", "display-message", "-p", "-t", process.env.TMUX_PANE, "#{cursor_x}"], { encoding: "utf8", timeout: 500, killSignal: "SIGKILL", maxBuffer: 128, stdio: ["ignore", "pipe", "ignore"] }).trim()); } catch { process.exitCode = 1; }';
+
+function buildPythonFooter(display: ReplSubmissionDisplay): string[] {
+	if (!display.enabled) return [];
+	return [
+		"    import subprocess as __pi_repl_subprocess",
+		"    import sys as __pi_repl_sys",
+		"    __pi_repl_column = ''",
+		"    try:",
+		"        __pi_repl_sys.stdout.flush()",
+		"        __pi_repl_sys.stderr.flush()",
+		`        __pi_repl_query = __pi_repl_subprocess.run([${JSON.stringify(process.execPath)}, '-e', ${JSON.stringify(CURSOR_COLUMN_QUERY)}], stdin=__pi_repl_subprocess.DEVNULL, stdout=__pi_repl_subprocess.PIPE, stderr=__pi_repl_subprocess.DEVNULL, timeout=5)`,
+		"        if __pi_repl_query.returncode == 0:",
+		"            __pi_repl_column = __pi_repl_query.stdout.decode('utf-8', 'replace').strip()",
+		// run() kills the query on any exception. Ctrl-C here must not skip the done file.
+		"    except BaseException:",
+		"        pass",
+		"    if __pi_repl_column != '0':",
+		"        __pi_repl_builtins.print()",
+		...display.suffixLines.map((line) => `    __pi_repl_builtins.print(${JSON.stringify(line)})`),
+	];
+}
+
 function buildPythonControlSource(runtime: PythonRuntime, code: string, doneFile: string, display: ReplSubmissionDisplay): string {
 	const prefix = buildPythonDisplayStatements(display);
-	const completion = display.suffixLines.map((line) => `    __pi_repl_builtins.print(${JSON.stringify(line)})`);
+	const completion = buildPythonFooter(display);
 	if (runtime === "ipython") {
 		return [
 			"from pathlib import Path as __pi_repl_path",
@@ -1119,8 +1145,25 @@ function buildPythonControlSource(runtime: PythonRuntime, code: string, doneFile
 	].join("\n");
 }
 
+function buildJuliaFooter(display: ReplSubmissionDisplay): string[] {
+	if (!display.enabled) return [];
+	const query = `Cmd([${juliaStringLiteral(process.execPath)}, "-e", ${juliaStringLiteral(CURSOR_COLUMN_QUERY)}])`;
+	return [
+		'    local __pi_repl_column = ""',
+		// read throws if the query fails; catch also takes an interrupt here.
+		"    try",
+		"        flush(stdout)",
+		"        flush(stderr)",
+		`        __pi_repl_column = strip(read(pipeline(${query}, stdin=devnull, stderr=devnull), String))`,
+		"    catch",
+		"    end",
+		'    __pi_repl_column == "0" || Base.println()',
+		...display.suffixLines.map((line) => `    Base.println(${juliaStringLiteral(line)})`),
+	];
+}
+
 function buildJuliaControlSource(code: string, doneFile: string, display: ReplSubmissionDisplay): string {
-	const completion = display.suffixLines.map((line) => `    Base.println(${juliaStringLiteral(line)})`);
+	const completion = buildJuliaFooter(display);
 	return [
 		...buildJuliaDisplayStatements(display),
 		"try",
@@ -1137,8 +1180,20 @@ function buildJuliaControlSource(code: string, doneFile: string, display: ReplSu
 	].join("\n");
 }
 
+function buildRFooter(display: ReplSubmissionDisplay): string[] {
+	if (!display.enabled) return [];
+	return [
+		"    try({ flush(stdout()); flush(stderr()) }, silent = TRUE)",
+		// system2 quotes the command but not its arguments. A failed query
+		// sets a status; an error or Ctrl-C here gives NULL, not a lost done file.
+		`    .__pi_repl_column <- tryCatch(suppressWarnings(system2(${JSON.stringify(process.execPath)}, c("-e", ${JSON.stringify(shellQuote(CURSOR_COLUMN_QUERY))}), stdout = TRUE, stderr = FALSE)), error = function(e) NULL, interrupt = function(e) NULL)`,
+		'    if (!is.null(attr(.__pi_repl_column, "status")) || !identical(trimws(paste(.__pi_repl_column, collapse = "")), "0")) base::cat("\\n")',
+		...display.suffixLines.map((line) => `    base::cat(${JSON.stringify(`${line}\n`)})`),
+	];
+}
+
 function buildRControlSource(code: string, doneFile: string, display: ReplSubmissionDisplay): string {
-	const completion = display.suffixLines.map((line) => `    base::cat(${JSON.stringify(`${line}\n`)})`);
+	const completion = buildRFooter(display);
 	return [
 		"local({",
 		...buildRDisplayStatements(display, "  "),
@@ -1265,8 +1320,33 @@ function buildJavaControlSource(code: string, doneFile: string, display: ReplSub
 	return [...prefix, code.replace(/\r/g, "").trimEnd(), ""].join("\n");
 }
 
+function buildClojureFooter(display: ReplSubmissionDisplay): string[] {
+	if (!display.enabled) return [];
+	const builder = `(java.lang.ProcessBuilder. ^java.util.List [${JSON.stringify(process.execPath)} "-e" ${JSON.stringify(CURSOR_COLUMN_QUERY)}])`;
+	return [
+		"      (try (.flush *out*) (.flush *err*) (catch Throwable _))",
+		// An interrupt left pending by the code would end the wait at once, so
+		// it is cleared for the query and restored afterwards, as is one that
+		// arrives during the wait. The query is killed on every path.
+		"      (let [pi-repl-interrupted (volatile! (Thread/interrupted))",
+		`            pi-repl-query (try (.start (.redirectError ${builder} java.lang.ProcessBuilder$Redirect/DISCARD)) (catch Throwable _ nil))`,
+		"            pi-repl-column (when pi-repl-query",
+		"                             (try",
+		"                               (.close (.getOutputStream pi-repl-query))",
+		"                               (when (and (.waitFor pi-repl-query 5 java.util.concurrent.TimeUnit/SECONDS) (zero? (.exitValue pi-repl-query)))",
+		"                                 (.trim ^String (slurp (.getInputStream pi-repl-query))))",
+		"                               (catch InterruptedException _ (vreset! pi-repl-interrupted true) nil)",
+		"                               (catch Throwable _ nil)",
+		"                               (finally (.destroyForcibly pi-repl-query))))]",
+		"        (when @pi-repl-interrupted (.interrupt (Thread/currentThread)))",
+		'        (when-not (= pi-repl-column "0") (clojure.core/println))',
+		...display.suffixLines.map((line) => `        (clojure.core/println ${JSON.stringify(line)})`),
+		"        nil)",
+	];
+}
+
 function buildClojureControlSource(code: string, doneFile: string, display: ReplSubmissionDisplay): string {
-	const completion = display.suffixLines.map((line) => `      (clojure.core/println ${JSON.stringify(line)})`);
+	const completion = buildClojureFooter(display);
 	return [
 		"(let [code " + JSON.stringify(code) + "]",
 		...buildClojureDisplayStatements(display, "  "),
