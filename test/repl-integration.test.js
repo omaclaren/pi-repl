@@ -114,6 +114,7 @@ async function fixture(t, { index = 0, runtime = "python", controlName, startWit
 	let afterEnter;
 	let beforePaste;
 	let beforeStop;
+	let execOverride;
 	const handlers = new Map();
 	const pi = {
 		registerTool: (tool) => tools.set(tool.name, tool),
@@ -126,6 +127,10 @@ async function fixture(t, { index = 0, runtime = "python", controlName, startWit
 				args = args.slice(1);
 			}
 			calls.push({ command, args: [...args] });
+			if (execOverride) {
+				const overridden = await execOverride(command, args, options);
+				if (overridden) return overridden;
+			}
 			try {
 				if (command === "tmux" && args[0] === "if-shell" && beforeStop) await beforeStop();
 				if (command === "tmux" && args[0] === "paste-buffer" && beforePaste) await beforePaste();
@@ -205,7 +210,7 @@ async function fixture(t, { index = 0, runtime = "python", controlName, startWit
 	} catch (error) {
 		throw new Error(`${runtime} startup failed: ${startupOutput}`, { cause: error });
 	}
-	return { cwd, calls, notifications, tmux, sessionName, target, repl, send, status, start, otherAgent, fire, owned: () => tmuxHarness.owned(), cleanup: () => tmuxHarness.cleanup(), onEnter: (callback) => { afterEnter = callback; }, onBeforePaste: (callback) => { beforePaste = callback; }, onBeforeStop: (callback) => { beforeStop = callback; } };
+	return { cwd, calls, notifications, tmux, sessionName, target, repl, send, status, start, otherAgent, fire, onExec: (override) => { execOverride = override; }, owned: () => tmuxHarness.owned(), cleanup: () => tmuxHarness.cleanup(), onEnter: (callback) => { afterEnter = callback; }, onBeforePaste: (callback) => { beforePaste = callback; }, onBeforeStop: (callback) => { beforeStop = callback; } };
 }
 
 async function assertCompletionGap(f, result) {
@@ -777,7 +782,7 @@ test("repl_send reports pane text this agent has not seen", { timeout: 60000 }, 
 	// repl_status previews it without marking it seen.
 	const status = (await f.status()).content[0].text;
 	assert.match(status, /\n\nPane text since this agent last saw this pane \(a preview; it is still reported later\)[^\n]*\n\[pane text\]\n>>> pi_repeat = 3; print\('one\\ntwo\\nthree'\)\none\ntwo\nthree\n\[end of pane text\]$/);
-	assert.match(status, /\nPane text, including what is typed there, goes to the agent at the start of each prompt and with its sends; PI_REPL_PANE_ACTIVITY=send keeps it to sends, and =off stops it\.\n/);
+	assert.match(status, /\nPane text, including what is typed there, goes to the agent and its model provider when a run starts and with its sends; PI_REPL_PANE_ACTIVITY=send keeps it to sends, and =off stops it\.\n/);
 	assert.equal(paneReport(await f.send("print(pi_repeat)")), `${PANE_HEADING}\n[pane text]\n>>> pi_repeat = 3; print('one\\ntwo\\nthree')\none\ntwo\nthree\n[end of pane text]`);
 });
 
@@ -834,7 +839,7 @@ test("pane text reaches the agent at the start of a prompt, once, for panes it h
 	});
 	process.env.PI_REPL_PANE_ACTIVITY = "send";
 	assert.equal(await promptStart(), undefined);
-	assert.match((await f.status()).content[0].text, /\nPane text, including what is typed there, goes to the agent with its next send; PI_REPL_PANE_ACTIVITY=off stops this\.\n/);
+	assert.match((await f.status()).content[0].text, /\nPane text, including what is typed there, goes to the agent and its model provider with its next send; PI_REPL_PANE_ACTIVITY=off stops this\.\n/);
 	assert.match(paneReport(await f.send("print(pi_prompt)")), /\n>>> pi_prompt = 12\n/);
 	delete process.env.PI_REPL_PANE_ACTIVITY;
 	// A new session forgets the panes, so nothing is added until they are used again.
@@ -843,6 +848,36 @@ test("pane text reaches the agent at the start of a prompt, once, for panes it h
 	await f.fire("session_start", { reason: "new" });
 	assert.equal(await promptStart(), undefined);
 	assert.match(paneReport(await f.send("print(pi_prompt)")), /^This agent has not seen this session's pane before[\s\S]*pi_prompt = 13/);
+});
+
+test("a pane that can't be checked when a run starts is named and kept, within the time limit", { timeout: 60000 }, async (t) => {
+	const f = await fixture(t, { startWithTool: true });
+	if (!f) return;
+	const promptStart = async () => (await f.fire("before_agent_start", { prompt: "next" })).find(Boolean)?.message?.content;
+	await typeAtPrompt(f, "pi_check = 21");
+	await paneSettles(f, /pi_check = 21\n>>>$/m);
+	const pane = `${f.sessionName}:^`;
+	const owner = (args) => args[0] === "display-message" && args.at(-1) === "#{session_id}\t#{session_created}";
+	const notChecked = /\n\n\[Not checked in time, or could not be read: pi-repl-python\. The next send to each, or repl_status, shows its text\.\]$/;
+	// tmux failing for another reason than a missing pane.
+	f.onExec(async (command, args) => (command === "tmux" && owner(args) ? { stdout: "", stderr: "server exited unexpectedly", code: 1, killed: false } : undefined));
+	assert.match(await promptStart(), notChecked);
+	// A capture killed at its timeout, which Pi reports with code 0.
+	f.onExec(async (command, args) => (command === "tmux" && args[0] === "capture-pane" ? { stdout: "", stderr: "", code: 0, killed: true } : undefined));
+	assert.match(await promptStart(), notChecked);
+	// Slow checks stop at the run start's time limit.
+	const identity = await f.tmux("display-message", "-p", "-t", pane, "#{session_id}\t#{session_created}");
+	f.onExec(async (command, args, options) => {
+		if (command !== "tmux" || !(owner(args) || args[0] === "capture-pane")) return undefined;
+		await new Promise((resolve) => setTimeout(resolve, Math.min(options.timeout, 1900)));
+		return owner(args) ? { stdout: identity, stderr: "", code: 0, killed: false } : { stdout: "", stderr: "", code: 0, killed: true };
+	});
+	const began = Date.now();
+	assert.match(await promptStart(), notChecked);
+	assert.ok(Date.now() - began < 4000, `took ${Date.now() - began} ms`);
+	// The pane stays enrolled, so its text is reported once tmux answers again.
+	f.onExec(undefined);
+	assert.match(await promptStart(), /\[pane text\]\n>>> pi_check = 21\n\[end of pane text\]/);
 });
 
 test("long output lines and PI_REPL_PANE_ACTIVITY=off", { timeout: 60000 }, async (t) => {
