@@ -5,7 +5,7 @@ All notable changes to `pi-repl` are documented here.
 ## [Unreleased]
 
 ### Added
-- `repl_send` reports what the pane showed since the last completed send: typing at the prompt, another client's sends, or late output from a send that timed out. The report comes before the submitted code, holds at most 40 lines or 4,000 characters, and stays out of the clean record. A session `pi-repl` creates is marked once its prompt is ready, so typing before the first send is reported too.
+- `repl_send` starts its result with the pane text the agent has not seen since its own last send: typing at the prompt, other clients' sends, and late or background output. Each agent process keeps its own view, which only its sends advance, anchored on each send's unique loader line. `repl_status` previews the same text. Reports are bounded, labelled as untrusted terminal text, and stay out of the clean record. Attach instructions mention it, and `PI_REPL_PANE_ACTIVITY=off` turns it off.
 
 ## [0.8.6] — 2026-10-19
 

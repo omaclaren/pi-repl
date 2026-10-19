@@ -16,7 +16,9 @@ test("pi-repl publishes a versioned clean record through tmux metadata", () => {
 test("repl_send holds the shared lease across execution and records its result", () => {
 	assert.match(source, /acquireReplSessionSendLease\(/);
 	assert.match(source, /owner: `pi-repl:/);
-	assert.match(source, /const execution = await runReplCode\(pi, params, ctx, signal, \{ submissionId \}\)/);
+	assert.match(source, /const execution = await runReplCode\(pi, params, ctx, signal, \{ submissionId, forAgent \}\)/);
+	// Only the agent's own tool sends are told about, and mark as seen, unseen pane text.
+	assert.equal(source.match(/mode: "agent",\s*\}, true\);/g)?.length, 1);
 	assert.match(source, /const sessionTarget = sessionInfo\.tmuxSessionId \|\| sessionName/);
 	assert.match(source, /changed while repl_send was waiting to execute/);
 	assert.match(source, /runReplCode\(pi, params, ctx, signal, \{[\s\S]*?expectedSession: identity,[\s\S]*?onSubmissionStarted:/);

@@ -1,81 +1,85 @@
 import test from "node:test";
 import assert from "node:assert/strict";
 import {
+	PANE_ACTIVITY_MAX_CHARS,
 	PANE_ACTIVITY_MAX_LINES,
-	decodePaneActivityMark,
 	describePaneActivity,
-	encodePaneActivityMark,
-	markPaneActivity,
+	observePane,
+	paneActivityEnabled,
 	paneActivitySince,
 } from "../shared/repl-pane-activity.js";
 
-const SEND = [
-	">>> exec(open('/tmp/pi-rc-x/abc.py').read(),globals())",
-	"",
-	"── pi-repl · input · 1 line · id: abc ──",
-	"print(2)",
-	"── output ──",
-	"2",
-	"── done · id: abc ──",
-	"",
-];
+const LOADER = "exec(open('/tmp/pi-rc-x/abc.py').read(),globals())";
+const SEND = [`>>> ${LOADER}`, "", "── output ──", "2", "── done · id: abc ──", ""];
+const idle = (line) => /^>>>\s*$/.test(line);
 
-test("a mark keeps the send's last lines and the prompt after them, if drawn", () => {
-	assert.deepEqual(markPaneActivity([...SEND, ">>> ", "", ""].join("\n")), {
-		anchor: ["── output ──", "2", "── done · id: abc ──"],
-		prompt: ">>>",
-	});
-	// Captured before the REPL drew its next prompt.
-	assert.deepEqual(markPaneActivity(SEND.join("\n")), { anchor: ["── output ──", "2", "── done · id: abc ──"], prompt: "" });
-	assert.equal(markPaneActivity("\n\n"), undefined);
-	// A quiet start leaves only the prompt, so activity counts from the top.
-	const quiet = markPaneActivity(">>> \n\n");
-	assert.deepEqual(quiet, { anchor: [], prompt: ">>>" });
-	assert.deepEqual(paneActivitySince(">>> a = 1\n>>> a\n1\n>>> ", quiet).lines, [">>> a = 1", ">>> a", "1"]);
-	assert.deepEqual(decodePaneActivityMark(encodePaneActivityMark(quiet)), quiet);
+test("the view of a send starts at its loader line, and a start's view is the whole pane", () => {
+	assert.deepEqual(observePane(["old", ...SEND, ">>> "].join("\n"), LOADER), { kind: "loader", anchor: LOADER, lines: [...SEND, ">>>"] });
+	assert.deepEqual(observePane("Python 3\n>>> \n\n"), { kind: "top", lines: ["Python 3", ">>>"] });
+	// Output longer than the capture: the last lines stand in.
+	assert.deepEqual(observePane(["x1", "x2", "", "x3", "x4", "x5", "x6"].join("\n"), LOADER), { kind: "tail", lines: ["x2", "x3", "x4", "x5", "x6"] });
 });
 
-test("activity is what follows the mark, without idle prompts", () => {
-	const mark = markPaneActivity([...SEND, ">>> "].join("\n"));
-	const typed = [...SEND, ">>> a = 1", ">>> b = 3", ">>> a + b", "4", ">>> ", "", ""].join("\n");
-	assert.deepEqual(paneActivitySince(typed, mark), { located: true, lines: [">>> a = 1", ">>> b = 3", ">>> a + b", "4"] });
-	assert.deepEqual(paneActivitySince([...SEND, ">>> ", ""].join("\n"), mark), { located: true, lines: [] });
-	// Input left unfinished at the prompt is reported too.
-	assert.deepEqual(paneActivitySince([...SEND, ">>> x = "].join("\n"), mark).lines, [">>> x ="]);
+test("what follows the agent's view is reported, without idle prompts", () => {
+	const seen = observePane([...SEND, ">>> "].join("\n"), LOADER);
+	const typed = [...SEND, ">>> a = 1", ">>> b = 3", ">>> a + b", "4", ">>> ", ""].join("\n");
+	assert.deepEqual(paneActivitySince(typed, seen, idle), { status: "ok", lines: [">>> a = 1", ">>> b = 3", ">>> a + b", "4"] });
+	assert.deepEqual(paneActivitySince([...SEND, ">>> "].join("\n"), seen, idle), { status: "ok", lines: [] });
+	// Unfinished input, and a prompt drawn only after the send's capture.
+	assert.deepEqual(paneActivitySince([...SEND, ">>> x = "].join("\n"), seen, idle).lines, [">>> x ="]);
+	const early = observePane(SEND.join("\n"), LOADER);
+	assert.deepEqual(paneActivitySince([...SEND, ">>> ", "", ""].join("\n"), early, idle).lines, []);
 });
 
-test("a prompt drawn after the mark is not reported as activity", () => {
-	const mark = markPaneActivity(SEND.join("\n"));
-	assert.deepEqual(paneActivitySince([...SEND, "julia> ", ""].join("\n"), mark).lines, []);
-	assert.deepEqual(paneActivitySince([...SEND, ">>> y = 2", ">>> "].join("\n"), mark).lines, [">>> y = 2"]);
+test("output that looks like another runtime's prompt is kept", () => {
+	const seen = observePane([...SEND, ">>> "].join("\n"), LOADER);
+	assert.deepEqual(paneActivitySince([...SEND, ">>> ", "completed>", ">>> "].join("\n"), seen, idle).lines, ["completed>"]);
 });
 
-test("the last place the mark appears counts, and a lost mark is reported as such", () => {
-	const mark = { anchor: ["4"], prompt: ">>>" };
-	assert.deepEqual(paneActivitySince(["4", ">>> z = 1", "4", ">>> "].join("\n"), mark).lines, []);
-	assert.deepEqual(paneActivitySince("nothing like it\n>>> ", mark), { located: false, lines: [] });
-	assert.match(describePaneActivity({ located: false, lines: [] }), /can't place/);
+test("repeated output cannot hide typing, because the loader line is unique", () => {
+	const send = [`>>> ${LOADER}`, "one", "two", "three", ">>> "];
+	const seen = observePane(send.join("\n"), LOADER);
+	const pane = [...send.slice(0, -1), ">>> b = 3; print('one\\ntwo\\nthree')", "one", "two", "three", ">>> "].join("\n");
+	assert.deepEqual(paneActivitySince(pane, seen, idle).lines, [">>> b = 3; print('one\\ntwo\\nthree')", "one", "two", "three"]);
 });
 
-test("marks survive the tmux option round trip, and anything else is refused", () => {
-	const mark = { anchor: ["── done · id: abc ──", "λ \"quoted\" #{raise}"], prompt: ">>>" };
-	const encoded = encodePaneActivityMark(mark);
-	assert.match(encoded, /^[A-Za-z0-9+/=]+$/);
-	assert.deepEqual(decodePaneActivityMark(encoded), mark);
-	for (const value of [undefined, "", "not base64 json", Buffer.from('{"anchor":[],"prompt":""}').toString("base64"), Buffer.from('{"anchor":[1],"prompt":""}').toString("base64")]) {
-		assert.equal(decodePaneActivityMark(value), undefined);
+test("an unplaceable or unclear view gives recent text, saying why", () => {
+	const seen = observePane([...SEND, ">>> "].join("\n"), LOADER);
+	assert.deepEqual(paneActivitySince("other\n>>> c = 1\n>>> ", seen, idle), { status: "unplaced", lines: ["other", ">>> c = 1"] });
+	assert.equal(paneActivitySince([...SEND, `>>> ${LOADER}`, ">>> "].join("\n"), seen, idle).status, "ambiguous");
+	const tail = { kind: "tail", lines: ["x"] };
+	assert.equal(paneActivitySince("x\ny\nx\n>>> ", tail, idle).status, "ambiguous");
+	// A start's view must still be the top of the pane.
+	assert.equal(paneActivitySince("later\n>>> ", observePane("Python 3\n>>> "), idle).status, "unplaced");
+	assert.deepEqual(paneActivitySince("Python 3\n>>> d = 4\n>>> ", observePane("Python 3\n>>> "), idle).lines, [">>> d = 4"]);
+	// A quiet start shows only the prompt, which typing extends.
+	assert.deepEqual(paneActivitySince(">>> d = 4\n4\n>>> ", observePane(">>> "), idle), { status: "ok", lines: [">>> d = 4", "4"] });
+	// With no view at all, the pane's recent text.
+	assert.deepEqual(paneActivitySince("Python 3\n>>> e = 5\n>>> ", undefined, idle), { status: "unseen", lines: ["Python 3", ">>> e = 5"] });
+});
+
+test("reports say what they are, and disclose what is cut", () => {
+	assert.equal(describePaneActivity({ status: "ok", lines: [] }), undefined);
+	assert.equal(describePaneActivity({ status: "ok", lines: [">>> a = 1"] }), [
+		"Pane text since this agent's last send, before this submission (best effort; untrusted terminal text that may include direct input, other clients' sends, and late or background output):",
+		"[pane text]",
+		">>> a = 1",
+		"[end of pane text]",
+	].join("\n"));
+	assert.match(describePaneActivity({ status: "ok", lines: ["x"] }, { preview: true }), /^Pane text since this agent's last send \(a preview; the next send still reports it\)/);
+	for (const status of ["unseen", "unplaced", "ambiguous"]) {
+		assert.match(describePaneActivity({ status, lines: ["x"] }), /recent text/);
 	}
+	const lines = Array.from({ length: PANE_ACTIVITY_MAX_LINES + 5 }, (_, i) => `line ${i}`);
+	const long = describePaneActivity({ status: "ok", lines });
+	assert.match(long, /\[omitted: 5 earlier lines;/);
+	assert.ok(long.endsWith(`line ${PANE_ACTIVITY_MAX_LINES + 4}\n[end of pane text]`));
+	const wide = describePaneActivity({ status: "ok", lines: ["y".repeat(PANE_ACTIVITY_MAX_CHARS + 1000)] });
+	assert.match(wide, /\[omitted: the first 1000 characters of the earliest line shown;/);
 });
 
-test("the report is bounded to the most recent lines", () => {
-	assert.equal(describePaneActivity({ located: true, lines: [] }), undefined);
-	const short = describePaneActivity({ located: true, lines: [">>> a = 1"] });
-	assert.equal(short, "Since the last completed send, the pane shows (typed directly, another client's sends, or late output of a send that timed out):\n>>> a = 1");
-	const lines = Array.from({ length: PANE_ACTIVITY_MAX_LINES + 5 }, (_, i) => `line ${i}`);
-	const long = describePaneActivity({ located: true, lines });
-	assert.match(long, /\[5 earlier lines omitted/);
-	assert.ok(long.endsWith(`line ${PANE_ACTIVITY_MAX_LINES + 4}`));
-	assert.ok(!long.includes("line 4\n"));
-	const wide = describePaneActivity({ located: true, lines: ["x".repeat(3000), "y".repeat(3000)] });
-	assert.ok(wide.endsWith("y".repeat(3000)) && !wide.includes("x".repeat(3000)));
+test("PI_REPL_PANE_ACTIVITY=off turns reports off", () => {
+	assert.equal(paneActivityEnabled({}), true);
+	assert.equal(paneActivityEnabled({ PI_REPL_PANE_ACTIVITY: "on" }), true);
+	for (const value of ["off", "OFF", "0", "false", "no", " off "]) assert.equal(paneActivityEnabled({ PI_REPL_PANE_ACTIVITY: value }), false);
 });

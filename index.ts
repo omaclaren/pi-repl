@@ -37,7 +37,7 @@ import {
 } from "./shared/repl-control-files.js";
 
 import { createPrivateReplHistoryFile } from "./shared/repl-history.js";
-import { PANE_ACTIVITY_OPTION, decodePaneActivityMark, describePaneActivity, encodePaneActivityMark, markPaneActivity, paneActivitySince } from "./shared/repl-pane-activity.js";
+import { describePaneActivity, observePane, paneActivityEnabled, paneActivitySince } from "./shared/repl-pane-activity.js";
 import { stopVerifiedReplSession } from "./shared/repl-session-stop.js";
 import { mStringLiteral, buildMLanguageControlSource, buildMLanguageDriverSource } from "./shared/repl-m-language.js";
 import { buildGnuplotSubmissionLine, buildGnuplotGuardSource, buildGnuplotDriverSource } from "./shared/repl-gnuplot.js";
@@ -703,13 +703,28 @@ async function readTmuxSessionOption(
 	return value || undefined;
 }
 
-/** Records where the pane stands, for the next send to report what follows. */
-async function markPaneActivityAfter(pi: ExtensionAPI, sessionTarget: string, capture: string, cwd: string, onlyIfAbsent: boolean): Promise<void> {
-	const mark = markPaneActivity(capture);
-	if (!mark) return;
-	const value = encodePaneActivityMark(mark);
-	if (onlyIfAbsent) await setTmuxSessionOptionIfAbsent(pi, sessionTarget, PANE_ACTIVITY_OPTION, value, cwd);
-	else await setTmuxSessionOption(pi, sessionTarget, PANE_ACTIVITY_OPTION, value, cwd);
+// What this agent process has seen of each pane, by exact session lifetime and
+// pane. Only its own repl_send results and the sessions it creates advance it,
+// so other clients' sends and the user's commands never hide pane text from it.
+const paneViews = new Map<string, ReturnType<typeof observePane>>();
+
+function paneViewKey(tmuxSessionId: string, tmuxSessionCreatedAt: number, paneId: string): string {
+	return `${tmuxSessionId}\0${tmuxSessionCreatedAt}\0${paneId}`;
+}
+
+/** The pane text this agent has not seen yet, as repl_status previews it. */
+async function previewPaneActivity(pi: ExtensionAPI, info: SessionInfo, cwd: string): Promise<string | undefined> {
+	if (!paneActivityEnabled()) return undefined;
+	try {
+		const paneId = await getPaneTarget(pi, info.tmuxSessionId || info.sessionName, cwd);
+		const seen = paneViews.get(paneViewKey(info.tmuxSessionId, info.tmuxSessionCreatedAt, paneId));
+		// Unseen sessions already show their recent pane output in the status.
+		if (!seen) return undefined;
+		const runtime = info.runtime ?? "";
+		return describePaneActivity(paneActivitySince(await capturePaneOutput(pi, paneId, cwd), seen, (line: string) => isIdleReplPrompt(runtime, line)), { preview: true });
+	} catch {
+		return undefined;
+	}
 }
 
 async function setTmuxSessionOptionIfAbsent(
@@ -897,6 +912,7 @@ function formatAttachInstructions(sessionName: string): string {
 	return [
 		"To use the REPL directly, open a new terminal window and run:",
 		formatAttachCommand(sessionName),
+		...(paneActivityEnabled() ? ["Pane text, including what is typed there, is shown to the agent with its next send; PI_REPL_PANE_ACTIVITY=off stops this."] : []),
 	].join("\n");
 }
 
@@ -920,6 +936,12 @@ function formatSessionInfo(info: SessionInfo): string {
 	}
 
 	return lines.join("\n");
+}
+
+/** A session's status for the agent, with pane text it has not seen yet. */
+async function formatSessionStatus(pi: ExtensionAPI, info: SessionInfo, cwd: string): Promise<string> {
+	const preview = await previewPaneActivity(pi, info, cwd);
+	return preview ? `${formatSessionInfo(info)}\n\n${preview}` : formatSessionInfo(info);
 }
 
 function getSessionDisplayName(selector: SessionSelector, info?: SessionInfo | null): string {
@@ -967,31 +989,37 @@ function sleep(ms: number): Promise<void> {
 	return new Promise((resolve) => setTimeout(resolve, ms));
 }
 
+// Each runtime's normal prompt with nothing typed at it.
+const REPL_PROMPTS: Record<ImplementedRuntime, RegExp> = {
+	python: /(?:^|\n)>>>[ \t]*$/,
+	ipython: /(?:^|\n)In \[\d+\]:[ \t]*$/,
+	julia: /(?:^|\n)julia>[ \t]*$/,
+	r: /(?:^|\n)>[ \t]*$/,
+	ghci: /(?:^|\n)(?:\*?[A-Za-z0-9_.:]+)(?: \*?[A-Za-z0-9_.:]+)*>[ \t]*$/,
+	clojure: /(?:^|\n)[^\s>]+=>[ \t]*$/,
+	ruby: /(?:^|\n)irb\([^\n]*\):\d+(?::0)?>[ \t]*$/,
+	java: /(?:^|\n)jshell>[ \t]*$/,
+	octave: /(?:^|\n)octave:\d+>[ \t]*$/,
+	matlab: /(?:^|\n)>>[ \t]*$/,
+	gnuplot: /(?:^|\n)gnuplot>[ \t]*$/,
+	cpp: /(?:^|\n)\[cling\]\$[ \t]*$/,
+};
+
+/** Whether a whole pane line is the runtime's prompt with nothing typed at it. */
+function isIdleReplPrompt(runtime: string, line: string): boolean {
+	// Shell aliases and legacy metadata can label either Python frontend as
+	// the other. They intentionally share one session and execution protocol.
+	if (runtime === "python" || runtime === "ipython") return REPL_PROMPTS.python.test(line) || REPL_PROMPTS.ipython.test(line);
+	return REPL_START_RUNTIMES.includes(runtime as ImplementedRuntime) && REPL_PROMPTS[runtime as ImplementedRuntime].test(line);
+}
+
 function hasNormalReplPrompt(info: SessionInfo, requested: ImplementedRuntime): boolean {
 	// Observe only: never send a probe, Enter or Ctrl-C into shared user state.
 	// A running process or startup banner alone does not establish readiness.
 	const runtime = info.runtime || requested;
-	const prompts: Record<ImplementedRuntime, RegExp> = {
-		python: /(?:^|\n)>>>[ \t]*$/,
-		ipython: /(?:^|\n)In \[\d+\]:[ \t]*$/,
-		julia: /(?:^|\n)julia>[ \t]*$/,
-		r: /(?:^|\n)>[ \t]*$/,
-		ghci: /(?:^|\n)(?:\*?[A-Za-z0-9_.:]+)(?: \*?[A-Za-z0-9_.:]+)*>[ \t]*$/,
-		clojure: /(?:^|\n)[^\s>]+=>[ \t]*$/,
-		ruby: /(?:^|\n)irb\([^\n]*\):\d+(?::0)?>[ \t]*$/,
-		java: /(?:^|\n)jshell>[ \t]*$/,
-		octave: /(?:^|\n)octave:\d+>[ \t]*$/,
-		matlab: /(?:^|\n)>>[ \t]*$/,
-		gnuplot: /(?:^|\n)gnuplot>[ \t]*$/,
-		cpp: /(?:^|\n)\[cling\]\$[ \t]*$/,
-	};
 	if (!REPL_START_RUNTIMES.includes(runtime as ImplementedRuntime)) return false;
 	if (toSessionSelector(runtime as ImplementedRuntime) !== toSessionSelector(requested)) return false;
-	const line = info.promptLine ?? "";
-	// Shell aliases and legacy metadata can label either Python frontend as
-	// the other. They intentionally share one session and execution protocol.
-	if (runtime === "python" || runtime === "ipython") return prompts.python.test(line) || prompts.ipython.test(line);
-	return prompts[runtime as ImplementedRuntime].test(line);
+	return isIdleReplPrompt(runtime, info.promptLine ?? "");
 }
 
 function checkStartAborted(signal: AbortSignal | undefined, sessionName: string): void {
@@ -1867,6 +1895,8 @@ async function runReplCode(
 		expectedRecordId?: string;
 		onSubmissionStarted?: (state: ReplSubmissionState) => void;
 		submissionId?: string;
+		// The result goes to the agent, which is told what it has not seen yet.
+		forAgent?: boolean;
 	} = {},
 ): Promise<{ output: string; details: ReplSendDetails }> {
 	const code = params.code ?? "";
@@ -1969,8 +1999,10 @@ async function runReplCode(
 	const sessionTarget = sessionInfo.tmuxSessionId || sessionName;
 	const paneTarget = await getPaneTarget(pi, sessionTarget, ctx.cwd);
 	const beforeCapture = await capturePaneOutput(pi, paneTarget, ctx.cwd);
-	const activityMark = decodePaneActivityMark(await readTmuxSessionOption(pi, sessionTarget, PANE_ACTIVITY_OPTION, ctx.cwd));
-	const paneActivity = activityMark ? describePaneActivity(paneActivitySince(beforeCapture, activityMark)) : undefined;
+	const viewKey = options.forAgent ? paneViewKey(sessionInfo.tmuxSessionId, sessionInfo.tmuxSessionCreatedAt, paneTarget) : undefined;
+	const paneActivity = viewKey && paneActivityEnabled()
+		? describePaneActivity(paneActivitySince(beforeCapture, paneViews.get(viewKey), (line: string) => isIdleReplPrompt(runtime, line)))
+		: undefined;
 	const cppPane = runtime === "cpp" ? await inspectCppPane(pi, paneTarget, ctx.cwd) : undefined;
 	if (runtime === "cpp" && (!cppPane || cppPane.dead)) throw new Error("The C++ pane is ended or cannot be inspected; no code was sent and no replacement was started.");
 	const echoMode = resolveReplSubmissionEchoMode(params.echoMode);
@@ -2011,8 +2043,8 @@ async function runReplCode(
 		);
 		submissionState.completionObserved = true;
 		const afterCapture = await capturePaneOutput(pi, paneTarget, ctx.cwd);
-		// The code has run, so a failed mark must not lose its result.
-		await markPaneActivityAfter(pi, sessionTarget, afterCapture, ctx.cwd, false).catch(() => undefined);
+		// The agent sees this send's result, so the pane up to here is seen.
+		if (viewKey) paneViews.set(viewKey, observePane(afterCapture, prepared.submissionLine));
 		const cppResult = prepared.cppCompletion ? readCppCompletion(prepared.cppCompletion) : undefined;
 		const delta = extractPaneDelta(beforeCapture, afterCapture);
 		const output = cleanupReplDelta(delta, prepared.submissionLine, prepared.previewComment, prepared.completionLine, prepared.display);
@@ -2097,13 +2129,14 @@ async function runRecordedReplCode(
 	ctx: ExtensionContext,
 	signal: AbortSignal | undefined,
 	metadata: { requestId: string; label: string; mode: "raw" | "literate" | "agent" },
+	forAgent = false,
 ): Promise<{ output: string; details: ReplSendDetails }> {
 	const target = normalizeReplSendTarget(params.target) ?? "python";
 	const sessionName = getSessionNameForSelector(target);
 	const submissionId = `pi-repl:${metadata.requestId}`;
 	const sessionInfo = await readSessionInfo(pi, sessionName, ctx.cwd);
 	if (!sessionInfo?.recordId || !sessionInfo.recordPath || sessionInfo.recordWarning) {
-		const execution = await runReplCode(pi, params, ctx, signal, { submissionId });
+		const execution = await runReplCode(pi, params, ctx, signal, { submissionId, forAgent });
 		return {
 			...execution,
 			details: {
@@ -2153,6 +2186,7 @@ async function runRecordedReplCode(
 				onSubmissionStarted: (state) => {
 					submissionStateRef.current = state;
 				},
+				forAgent,
 			});
 			if (recordEntry) {
 				try {
@@ -2248,7 +2282,7 @@ async function executeReplSend(
 		requestId: `tool:${toolCallId}`,
 		label: getToolSubmissionLabel(),
 		mode: "agent",
-	});
+	}, true);
 	const formatted = formatReplSendResult(execution.output, execution.details);
 
 	return {
@@ -2351,13 +2385,13 @@ async function startDefaultReplSession(
 	}
 	const { info, ready } = await waitForReplSessionInfo(pi, cwd, sessionTarget, sessionName, runtime, timeoutMs, signal);
 	if (created && ready) {
-		// Typing between now and the first send is reported by that send. A
-		// reused session is left unchanged; its next send marks it.
+		// Typing between now and the first send is reported by that send,
+		// without the startup banner. Nothing is changed in tmux.
 		try {
-			const target = info.tmuxSessionId || sessionTarget;
-			await markPaneActivityAfter(pi, target, await capturePaneOutput(pi, target, cwd), cwd, true);
+			const paneId = await getPaneTarget(pi, info.tmuxSessionId || sessionTarget, cwd);
+			paneViews.set(paneViewKey(info.tmuxSessionId, info.tmuxSessionCreatedAt, paneId), observePane(await capturePaneOutput(pi, paneId, cwd)));
 		} catch {
-			// Without a mark, the first send reports nothing; startup is unaffected.
+			// The first send then reports the pane's recent text instead.
 		}
 	}
 	if (!ready) warnings.push(`No normal prompt was confirmed within ${timeoutMs}ms. The session is left running; it may be busy, awaiting input, or using a custom prompt. Inspect it before sending code.`);
@@ -3046,7 +3080,7 @@ export default function (pi: ExtensionAPI) {
 				}
 
 				return {
-					content: [{ type: "text", text: `${getSessionDisplayName(target, sessionInfo)} REPL session is running.\n\n${formatSessionInfo(sessionInfo)}` }],
+					content: [{ type: "text", text: `${getSessionDisplayName(target, sessionInfo)} REPL session is running.\n\n${await formatSessionStatus(pi, sessionInfo, ctx.cwd)}` }],
 					details,
 				};
 			}
@@ -3061,11 +3095,12 @@ export default function (pi: ExtensionAPI) {
 			if (sessions.length === 1) {
 				const only = sessions[0];
 				return {
-					content: [{ type: "text", text: `${getSessionDisplayName(only.selector, only.info)} REPL session is running.\n\n${formatSessionInfo(only.info)}` }],
+					content: [{ type: "text", text: `${getSessionDisplayName(only.selector, only.info)} REPL session is running.\n\n${await formatSessionStatus(pi, only.info, ctx.cwd)}` }],
 					details,
 				};
 			}
 
+			const statuses = await Promise.all(sessions.map((session) => formatSessionStatus(pi, session.info, ctx.cwd)));
 			return {
 				content: [{
 					type: "text",
@@ -3074,7 +3109,7 @@ export default function (pi: ExtensionAPI) {
 						"",
 						...sessions.flatMap((session, index) => [
 							`${getSessionDisplayName(session.selector, session.info)} session:`,
-							formatSessionInfo(session.info),
+							statuses[index],
 							...(index < sessions.length - 1 ? [""] : []),
 						]),
 					].join("\n"),
