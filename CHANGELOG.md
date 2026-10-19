@@ -4,6 +4,11 @@ All notable changes to `pi-repl` are documented here.
 
 ## [Unreleased]
 
+## [0.8.2] — 2026-10-19
+
+### Added
+- `stopVerifiedReplSession` takes an optional `sessionNamePattern`, so a host such as pi-studio can stop its own sessions with the same verification. By default it still accepts only pi-repl's sessions; a global or sticky pattern is refused.
+
 ### Fixed
 - IPython shows an expression's value once, as `Out[N]: …`. The wrapper used to print it again as a bare `repr`.
 - Verified stop no longer refuses to run on macOS when a process of `nobody` (uid -2) is running.
