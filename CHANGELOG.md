@@ -4,6 +4,8 @@ All notable changes to `pi-repl` are documented here.
 
 ## [Unreleased]
 
+## [0.8.4] — 2026-10-19
+
 ### Fixed
 - In the Summary and Full displays, output that doesn't end its line no longer runs into the done marker in Python, IPython, Julia, R and Clojure. The marker then stayed in the clean output, as in `c── done · id: … ──`. These wrappers now check the cursor column first, as the GHCi, Ruby and Java ones do.
 
