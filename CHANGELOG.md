@@ -4,6 +4,11 @@ All notable changes to `pi-repl` are documented here.
 
 ## [Unreleased]
 
+## [0.8.3] — 2026-10-19
+
+### Fixed
+- pi-repl works when the locale is not UTF-8, for example with `LANG` unset. tmux printed the tabs in its pane listings as `_`, so commands failed with "no panes found"; pi-repl now passes `-u` to tmux.
+
 ## [0.8.2] — 2026-10-19
 
 ### Added
