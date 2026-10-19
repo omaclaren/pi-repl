@@ -59,7 +59,10 @@ function fixture(options = {}) {
 
 test("shutdown process parsing is locale-normalised and rejects malformed ownership data", () => {
 	assert.deepEqual(parseStopProcessTable(" 1001 900 1001 501 ttys100 Wed Sep  9 08:00:00 2026 S\n"), [proc(1001)]);
+	assert.deepEqual(parseStopProcessTable("  404     1   404    -2 ??       Sat Aug 15 12:08:00 2026     S   \n"),
+		[{ pid: 404, ppid: 1, pgid: 404, uid: -2, tty: "??", startedAt: "Sat Aug 15 12:08:00 2026", state: "S" }]);
 	assert.throws(() => parseStopProcessTable("not ownership data"), /refusing unsafe shutdown/);
+	assert.throws(() => parseStopProcessTable(" -1001 900 1001 501 ttys100 Wed Sep  9 08:00:00 2026 S\n"), /refusing unsafe shutdown/);
 });
 
 test("cooperative shutdown verifies exit without follow-up signals", async () => {

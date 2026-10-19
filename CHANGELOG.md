@@ -6,6 +6,7 @@ All notable changes to `pi-repl` are documented here.
 
 ### Fixed
 - IPython shows an expression's value once, as `Out[N]: …`. The wrapper used to print it again as a bare `repr`.
+- Verified stop no longer refuses to run on macOS when a process of `nobody` (uid -2) is running.
 
 ## [0.8.1] — 2026-09-25
 
