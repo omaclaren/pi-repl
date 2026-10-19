@@ -1240,11 +1240,8 @@ test("julia footer closes its pipe when a child of the helper holds it open", {
 	if (!f) return;
 	// A startup hook leaves a child with the helper's stdout, so the footer's
 	// read never sees the end of it.
-	const holderPath = join(f.cwd, "holder.pid");
 	const hook = join(f.cwd, "hold.cjs");
-	writeFileSync(hook, `const child = require("node:child_process").spawn("/bin/sleep", ["30"], { stdio: ["ignore", "inherit", "ignore"] });\nrequire("node:fs").writeFileSync(${JSON.stringify(holderPath)}, String(child.pid));\nchild.unref();\n`);
-	const killHolder = () => { try { process.kill(Number(readFileSync(holderPath, "utf8").trim()), "SIGKILL"); } catch {} };
-	t.after(killHolder);
+	writeFileSync(hook, `require("node:child_process").spawn("/bin/sleep", ["30"], { stdio: ["ignore", "inherit", "ignore"] }).unref();\n`);
 	const openFiles = async () => Number((await f.send('GC.gc(true); println(length(readdir("/dev/fd")))')).content[0].text.split("Output:\n")[1]);
 	await openFiles();
 	const before = await openFiles();
@@ -1252,7 +1249,6 @@ test("julia footer closes its pipe when a child of the helper holds it open", {
 	assert.equal(held.content[0].text.split("Output:\n")[1], "pipe held");
 	await f.send('delete!(ENV, "NODE_OPTIONS"); nothing');
 	assert.equal(await openFiles(), before);
-	killHolder();
 	assert.equal(readdirSync(process.env.PI_REPL_CONTROL_ROOT).length, 0);
 });
 
