@@ -1154,19 +1154,30 @@ function buildJuliaFooter(display: ReplSubmissionDisplay): string[] {
 		'    local __pi_repl_column = ""',
 		"    local __pi_repl_query = nothing",
 		// The wait, not the read, is bounded: a child the helper started could
-		// keep the pipe open after the helper is killed. catch also takes an
-		// interrupt; on every path a helper still running is killed.
+		// keep the pipe open after the helper exits. An interrupt does not end
+		// the wait, since killing Node early would leave its tmux child
+		// running. After 5 s a helper still running is killed, and the pipe
+		// is closed so that the reader ends too.
 		"    try",
 		"        flush(stdout)",
 		"        flush(stderr)",
 		`        __pi_repl_query = open(pipeline(${query}, stdin=devnull, stderr=devnull), "r")`,
-		"        __pi_repl_reader = @async read(__pi_repl_query, String)",
-		"        if timedwait(() -> istaskdone(__pi_repl_reader) && process_exited(__pi_repl_query), 5; pollint=0.01) === :ok && success(__pi_repl_query)",
-		"            __pi_repl_column = strip(fetch(__pi_repl_reader))",
+		"        local __pi_repl_reader = @async read(__pi_repl_query, String)",
+		"        local __pi_repl_deadline = time() + 5",
+		"        local __pi_repl_finished = false",
+		"        while !__pi_repl_finished && time() < __pi_repl_deadline",
+		"            try",
+		"                __pi_repl_finished = timedwait(() -> istaskdone(__pi_repl_reader) && process_exited(__pi_repl_query), max(0.01, __pi_repl_deadline - time()); pollint=0.01) === :ok",
+		"            catch",
+		"            end",
 		"        end",
+		"        __pi_repl_finished && success(__pi_repl_query) && (__pi_repl_column = strip(fetch(__pi_repl_reader)))",
 		"    catch",
 		"    finally",
-		"        isnothing(__pi_repl_query) || process_exited(__pi_repl_query) || kill(__pi_repl_query, Base.SIGKILL)",
+		"        if !isnothing(__pi_repl_query)",
+		"            process_exited(__pi_repl_query) || kill(__pi_repl_query, Base.SIGKILL)",
+		"            try close(__pi_repl_query.out) catch end",
+		"        end",
 		"    end",
 		'    __pi_repl_column == "0" || Base.println()',
 		...display.suffixLines.map((line) => `    Base.println(${juliaStringLiteral(line)})`),

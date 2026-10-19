@@ -1215,6 +1215,47 @@ test("clojure footer keeps waiting for its query when the thread is interrupted"
 	assert.equal(readdirSync(process.env.PI_REPL_CONTROL_ROOT).length, 0);
 });
 
+test("julia footer keeps waiting for its query when the task is interrupted", {
+	timeout: 30000, skip: !(optionalRuntimes.has("all") || optionalRuntimes.has("julia")),
+}, async (t) => {
+	const f = await fixture(t, { runtime: "julia" });
+	if (!f) return;
+	const realTmux = binary("tmux");
+	const pidPath = join(f.cwd, "query.pid");
+	writeFileSync(join(f.cwd, "bin", "tmux"), `#!/bin/sh\nif [ -n "\${TMUX_PANE:-}" ]; then\n  echo $$ > ${quote(pidPath)}\n  exec /bin/sleep 10\nfi\nexec ${quote(realTmux)} "$@"\n`, { mode: 0o700 });
+	// Interrupts the evaluating task once the footer's query is running.
+	const code = `let task = current_task()\n    @async begin\n        while !isfile(${JSON.stringify(pidPath)})\n            sleep(0.005)\n        end\n        Base.throwto(task, InterruptException())\n    end\n    print("interrupted wait")\nend`;
+	const result = await f.send(code, { timeoutMs: 8000 });
+	assert.equal(result.content[0].text.split("Output:\n")[1], "interrupted wait");
+	// Node ends the hung query itself, before the footer goes on.
+	const pid = Number(readFileSync(pidPath, "utf8").trim());
+	assert.throws(() => process.kill(pid, 0), { code: "ESRCH" });
+	assert.equal(readdirSync(process.env.PI_REPL_CONTROL_ROOT).length, 0);
+});
+
+test("julia footer closes its pipe when a child of the helper holds it open", {
+	timeout: 60000, skip: !(optionalRuntimes.has("all") || optionalRuntimes.has("julia")),
+}, async (t) => {
+	const f = await fixture(t, { runtime: "julia" });
+	if (!f) return;
+	// A startup hook leaves a child with the helper's stdout, so the footer's
+	// read never sees the end of it.
+	const holderPath = join(f.cwd, "holder.pid");
+	const hook = join(f.cwd, "hold.cjs");
+	writeFileSync(hook, `const child = require("node:child_process").spawn("/bin/sleep", ["30"], { stdio: ["ignore", "inherit", "ignore"] });\nrequire("node:fs").writeFileSync(${JSON.stringify(holderPath)}, String(child.pid));\nchild.unref();\n`);
+	const killHolder = () => { try { process.kill(Number(readFileSync(holderPath, "utf8").trim()), "SIGKILL"); } catch {} };
+	t.after(killHolder);
+	const openFiles = async () => Number((await f.send('GC.gc(true); println(length(readdir("/dev/fd")))')).content[0].text.split("Output:\n")[1]);
+	await openFiles();
+	const before = await openFiles();
+	const held = await f.send(`ENV["NODE_OPTIONS"] = ${JSON.stringify(`--require=${hook}`)}; print("pipe held")`, { timeoutMs: 15000 });
+	assert.equal(held.content[0].text.split("Output:\n")[1], "pipe held");
+	await f.send('delete!(ENV, "NODE_OPTIONS"); nothing');
+	assert.equal(await openFiles(), before);
+	killHolder();
+	assert.equal(readdirSync(process.env.PI_REPL_CONTROL_ROOT).length, 0);
+});
+
 test("ghci shell fallback preserves the footer gap if Node cannot start", {
 	timeout: 30000, skip: !(optionalRuntimes.has("all") || optionalRuntimes.has("ghci")),
 }, async (t) => {
