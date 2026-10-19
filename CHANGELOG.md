@@ -4,6 +4,8 @@ All notable changes to `pi-repl` are documented here.
 
 ## [Unreleased]
 
+## [0.8.6] — 2026-10-19
+
 ### Fixed
 - The 0.8.4 done-marker footer no longer waits without limit for its helper. In Julia and R, a Node startup hook (`NODE_OPTIONS`) that kept Node running held the cell's completion indefinitely. Node now exits as soon as the query has run, and every wrapper limits the helper to 5 s.
 - In Clojure, an interrupt while the footer waits no longer leaves the tmux query running. The wait goes on, and the interrupt is restored afterwards.
