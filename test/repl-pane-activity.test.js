@@ -16,8 +16,8 @@ const idle = (line) => /^>>>\s*$/.test(line);
 test("the view of a send starts at its loader line, and a start's view is the whole pane", () => {
 	assert.deepEqual(observePane(["old", ...SEND, ">>> "].join("\n"), LOADER), { kind: "loader", anchor: LOADER, lines: [...SEND, ">>>"] });
 	assert.deepEqual(observePane("Python 3\n>>> \n\n"), { kind: "top", lines: ["Python 3", ">>>"] });
-	// Output longer than the capture: the last lines stand in.
-	assert.deepEqual(observePane(["x1", "x2", "", "x3", "x4", "x5", "x6"].join("\n"), LOADER), { kind: "tail", lines: ["x2", "x3", "x4", "x5", "x6"] });
+	// Output longer than the capture: nothing marks where the send ended.
+	assert.deepEqual(observePane(["x1", "x2", ">>> "].join("\n"), LOADER), { kind: "lost", lines: [] });
 });
 
 test("what follows the agent's view is reported, without idle prompts", () => {
@@ -47,8 +47,10 @@ test("an unplaceable or unclear view gives recent text, saying why", () => {
 	const seen = observePane([...SEND, ">>> "].join("\n"), LOADER);
 	assert.deepEqual(paneActivitySince("other\n>>> c = 1\n>>> ", seen, idle), { status: "unplaced", lines: ["other", ">>> c = 1"] });
 	assert.equal(paneActivitySince([...SEND, `>>> ${LOADER}`, ">>> "].join("\n"), seen, idle).status, "ambiguous");
-	const tail = { kind: "tail", lines: ["x"] };
-	assert.equal(paneActivitySince("x\ny\nx\n>>> ", tail, idle).status, "ambiguous");
+	// A lost view never claims that nothing happened, even if output repeats.
+	const lost = observePane("one\ntwo\nthree\nfour\n>>> ", "loader no longer present");
+	const repeated = ["one", "two", "three", "four", ">>> b = 3; print('one\\ntwo\\nthree\\nfour')", "one", "two", "three", "four", ">>> "].join("\n");
+	assert.deepEqual(paneActivitySince(repeated, lost, idle), { status: "unplaced", lines: repeated.split("\n").slice(0, -1) });
 	// A start's view must still be the top of the pane.
 	assert.equal(paneActivitySince("later\n>>> ", observePane("Python 3\n>>> "), idle).status, "unplaced");
 	assert.deepEqual(paneActivitySince("Python 3\n>>> d = 4\n>>> ", observePane("Python 3\n>>> "), idle).lines, [">>> d = 4"]);
@@ -70,6 +72,10 @@ test("reports say what they are, and disclose what is cut", () => {
 	for (const status of ["unseen", "unplaced", "ambiguous"]) {
 		assert.match(describePaneActivity({ status, lines: ["x"] }), /recent text/);
 	}
+	// A lost position is still reported when the pane shows nothing else.
+	assert.match(describePaneActivity({ status: "unplaced", lines: [] }), /no longer in the pane's capture, and the pane shows no other text now/);
+	assert.match(describePaneActivity({ status: "ambiguous", lines: [] }), /unclear/);
+	assert.equal(describePaneActivity({ status: "unseen", lines: [] }), undefined);
 	const lines = Array.from({ length: PANE_ACTIVITY_MAX_LINES + 5 }, (_, i) => `line ${i}`);
 	const long = describePaneActivity({ status: "ok", lines });
 	assert.match(long, /\[omitted: 5 earlier lines;/);

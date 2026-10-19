@@ -7,8 +7,6 @@
 
 export const PANE_ACTIVITY_MAX_LINES = 40;
 export const PANE_ACTIVITY_MAX_CHARS = 4000;
-// Matched in order when a send's loader line is not in the pane.
-const TAIL_LINES = 5;
 
 /** False when PI_REPL_PANE_ACTIVITY is off, 0, false or no. */
 export function paneActivityEnabled(env = process.env) {
@@ -23,24 +21,16 @@ function paneLines(capture) {
 
 /**
  * What an agent has seen of a pane once its send finished: the pane from the
- * send's loader line, which names a control file unique to the send. Without
- * that line (output longer than the capture) its last lines stand in, and
- * after a start the whole pane does.
+ * send's loader line, which names a control file unique to the send. After a
+ * start it is the whole pane. When the loader line has already left the
+ * capture (output longer than it holds), the view is lost: nothing else in
+ * the pane marks where the send ended for certain.
  */
 export function observePane(capture, loaderLine) {
 	const lines = paneLines(capture);
 	if (!loaderLine) return { kind: "top", lines };
 	const at = lines.findLastIndex((line) => line.includes(loaderLine));
-	if (at >= 0) return { kind: "loader", anchor: loaderLine, lines: lines.slice(at) };
-	return { kind: "tail", lines: lines.filter(Boolean).slice(-TAIL_LINES) };
-}
-
-function sequenceStarts(lines, sequence) {
-	const starts = [];
-	for (let i = 0; i + sequence.length <= lines.length; i++) {
-		if (sequence.every((line, k) => lines[i + k] === line)) starts.push(i);
-	}
-	return starts;
+	return at >= 0 ? { kind: "loader", anchor: loaderLine, lines: lines.slice(at) } : { kind: "lost", lines: [] };
 }
 
 function withoutIdlePrompts(lines, isIdlePrompt) {
@@ -62,13 +52,10 @@ export function paneActivitySince(capture, seen, isIdlePrompt = (_line) => false
 	const lines = paneLines(capture);
 	const recent = (status) => ({ status, lines: withoutIdlePrompts(lines, isIdlePrompt) });
 	if (!seen) return recent("unseen");
+	if (seen.kind === "lost") return recent("unplaced");
 	let start = 0;
 	if (seen.kind === "loader") {
 		const hits = lines.flatMap((line, index) => (line.includes(seen.anchor) ? [index] : []));
-		if (hits.length !== 1) return recent(hits.length ? "ambiguous" : "unplaced");
-		start = hits[0];
-	} else if (seen.kind === "tail") {
-		const hits = sequenceStarts(lines, seen.lines);
 		if (hits.length !== 1) return recent(hits.length ? "ambiguous" : "unplaced");
 		start = hits[0];
 	}
@@ -89,12 +76,17 @@ const HEADINGS = {
 	ambiguous: "Where this agent's last send ended is unclear in the pane, so here is its recent text instead",
 };
 
+const EMPTY_NOTES = {
+	unplaced: "This agent's last send is no longer in the pane's capture, and the pane shows no other text now.",
+	ambiguous: "Where this agent's last send ended is unclear in the pane, and the pane shows no other text now.",
+};
+
 /**
  * The report for a send, or undefined if there is nothing new. A preview, as
  * repl_status shows, says that the next send will still report the text.
  */
 export function describePaneActivity(activity, { preview = false } = {}) {
-	if (activity.lines.length === 0) return undefined;
+	if (activity.lines.length === 0) return EMPTY_NOTES[activity.status];
 	let lines = activity.lines.slice(-PANE_ACTIVITY_MAX_LINES);
 	while (lines.length > 1 && lines.join("\n").length > PANE_ACTIVITY_MAX_CHARS) lines = lines.slice(1);
 	let text = lines.join("\n");

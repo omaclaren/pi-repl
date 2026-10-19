@@ -703,10 +703,21 @@ async function readTmuxSessionOption(
 	return value || undefined;
 }
 
-// What this agent process has seen of each pane, by exact session lifetime and
-// pane. Only its own repl_send results and the sessions it creates advance it,
-// so other clients' sends and the user's commands never hide pane text from it.
-const paneViews = new Map<string, ReturnType<typeof observePane>>();
+// What each registration's agent has seen of each pane, by exact session
+// lifetime and pane. Only its own repl_send results and the sessions it
+// creates advance it, so other clients' sends and the user's commands never
+// hide pane text from it. Pi can register a cached extension again for a new
+// conversation, so the views belong to the registration, not the module.
+const paneViewsByHost = new WeakMap<object, Map<string, ReturnType<typeof observePane>>>();
+
+function paneViewsFor(pi: ExtensionAPI): Map<string, ReturnType<typeof observePane>> {
+	let views = paneViewsByHost.get(pi);
+	if (!views) {
+		views = new Map();
+		paneViewsByHost.set(pi, views);
+	}
+	return views;
+}
 
 function paneViewKey(tmuxSessionId: string, tmuxSessionCreatedAt: number, paneId: string): string {
 	return `${tmuxSessionId}\0${tmuxSessionCreatedAt}\0${paneId}`;
@@ -717,7 +728,7 @@ async function previewPaneActivity(pi: ExtensionAPI, info: SessionInfo, cwd: str
 	if (!paneActivityEnabled()) return undefined;
 	try {
 		const paneId = await getPaneTarget(pi, info.tmuxSessionId || info.sessionName, cwd);
-		const seen = paneViews.get(paneViewKey(info.tmuxSessionId, info.tmuxSessionCreatedAt, paneId));
+		const seen = paneViewsFor(pi).get(paneViewKey(info.tmuxSessionId, info.tmuxSessionCreatedAt, paneId));
 		// Unseen sessions already show their recent pane output in the status.
 		if (!seen) return undefined;
 		const runtime = info.runtime ?? "";
@@ -2001,7 +2012,7 @@ async function runReplCode(
 	const beforeCapture = await capturePaneOutput(pi, paneTarget, ctx.cwd);
 	const viewKey = options.forAgent ? paneViewKey(sessionInfo.tmuxSessionId, sessionInfo.tmuxSessionCreatedAt, paneTarget) : undefined;
 	const paneActivity = viewKey && paneActivityEnabled()
-		? describePaneActivity(paneActivitySince(beforeCapture, paneViews.get(viewKey), (line: string) => isIdleReplPrompt(runtime, line)))
+		? describePaneActivity(paneActivitySince(beforeCapture, paneViewsFor(pi).get(viewKey), (line: string) => isIdleReplPrompt(runtime, line)))
 		: undefined;
 	const cppPane = runtime === "cpp" ? await inspectCppPane(pi, paneTarget, ctx.cwd) : undefined;
 	if (runtime === "cpp" && (!cppPane || cppPane.dead)) throw new Error("The C++ pane is ended or cannot be inspected; no code was sent and no replacement was started.");
@@ -2044,7 +2055,7 @@ async function runReplCode(
 		submissionState.completionObserved = true;
 		const afterCapture = await capturePaneOutput(pi, paneTarget, ctx.cwd);
 		// The agent sees this send's result, so the pane up to here is seen.
-		if (viewKey) paneViews.set(viewKey, observePane(afterCapture, prepared.submissionLine));
+		if (viewKey) paneViewsFor(pi).set(viewKey, observePane(afterCapture, prepared.submissionLine));
 		const cppResult = prepared.cppCompletion ? readCppCompletion(prepared.cppCompletion) : undefined;
 		const delta = extractPaneDelta(beforeCapture, afterCapture);
 		const output = cleanupReplDelta(delta, prepared.submissionLine, prepared.previewComment, prepared.completionLine, prepared.display);
@@ -2389,7 +2400,7 @@ async function startDefaultReplSession(
 		// without the startup banner. Nothing is changed in tmux.
 		try {
 			const paneId = await getPaneTarget(pi, info.tmuxSessionId || sessionTarget, cwd);
-			paneViews.set(paneViewKey(info.tmuxSessionId, info.tmuxSessionCreatedAt, paneId), observePane(await capturePaneOutput(pi, paneId, cwd)));
+			paneViewsFor(pi).set(paneViewKey(info.tmuxSessionId, info.tmuxSessionCreatedAt, paneId), observePane(await capturePaneOutput(pi, paneId, cwd)));
 		} catch {
 			// The first send then reports the pane's recent text instead.
 		}
@@ -3002,6 +3013,13 @@ async function handleRepl(pi: ExtensionAPI, args: string, ctx: ExtensionCommandC
 }
 
 export default function (pi: ExtensionAPI) {
+	// A new, resumed, branched or compacted conversation no longer holds what
+	// earlier sends showed the agent, so its views of the panes start again.
+	// Hosts without these events (agent-repl, tests) keep one conversation.
+	const forgetPaneViews = () => paneViewsFor(pi).clear();
+	pi.on?.("session_start", forgetPaneViews);
+	pi.on?.("session_tree", forgetPaneViews);
+	pi.on?.("session_compact", forgetPaneViews);
 	pi.registerCommand("repl", {
 		description: "Manage collaborative tmux-backed REPL sessions",
 		handler: async (args, ctx) => {

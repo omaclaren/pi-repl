@@ -150,10 +150,12 @@ async function fixture(t, { index = 0, runtime = "python", controlName, startWit
 	const send = (code, options = {}, signal) => tools.get("repl_send").execute(randomUUID(), { code, target, ...options }, signal, undefined, ctx);
 	const status = (options = {}) => tools.get("repl_status").execute(randomUUID(), { target, ...options }, undefined, undefined, ctx);
 	const start = (options = {}, signal) => tools.get("repl_start").execute(randomUUID(), { runtime, ...options }, signal, undefined, { cwd });
-	// Another agent process on the same session: its own extension instance.
-	async function otherAgent() {
+	// Another agent on the same session: by default another process (a fresh
+	// module); with sameFactory, another conversation registering the cached
+	// extension factory again, as Pi can.
+	async function otherAgent({ sameFactory = false } = {}) {
 		const otherTools = new Map();
-		const { default: registerOther } = await import(`../index.ts?fixture=${randomUUID()}`);
+		const registerOther = sameFactory ? register : (await import(`../index.ts?fixture=${randomUUID()}`)).default;
 		registerOther({ ...pi, registerTool: (tool) => otherTools.set(tool.name, tool), registerCommand() {} });
 		return { send: (code, options = {}) => otherTools.get("repl_send").execute(randomUUID(), { code, target, ...options }, undefined, undefined, ctx) };
 	}
@@ -780,6 +782,9 @@ test("other agents' sends and the user's commands do not hide pane text from an 
 	assert.match(afterEnv, /\n>>> pi_human = 73\n/);
 	assert.match(afterEnv, /sys\.executable=/);
 	assert.match(paneReport(await other.send("print(pi_human + 1)")), /\n>>> pi_human = 73\n/);
+	// A new conversation in the same process has not seen what this one was told.
+	const conversation = await f.otherAgent({ sameFactory: true });
+	assert.match(paneReport(await conversation.send("print(2)")), /^This agent has not seen this session's pane before[\s\S]*pi_human = 73/);
 });
 
 test("long output lines and PI_REPL_PANE_ACTIVITY=off", { timeout: 60000 }, async (t) => {
@@ -787,6 +792,15 @@ test("long output lines and PI_REPL_PANE_ACTIVITY=off", { timeout: 60000 }, asyn
 	if (!f) return;
 	await f.send("print('X' * 280000)", { echoMode: "off" });
 	assert.equal(paneReport(await f.send("print('quiet')")), undefined);
+	// More lines than the capture holds: the send's loader line leaves it, so
+	// repeated output must not pass for where the send ended.
+	await f.send("print('\\n'.join(['padding'] * 5200 + ['one', 'two', 'three', 'four']))", { echoMode: "off", timeoutMs: 30000 });
+	await typeAtPrompt(f, "pi_repeat = 3; print('one\\ntwo\\nthree\\nfour')");
+	await paneSettles(f, /pi_repeat = 3[^\n]*\none\ntwo\nthree\nfour\n>>>$/m);
+	const lost = paneReport(await f.send("print(pi_repeat)"));
+	assert.match(lost, /^This agent's last send is no longer in the pane's capture/);
+	assert.match(lost, /pi_repeat = 3; print/);
+	assert.equal(paneReport(await f.send("print('quiet again')")), undefined);
 	const previous = process.env.PI_REPL_PANE_ACTIVITY;
 	process.env.PI_REPL_PANE_ACTIVITY = "off";
 	t.after(() => {
