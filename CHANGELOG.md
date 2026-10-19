@@ -4,6 +4,9 @@ All notable changes to `pi-repl` are documented here.
 
 ## [Unreleased]
 
+### Fixed
+- Julia no longer leaves copies of a wrapped submission line in the output. In a pane narrower than the `include(...)` line, such as a detached session's default 80 columns, Julia redrew the line for each pasted character, and the copies stayed in the clean output. pi-repl now sends Julia a bracketed paste.
+
 ## [0.8.4] — 2026-10-19
 
 ### Fixed

@@ -1567,6 +1567,7 @@ async function pasteTextToTmuxPane(
 	cwd: string,
 	text: string,
 	onPasted?: () => void,
+	bracketed = false,
 ): Promise<void> {
 	const bufferName = `pi-repl-${randomUUID()}`;
 	const target = await getPaneTarget(pi, sessionTarget, cwd);
@@ -1581,7 +1582,10 @@ async function pasteTextToTmuxPane(
 			throw new Error(`Failed to load tmux buffer: ${reason}`);
 		}
 
-		const pasteResult = await execTmux(pi, ["paste-buffer", "-d", "-b", bufferName, "-t", target], cwd, 5_000);
+		// -p brackets the paste only if the REPL asked for bracketed pastes.
+		// Julia then draws a line that wraps in the pane once, not once per
+		// character, which left copies of its first row in the output.
+		const pasteResult = await execTmux(pi, ["paste-buffer", ...(bracketed ? ["-p"] : []), "-d", "-b", bufferName, "-t", target], cwd, 5_000);
 		if (pasteResult.code !== 0) {
 			const reason = pasteResult.stderr.trim() || pasteResult.stdout.trim() || `exit code ${pasteResult.code}`;
 			throw new Error(`Failed to paste tmux buffer: ${reason}`);
@@ -1946,7 +1950,7 @@ async function runReplCode(
 		await pasteTextToTmuxPane(pi, paneTarget, ctx.cwd, prepared.submissionText, () => {
 			submissionStarted = true;
 			options.onSubmissionStarted?.(submissionState);
-		});
+		}, runtime === "julia");
 		await waitForReplDoneFile(
 			pi,
 			sessionName,

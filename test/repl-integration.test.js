@@ -1113,9 +1113,6 @@ for (const runtime of ["ghci", "ruby", "java", "python", "ipython", "julia", "r"
 	}, async (t) => {
 		const f = await fixture(t, { runtime, index: 1 });
 		if (!f) return;
-		// Julia redraws a wrapped include line, leaving copies of it in the
-		// output; that is a separate problem from the footer.
-		if (runtime === "julia") await f.tmux("resize-window", "-t", `${f.sessionName}:^`, "-x", "320");
 		for (const echoMode of ["summary", "full"]) {
 			for (const footerCase of footerCases) {
 				const { expected } = footerCase;
@@ -1144,7 +1141,6 @@ for (const runtime of ["ghci", "ruby", "java", "python", "ipython", "julia", "r"
 		}, async (t) => {
 			const f = await fixture(t, { runtime });
 			if (!f) return;
-			if (runtime === "julia") await f.tmux("resize-window", "-t", `${f.sessionName}:^`, "-x", "320");
 			const realTmux = binary("tmux");
 			const pidPath = join(f.cwd, "query.pid");
 			// Only the runtime's own query sees TMUX_PANE. Harness calls still
