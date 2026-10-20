@@ -18,6 +18,10 @@ test("process names only select same-user interpreter/Qt candidates, never autho
 	const listing = "100 501 /usr/bin/gnuplot\n101 501 /some path/gnuplot_qt\n102 502 /bin/gnuplot_qt\n103 501 /bin/not_gnuplot_qt\n";
 	assert.deepEqual(parseGnuplotCandidates(listing, 501), [100, 101]);
 	assert.throws(() => parseGnuplotCandidates("invalid", 501), /parse/);
+	// macOS runs some daemons as `nobody`, which ps lists with uid -2.
+	const nobody = "  404    -2 /usr/sbin/distnoted\n1001 501 /usr/bin/gnuplot\n1002 501 /bin/gnuplot_qt\n1003 502 /usr/bin/gnuplot\n1004 -2 /usr/bin/gnuplot\n";
+	assert.deepEqual(parseGnuplotCandidates(nobody, 501), [1001, 1002]);
+	for (const bad of ["-404 501 gnuplot", "404 --2 gnuplot", "404 -2x gnuplot", "not a process"]) assert.throws(() => parseGnuplotCandidates(bad, 501), /parse/, bad);
 	const table = [100, 101, 102, 103].map((pid) => ({ pid, uid: pid === 102 ? 502 : 501, state: "S", tty: "??" }));
 	const result = await findOwnedGnuplotProcesses(table, owner, {
 		uid: 501, execute: async () => ({ stdout: listing }),
