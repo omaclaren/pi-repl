@@ -4,6 +4,18 @@ All notable changes to `pi-repl` are documented here.
 
 ## [Unreleased]
 
+## [0.10.4] — 2026-10-21
+
+### Fixed
+- Echo Off: output that doesn't end its line is no longer lost, or followed by pi-repl's loader line in the next result. With no footer in Off, the REPL's prompt followed such output on the same row, and the clean record took the row for a prompt:
+  - Python returned `midline>>> `;
+  - R, GHCi, Clojure, Octave and gnuplot lost the output;
+  - Python's, R's and gnuplot's next results started with the loader line.
+
+  Off now ends a line that output left open, as C++ already did, and prints no display; if the cursor column can't be checked, it adds a newline. Ruby's Off no longer adds a blank line after every send. Found by pi-studio's review.
+- GHCi: the footer's Node helper now runs with a five-second alarm timeout, as the Octave and MATLAB helpers do. A Node startup hook (`NODE_OPTIONS`) that kept Node running or blocked it no longer leaves the send unfinished. If Node can't start, the line is still ended. Ctrl-C while the footer waits no longer leaves the send unfinished: GHCi passed it to the footer's shell, which stopped before writing the done file.
+- Java: the done file is written from an outer `finally`, so a footer that throws, for example from a replaced `System.out`, no longer leaves the send unfinished.
+
 ## [0.10.3] — 2026-10-20
 
 ### Fixed
