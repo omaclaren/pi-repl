@@ -4,6 +4,11 @@ All notable changes to `pi-repl` are documented here.
 
 ## [Unreleased]
 
+## [0.10.3] — 2026-10-20
+
+### Fixed
+- gnuplot: stopping a session no longer fails on a Mac that runs processes as `nobody`. macOS lists them with UID −2, which the helper-process check refused to parse, so every stop of a gnuplot session with an ownership marker failed before anything was signalled ("Could not parse gnuplot process candidates"). Found by pi-studio's review.
+
 ## [0.10.2] — 2026-10-20
 
 ### Added
