@@ -99,12 +99,16 @@ for (const options of [{ column: "12" }, { queryFailure: true }]) {
 	});
 }
 
-test("gnuplot Off uses the same completion mechanism without display or cursor queries", () => {
-	const f = fixture({ mode: "off" });
-	assert.doesNotMatch(f.source, /cursor_x|node:child_process|──|a = 42/);
-	f.state.ack = true;
-	f.state.tick();
-	assert.deepEqual(f.state.terminal, []);
-	assert.deepEqual(f.state.queries, []);
-	assert.equal(f.state.files.length, 1);
+test("gnuplot Off ends a line that output left open, and adds no display", () => {
+	// Otherwise gnuplot's prompt follows the output on the same row, and its line editor
+	// redraws the next pasted line wrongly.
+	for (const [options, ending] of [[{ column: "0" }, ""], [{ column: "7" }, "\n"], [{ queryFailure: true }, "\n"]]) {
+		const f = fixture({ mode: "off", ...options });
+		assert.doesNotMatch(f.source, /──|a = 42/);
+		f.state.ack = true;
+		f.state.tick();
+		assert.deepEqual(f.state.terminal, [ending], JSON.stringify(options));
+		assert.equal(f.state.queries.length, 1);
+		assert.equal(f.state.files.length, 1);
+	}
 });

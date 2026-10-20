@@ -22,14 +22,14 @@ export function buildMLanguageControlSource(code, display) {
 }
 
 /**
- * What runs once a submission's code has finished: the footer (when the
- * display is on), then the done file. Ctrl-C during Octave's footer interrupts
- * this cleanup action and skips whatever follows, so for Octave the done file
- * is written by unwind_protect. MATLAB finishes the action, and has no
- * unwind_protect.
+ * What runs once a submission's code has finished: the footer, then the done
+ * file. In Off the footer still ends a line that output left open, and adds
+ * nothing else. Ctrl-C during Octave's footer interrupts this cleanup action
+ * and skips whatever follows, so for Octave the done file is written by
+ * unwind_protect. MATLAB finishes the action, and has no unwind_protect.
  */
 export function buildMLanguageFinish(runtime, doneFile, display) {
-	const footer = display.enabled ? [
+	const footer = [
 		...(runtime === "octave" ? ["fflush(1);"] : []),
 		"try",
 		`  [pi_repl_status,pi_repl_column]=system(${mStringLiteral(boundedCursorColumnCommand(process.execPath))});`,
@@ -38,9 +38,9 @@ export function buildMLanguageFinish(runtime, doneFile, display) {
 		"end",
 		"if pi_repl_status~=0 || ~strcmp(strtrim(pi_repl_column),'0'); fprintf(1,'\\n'); end",
 		...display.suffixLines.map((line) => `fprintf(1,'%s\\n',${mStringLiteral(line)});`),
-	] : [];
+	];
 	const done = `fclose(fopen(${mStringLiteral(doneFile)},'w'));`;
-	return (runtime === "octave" && footer.length > 0
+	return (runtime === "octave"
 		? ["unwind_protect", ...footer, "unwind_protect_cleanup", done, "end_unwind_protect"]
 		: [...footer, done]).join("\n");
 }

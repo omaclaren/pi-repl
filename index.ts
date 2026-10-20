@@ -37,7 +37,7 @@ import {
 } from "./shared/repl-control-files.js";
 
 import { createPrivateReplHistoryFile } from "./shared/repl-history.js";
-import { CURSOR_COLUMN_QUERY } from "./shared/repl-cursor-column.js";
+import { CURSOR_COLUMN_QUERY, boundedCursorColumnCommand } from "./shared/repl-cursor-column.js";
 import { advancePaneView, describePaneActivity, observePane, paneActivityEnabled, paneActivityMode, paneActivitySince } from "./shared/repl-pane-activity.js";
 import { stopVerifiedReplSession } from "./shared/repl-session-stop.js";
 import { mStringLiteral, buildMLanguageControlSource, buildMLanguageDriverSource } from "./shared/repl-m-language.js";
@@ -1243,10 +1243,11 @@ function buildClojureDisplayStatements(display: ReplSubmissionDisplay, indent = 
 }
 
 // CURSOR_COLUMN_QUERY (shared/repl-cursor-column.js) prints the pane's cursor
-// column; each wrapper below also limits the whole helper to 5 s.
+// column; each wrapper below also limits the whole helper to 5 s. Off still ends
+// a line that output left open, as C++ does, so the prompt starts its own line;
+// it adds nothing else (Off has no suffix lines).
 
 function buildPythonFooter(display: ReplSubmissionDisplay): string[] {
-	if (!display.enabled) return [];
 	return [
 		"    import subprocess as __pi_repl_subprocess",
 		"    import sys as __pi_repl_sys",
@@ -1305,7 +1306,6 @@ function buildPythonControlSource(runtime: PythonRuntime, code: string, doneFile
 }
 
 function buildJuliaFooter(display: ReplSubmissionDisplay): string[] {
-	if (!display.enabled) return [];
 	const query = `Cmd([${juliaStringLiteral(process.execPath)}, "-e", ${juliaStringLiteral(CURSOR_COLUMN_QUERY)}])`;
 	return [
 		'    local __pi_repl_column = ""',
@@ -1360,7 +1360,6 @@ function buildJuliaControlSource(code: string, doneFile: string, display: ReplSu
 }
 
 function buildRFooter(display: ReplSubmissionDisplay): string[] {
-	if (!display.enabled) return [];
 	return [
 		"    try({ flush(stdout()); flush(stderr()) }, silent = TRUE)",
 		// system2 quotes the command but not its arguments, and kills it after
@@ -1423,7 +1422,7 @@ function buildRubyControlSource(code: string, doneFile: string, display: ReplSub
 	const prefix = display.enabled ? display.prefixLines.map((line) => `  puts ${rubyStringLiteral(line)}`) : [];
 	// Query the actual terminal column rather than intercepting user stdout.
 	// Keep the old newline guard if the bounded, read-only query is unavailable.
-	const completion = display.enabled ? [
+	const completion = [
 		'  __pi_repl_column = ""',
 		"  begin",
 		"    $stdout.flush",
@@ -1454,7 +1453,7 @@ function buildRubyControlSource(code: string, doneFile: string, display: ReplSub
 		"  end",
 		'  puts unless __pi_repl_column == "0"',
 		...display.suffixLines.map((line) => `  puts ${rubyStringLiteral(line)}`),
-	] : ["  puts"];
+	];
 	return [
 		"begin",
 		...prefix,
@@ -1506,7 +1505,6 @@ function buildJavaControlSource(code: string, doneFile: string, display: ReplSub
 }
 
 function buildClojureFooter(display: ReplSubmissionDisplay): string[] {
-	if (!display.enabled) return [];
 	const builder = `(java.lang.ProcessBuilder. ^java.util.List [${JSON.stringify(process.execPath)} "-e" ${JSON.stringify(CURSOR_COLUMN_QUERY)}])`;
 	return [
 		"      (try (.flush *out*) (.flush *err*) (catch Throwable _))",
@@ -1602,7 +1600,7 @@ function buildReplSubmissionLine(runtime: ImplementedRuntime, sourceFile: string
 function buildJavaDriverSource(sourceFile: string, doneFile: string, display: ReplSubmissionDisplay): string {
 	// Only add a newline when the terminal is mid-line. The scoped query does
 	// not replace System.out/err, change user declarations, or emit another /open.
-	const completion = display.enabled ? [
+	const completion = [
 		'  String __pi_repl_column = "";',
 		"  java.lang.Process __pi_repl_query = null;",
 		"  try {",
@@ -1624,12 +1622,16 @@ function buildJavaDriverSource(sourceFile: string, doneFile: string, display: Re
 		"  }",
 		'  if (!"0".equals(__pi_repl_column)) java.lang.System.out.println();',
 		...display.suffixLines.map((line) => `  java.lang.System.out.println(${JSON.stringify(line)});`),
-	] : [];
+	];
 	return [
 		buildReplSubmissionLine("java", sourceFile),
 		"{",
-		...completion,
-		`  java.nio.file.Files.write(java.nio.file.Paths.get(${JSON.stringify(doneFile)}), new byte[]{100, 111, 110, 101, 10});`,
+		"  try {",
+		...completion.map((line) => `  ${line}`),
+		// A footer that throws, such as from a replaced System.out, must not lose the done file.
+		"  } finally {",
+		`    java.nio.file.Files.write(java.nio.file.Paths.get(${JSON.stringify(doneFile)}), new byte[]{100, 111, 110, 101, 10});`,
+		"  }",
 		"}",
 	].join("\n");
 }
@@ -1637,16 +1639,14 @@ function buildJavaDriverSource(sourceFile: string, doneFile: string, display: Re
 function buildReplCompletionLine(runtime: ImplementedRuntime, doneFile: string, display: ReplSubmissionDisplay): string | undefined {
 	if (runtime === "ghci") {
 		// Run from the outer driver, after the guard has absorbed a source
-		// script failure. Node is already used by the raw-history pipe; its
-		// bounded cursor query avoids both blank padding and inline footers.
-		const footerScript = [
-			'let column = "";',
-			'try { column = require("node:child_process").execFileSync("tmux", ["-N", "display-message", "-p", "-t", process.env.TMUX_PANE, "#{cursor_x}"], { encoding: "utf8", timeout: 500, killSignal: "SIGKILL", maxBuffer: 128, stdio: ["ignore", "pipe", "ignore"] }).trim(); } catch {}',
-			`process.stdout.write((column === "0" ? "" : "\\n") + ${JSON.stringify(`${display.suffixLines.join("\n")}\n`)});`,
-		].join(" ");
-		const fallback = `command printf '\\n%s\\n\\n' ${shellQuote(display.endMarker)}`;
-		const displayCommand = display.enabled ? `${shellQuote(process.execPath)} -e ${shellQuote(footerScript)} 2>/dev/null || ${fallback}; ` : "";
-		return `:! ${displayCommand}touch ${shellQuote(doneFile)}`;
+		// script failure. The cursor query is the 5 s helper Octave and MATLAB
+		// use, so a stuck or kept-alive Node can't hold up the done file. A line
+		// left open is ended, also when the query fails; then the display's
+		// suffix lines, if any. GHCi passes Ctrl-C to this shell, which would
+		// otherwise die before the done file; the trap isn't inherited, so the
+		// helper itself is still interrupted.
+		const suffix = display.suffixLines.map((line) => `command printf '%s\\n' ${shellQuote(line)}; `).join("");
+		return `:! trap : INT; c=$(${boundedCursorColumnCommand(process.execPath)}) || c=; [ "$c" = 0 ] || command printf '\\n'; ${suffix}touch ${shellQuote(doneFile)}`;
 	}
 	return undefined;
 }

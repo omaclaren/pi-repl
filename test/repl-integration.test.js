@@ -1301,6 +1301,49 @@ test("ruby preserves interpolation, literal hashes, Unicode, escapes and error r
 	assert.equal(readdirSync(process.env.PI_REPL_CONTROL_ROOT).length, 0);
 });
 
+// Off adds no display, but still ends a line that output left open. Otherwise the
+// prompt follows the output on the same row: the clean record took that row for a
+// prompt and dropped it, and the next loader line's echo leaked into the result.
+const offMidline = {
+	python: ['print("midline", end="")', 'print("next")'], ipython: ['print("midline", end="")', 'print("next")'],
+	julia: ['print("midline")', 'println("next")'], r: ['cat("midline")', 'cat("next\\n")'], ghci: ['putStr "midline"', 'putStrLn "next"'],
+	clojure: ['(print "midline")', '(println "next")'], ruby: ['print "midline"', 'puts "next"'], java: ['System.out.print("midline");', 'System.out.println("next");'],
+	octave: ['printf("midline")', 'printf("next\\n")'], gnuplot: ['system "printf midline"', 'print "next"'],
+};
+// A line of output, then a send with none. These REPLs print a blank line of their own after each input.
+const offSpacing = {
+	python: ['print("line42")', 'pass'], ipython: ['print("line42")', 'pass'], julia: ['println("line42")', 'nothing'],
+	r: ['cat("line42\\n")', 'invisible(NULL)'], ghci: ['putStrLn "line42"', 'let pi_quiet = 1'], clojure: ['(println "line42")', 'nil'],
+	ruby: ['puts "line42"', 'nil'], java: ['System.out.println("line42");', ';'], octave: ['printf("line42\\n")', 'pi_quiet = 1;'], gnuplot: ['print "line42"', 'pi_quiet = 1'],
+};
+const nativeBlankLine = new Set(["ipython", "julia", "java"]);
+for (const [runtime, [midline, next]] of Object.entries(offMidline)) {
+	test(`${runtime} Off keeps output that doesn't end its line, and the next send's record is exact`, {
+		timeout: 60000, skip: runtime !== "python" && !(optionalRuntimes.has("all") || optionalRuntimes.has(runtime)) && "set PI_REPL_TEST_RUNTIMES=all to include installed optional runtimes",
+	}, async (t) => {
+		const f = await fixture(t, { runtime, startWithTool: true });
+		if (!f) return;
+		const output = (result) => result.content[0].text.split("Output:\n")[1];
+		assert.equal(output(await f.send(midline, { echoMode: "off" })), "midline");
+		assert.equal(output(await f.send(next, { echoMode: "off" })), "next");
+		assert.equal(output(await f.send(next, { echoMode: "summary" })), "next");
+		const status = (await f.status()).details[runtime === "ipython" ? "python" : runtime];
+		assert.deepEqual(readReplSessionRecord(status.recordId).entries.slice(-3).map((entry) => entry.output), ["midline", "next", "next"]);
+		const pane = await f.tmux("capture-pane", "-p", "-J", "-t", `${f.sessionName}:^`, "-S", "-1000");
+		assert.match(pane, /^midline$/m, pane);
+		// Output that ends its line gets no extra blank line, nor does a send with no output.
+		const [line, quiet] = offSpacing[runtime];
+		await f.send(line, { echoMode: "off" });
+		await f.send(quiet, { echoMode: "off" });
+		await f.send(line, { echoMode: "off" });
+		const rows = (await f.tmux("capture-pane", "-p", "-J", "-t", `${f.sessionName}:^`, "-S", "-1000")).replace(/\s+$/, "").split("\n");
+		assert.ok(rows.includes("line42"), rows.join("\n"));
+		const blanks = rows.slice(rows.indexOf("line42")).map((row, index) => row === "" ? index : -1).filter((index) => index >= 0);
+		assert.deepEqual(blanks, nativeBlankLine.has(runtime) ? [1, 3, 6] : [], rows.slice(rows.indexOf("line42")).join("\n"));
+		assert.equal(readdirSync(process.env.PI_REPL_CONTROL_ROOT).length, 0);
+	});
+}
+
 // Output that does not end a line still ends before the done marker.
 const footerCases = [
 	{ expected: "42\n", ruby: 'puts "42"', java: 'System.out.println("42");', ghci: 'putStrLn "42"', python: 'print("42")', julia: 'println("42")', r: 'cat("42\\n")', clojure: '(println "42")' },
@@ -1459,7 +1502,7 @@ test("julia footer closes its pipe when a child of the helper holds it open", {
 	assert.equal(readdirSync(process.env.PI_REPL_CONTROL_ROOT).length, 0);
 });
 
-test("ruby footer still completes when Ctrl-C interrupts its cursor query", {
+for (const echoMode of ["summary", "off"]) test(`ruby footer still completes when Ctrl-C interrupts its cursor query (${echoMode})`, {
 	timeout: 30000, skip: !(optionalRuntimes.has("all") || optionalRuntimes.has("ruby")),
 }, async (t) => {
 	const f = await fixture(t, { runtime: "ruby" });
@@ -1473,10 +1516,10 @@ test("ruby footer still completes when Ctrl-C interrupts its cursor query", {
 		await eventually(() => existsSync(pidPath), 10000);
 		await f.tmux("send-keys", "-t", `${f.sessionName}:^`, "C-c");
 	})();
-	const result = await f.send('print "interrupted footer"', { timeoutMs: 8000 });
+	const result = await f.send('print "interrupted footer"', { echoMode, timeoutMs: 8000 });
 	await interrupt;
 	assert.match(result.content[0].text, /Output:\n[\s\S]*interrupted footer/);
-	assert.match((await f.send('puts "after the interrupt"')).content[0].text, /Output:\n[\s\S]*after the interrupt/);
+	assert.match((await f.send('puts "after the interrupt"', { echoMode })).content[0].text, /Output:\n[\s\S]*after the interrupt/);
 	assert.equal(readdirSync(process.env.PI_REPL_CONTROL_ROOT).length, 0);
 });
 
@@ -1490,7 +1533,7 @@ test("stopping octave leaves no octave-workspace file", {
 	assert.equal(existsSync(join(f.cwd, "octave-workspace")), false, readdirSync(f.cwd).join(", "));
 });
 
-test("octave's footer helper is bounded, and Ctrl-C while it waits still finishes the send", {
+for (const echoMode of ["summary", "off"]) test(`octave's footer helper is bounded, and Ctrl-C while it waits still finishes the send (${echoMode})`, {
 	timeout: 120000, skip: !(optionalRuntimes.has("all") || optionalRuntimes.has("octave")),
 }, async (t) => {
 	const f = await fixture(t, { runtime: "octave" });
@@ -1503,12 +1546,12 @@ test("octave's footer helper is bounded, and Ctrl-C while it waits still finishe
 	// A startup hook that keeps Node alive no longer holds up the footer.
 	const keep = hook("keep.cjs", "setInterval(() => {}, 1000);\n");
 	let began = Date.now();
-	assert.match((await f.send(`setenv('NODE_OPTIONS','--require=${keep}');\nfprintf('kept alive')`, { timeoutMs: 20000 })).content[0].text, /Output:\nkept alive$/);
+	assert.match((await f.send(`setenv('NODE_OPTIONS','--require=${keep}');\nfprintf('kept alive')`, { echoMode, timeoutMs: 20000 })).content[0].text, /Output:\nkept alive$/);
 	assert.ok(Date.now() - began < 5000, `took ${Date.now() - began} ms`);
 	// One that blocks Node is stopped after 5 s, leaving only the cell's output.
 	const stall = hook("stall.cjs", "Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0, 10000);\n");
 	began = Date.now();
-	const timed = await f.send(`setenv('NODE_OPTIONS','--require=${stall}');\nfprintf('timed')`, { timeoutMs: 20000 });
+	const timed = await f.send(`setenv('NODE_OPTIONS','--require=${stall}');\nfprintf('timed')`, { echoMode, timeoutMs: 20000 });
 	const took = Date.now() - began;
 	assert.equal(timed.content[0].text.split("Output:\n")[1], "timed");
 	assert.ok(took > 4500 && took < 10000, `took ${took} ms`);
@@ -1520,7 +1563,7 @@ test("octave's footer helper is bounded, and Ctrl-C while it waits still finishe
 		await eventually(() => existsSync(started), 15000);
 		await f.tmux("send-keys", "-t", `${f.sessionName}:^`, "C-c");
 	})();
-	const interrupted = f.send(`setenv('NODE_OPTIONS','--require=${marked}');\nfprintf('interrupted')`, { timeoutMs: 20000 });
+	const interrupted = f.send(`setenv('NODE_OPTIONS','--require=${marked}');\nfprintf('interrupted')`, { echoMode, timeoutMs: 20000 });
 	await interrupt;
 	assert.match((await interrupted).content[0].text, /Output:\n[\s\S]*interrupted/);
 	const helper = Number(readFileSync(started, "utf8"));
@@ -1528,19 +1571,95 @@ test("octave's footer helper is bounded, and Ctrl-C while it waits still finishe
 		try { process.kill(helper, 0); return false; }
 		catch (error) { if (error.code === "ESRCH") return true; throw error; }
 	}, 6000);
-	assert.match((await f.send("unsetenv('NODE_OPTIONS');\ndisp(6*7)")).content[0].text, /Output:\n42/);
+	assert.match((await f.send("unsetenv('NODE_OPTIONS');\ndisp(6*7)", { echoMode })).content[0].text, /Output:\n42/);
 	assert.equal(readdirSync(process.env.PI_REPL_CONTROL_ROOT).length, 0);
 });
 
-test("ghci shell fallback preserves the footer gap if Node cannot start", {
+for (const echoMode of ["summary", "off"]) test(`ghci shell fallback ends the line if Node cannot start (${echoMode})`, {
 	timeout: 30000, skip: !(optionalRuntimes.has("all") || optionalRuntimes.has("ghci")),
 }, async (t) => {
 	const f = await fixture(t, { runtime: "ghci" });
 	if (!f) return;
-	const result = await f.send('import qualified System.Environment\nSystem.Environment.setEnv "NODE_OPTIONS" "--pi-repl-invalid-test-option"\nputStr "shell fallback"');
+	const result = await f.send('import qualified System.Environment\nSystem.Environment.setEnv "NODE_OPTIONS" "--pi-repl-invalid-test-option"\nputStr "shell fallback"', { echoMode });
 	assert.equal(result.content[0].text.split("Output:\n")[1], "shell fallback");
-	await assertCompletionGap(f, result);
+	if (echoMode === "summary") await assertCompletionGap(f, result);
+	assert.equal((await f.send('putStrLn "next"', { echoMode })).content[0].text.split("Output:\n")[1], "next");
+	assert.match(await f.tmux("capture-pane", "-p", "-J", "-t", `${f.sessionName}:^`, "-S", "-200"), /^shell fallback$/m);
 	await f.send('System.Environment.unsetEnv "NODE_OPTIONS"');
+	assert.equal(readdirSync(process.env.PI_REPL_CONTROL_ROOT).length, 0);
+});
+
+for (const echoMode of ["summary", "off"]) test(`ghci footer's Node helper is bounded (${echoMode})`, {
+	timeout: 60000, skip: !(optionalRuntimes.has("all") || optionalRuntimes.has("ghci")),
+}, async (t) => {
+	const f = await fixture(t, { runtime: "ghci" });
+	if (!f) return;
+	const hook = (name, body) => {
+		const path = join(f.cwd, name);
+		writeFileSync(path, body);
+		return path;
+	};
+	const withHook = (path, text) => `import qualified System.Environment\nSystem.Environment.setEnv "NODE_OPTIONS" ${JSON.stringify(`--require=${path}`)}\nputStr ${JSON.stringify(text)}`;
+	const output = (result) => result.content[0].text.split("Output:\n")[1];
+	// A startup hook that keeps Node alive no longer holds up the done file.
+	let began = Date.now();
+	assert.equal(output(await f.send(withHook(hook("keep.cjs", "setInterval(() => {}, 1000);\n"), "kept alive"), { echoMode, timeoutMs: 20000 })), "kept alive");
+	assert.ok(Date.now() - began < 5000, `took ${Date.now() - began} ms`);
+	// One that blocks Node is stopped after 5 s.
+	const pidPath = join(f.cwd, "helper.pid");
+	const stall = hook("stall.cjs", `require("node:fs").writeFileSync(${JSON.stringify(pidPath)}, String(process.pid));\nAtomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0, 30000);\n`);
+	began = Date.now();
+	assert.equal(output(await f.send(withHook(stall, "stalled helper"), { echoMode, timeoutMs: 20000 })), "stalled helper");
+	const took = Date.now() - began;
+	assert.ok(took > 4500 && took < 10000, `took ${took} ms`);
+	const pid = Number(readFileSync(pidPath, "utf8").trim());
+	await eventually(() => {
+		try { process.kill(pid, 0); return false; }
+		catch (error) { if (error.code === "ESRCH") return true; throw error; }
+	}, 5000);
+	await f.send('System.Environment.unsetEnv "NODE_OPTIONS"');
+	assert.equal(output(await f.send('putStrLn "next"', { echoMode })), "next");
+	assert.equal(readdirSync(process.env.PI_REPL_CONTROL_ROOT).length, 0);
+});
+
+for (const echoMode of ["summary", "off"]) test(`ghci footer still completes when Ctrl-C interrupts its helper (${echoMode})`, {
+	timeout: 60000, skip: !(optionalRuntimes.has("all") || optionalRuntimes.has("ghci")),
+}, async (t) => {
+	const f = await fixture(t, { runtime: "ghci" });
+	if (!f) return;
+	const started = join(f.cwd, "started");
+	const hook = join(f.cwd, "marked.cjs");
+	writeFileSync(hook, `require("node:fs").writeFileSync(${JSON.stringify(started)}, String(process.pid));\nAtomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0, 4000);\n`);
+	const interrupt = (async () => {
+		await eventually(() => existsSync(started), 15000);
+		await f.tmux("send-keys", "-t", `${f.sessionName}:^`, "C-c");
+	})();
+	const result = f.send(`import qualified System.Environment\nSystem.Environment.setEnv "NODE_OPTIONS" ${JSON.stringify(`--require=${hook}`)}\nputStr "interrupted footer"`, { echoMode, timeoutMs: 20000 });
+	await interrupt;
+	assert.match((await result).content[0].text, /Output:\n[\s\S]*interrupted footer/);
+	const helper = Number(readFileSync(started, "utf8"));
+	await eventually(() => {
+		try { process.kill(helper, 0); return false; }
+		catch (error) { if (error.code === "ESRCH") return true; throw error; }
+	}, 6000);
+	await f.send('System.Environment.unsetEnv "NODE_OPTIONS"', { echoMode });
+	assert.equal((await f.send('putStrLn "next"', { echoMode })).content[0].text.split("Output:\n")[1], "next");
+	assert.equal(readdirSync(process.env.PI_REPL_CONTROL_ROOT).length, 0);
+});
+
+for (const echoMode of ["summary", "off"]) test(`java writes the done file even if the footer's newline throws (${echoMode})`, {
+	timeout: 60000, skip: !(optionalRuntimes.has("all") || optionalRuntimes.has("java")),
+}, async (t) => {
+	const f = await fixture(t, { runtime: "java" });
+	if (!f) return;
+	// System.out's println() throws once, then puts the original stream back.
+	const result = await f.send([
+		"var piOriginalOut = System.out;",
+		"System.setOut(new java.io.PrintStream(piOriginalOut, true) { public void println() { System.setOut(piOriginalOut); throw new IllegalStateException(\"footer newline failed\"); } });",
+		'System.out.print("midline");',
+	].join("\n"), { echoMode, timeoutMs: 15000 });
+	assert.match(result.content[0].text, /midline/);
+	assert.equal((await f.send('System.out.println("next");', { echoMode })).content[0].text.split("Output:\n")[1], "next");
 	assert.equal(readdirSync(process.env.PI_REPL_CONTROL_ROOT).length, 0);
 });
 

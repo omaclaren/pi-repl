@@ -30,14 +30,15 @@ process.on("SIGINT", () => {});
 function finish() {
   if (ending) return;
   ending = true;
-${display.enabled ? `  let column = "";
+  // Off still ends a line that output left open, as C++ does; it adds nothing else.
+  let column = "";
   try {
     column = require("node:child_process").execFileSync("tmux", ["-N", "display-message", "-p", "-t", process.env.TMUX_PANE, "#{cursor_x}"], {
       encoding: "utf8", timeout: 500, killSignal: "SIGKILL", maxBuffer: 128, stdio: ["ignore", "pipe", "ignore"]
     }).trim();
   } catch {}
-  fs.writeSync(2, (column === "0" ? "" : "\\n") + ${JSON.stringify(display.suffixLines.join("\n") + "\n")});
-` : ""}  fs.writeFileSync(${JSON.stringify(doneFile)}, "done\\n", { mode: 0o600, flag: "wx" });
+  fs.writeSync(2, (column === "0" ? "" : "\\n") + ${JSON.stringify(display.enabled ? display.suffixLines.join("\n") + "\n" : "")});
+  fs.writeFileSync(${JSON.stringify(doneFile)}, "done\\n", { mode: 0o600, flag: "wx" });
   process.exit(0);
 }
 process.stdout.on("error", error => {
