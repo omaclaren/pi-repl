@@ -40,6 +40,7 @@ function fixture(options = {}) {
 		stop: () => stopVerifiedReplSession({
 			tmux, sessionName, currentPid: 9999, uid: 501, graceMs: 0, termMs: 0, killMs: 10,
 			...(options.sessionNamePattern ? { sessionNamePattern: options.sessionNamePattern } : {}),
+			...("isGnuplotSession" in options ? { isGnuplotSession: options.isGnuplotSession } : {}),
 			snapshotSockets: async () => [],
 			findMarked: async (table, marker) => {
 				state.onMarked?.(++state.markerReads || (state.markerReads = 1));
@@ -242,6 +243,41 @@ test("a host can name its own sessions; the default still accepts only pi-repl's
 	for (const pattern of [/^pi-studio-repl-python$/g, /^pi-studio-repl-python$/y, "pi-studio-repl-python"]) {
 		const bad = fixture({ sessionName: "pi-studio-repl-python", sessionNamePattern: pattern });
 		await assert.rejects(bad.stop(), /plain session-name pattern/);
+		assert.deepEqual(bad.state.calls, []);
+	}
+});
+
+test("a host can pick out its own gnuplot sessions so their marked helpers are cleaned up", async () => {
+	const studio = /^pi-studio-repl-(python|gnuplot)(?:-[a-z0-9]+)?$/;
+	const studioGnuplot = (name) => /^pi-studio-repl-gnuplot(?:-|$)/.test(name);
+	const options = { gnuplot: true, sessionName: "pi-studio-repl-gnuplot-abc", sessionNamePattern: studio };
+	const f = fixture({ ...options, isGnuplotSession: studioGnuplot });
+	addQt(f, 3001);
+	addQt(f, 4001, "d".repeat(32));
+	addQt(f, 5001, null);
+	const result = await f.stop();
+	assert.equal(result.processCount, 3);
+	assert.deepEqual(result.warnings, []);
+	assert.ok(result.signals.some((s) => s.pid === 3001 && s.signal === "SIGKILL"));
+	assert.ok(!result.signals.some((s) => [4001, 5001].includes(s.pid)));
+	assert.ok(f.state.calls.find((args) => args[0] === "if-shell")[4].includes("@pi_repl_gnuplot_owner"));
+
+	// Without the predicate only pi-repl-gnuplot counts, so the host's helper is left alone.
+	const plain = fixture(options);
+	addQt(plain, 3001);
+	const untouched = await plain.stop();
+	assert.equal(untouched.processCount, 2);
+	assert.ok(!untouched.signals.some((s) => s.pid === 3001));
+	assert.ok(!plain.state.calls.find((args) => args[0] === "if-shell")[4].includes("@pi_repl_gnuplot_owner"));
+
+	// A truthy non-boolean is not a yes.
+	const loose = fixture({ ...options, isGnuplotSession: (name) => name.match(/gnuplot/) });
+	addQt(loose, 3001);
+	assert.ok(!(await loose.stop()).signals.some((s) => s.pid === 3001));
+
+	for (const predicate of [/^pi-studio-repl-gnuplot/, "pi-studio-repl-gnuplot", null]) {
+		const bad = fixture({ ...options, isGnuplotSession: predicate });
+		await assert.rejects(bad.stop(), /gnuplot-session predicate/);
 		assert.deepEqual(bad.state.calls, []);
 	}
 });
