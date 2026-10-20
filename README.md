@@ -223,7 +223,7 @@ Both runtimes support the same private logs, clean records, exports, Summary/Off
 
 ### Octave and MATLAB submissions
 
-Octave requires `octave-cli` on PATH and starts with `--quiet --interactive`. MATLAB requires a licensed installation with `matlab` on PATH; it starts with `-nodesktop -nosplash -sd <Pi working directory>`. These are separate persistent terminal sessions, not connections to an existing MATLAB desktop. Startup can take longer for MATLAB: request `repl_start` with `timeoutMs: 120000` if needed, and check `ready` before sending code.
+Octave requires `octave-cli` on PATH and starts with `--quiet --interactive`, turning off Octave's workspace dump on SIGHUP and SIGTERM so that stopping the session leaves no `octave-workspace` file behind. MATLAB requires a licensed installation with `matlab` on PATH; it starts with `-nodesktop -nosplash -sd <Pi working directory>`. These are separate persistent terminal sessions, not connections to an existing MATLAB desktop. Startup can take longer for MATLAB: request `repl_start` with `timeoutMs: 120000` if needed, and check `ready` before sending code.
 
 Code evaluates in the **base workspace**, shared with direct terminal input. Variables, native semicolon/`ans` behaviour, working-directory changes and search-path changes persist. For example, either runtime can run:
 

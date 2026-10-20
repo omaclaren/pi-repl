@@ -4,6 +4,11 @@ All notable changes to `pi-repl` are documented here.
 
 ## [Unreleased]
 
+### Fixed
+- Ruby: Ctrl-C while a send's footer waits for the cursor column no longer leaves the send unfinished. irb raises `IRB::Abort`, which is not a `StandardError`, so the wrapper skipped writing its done file; it now always writes it.
+- Octave: stopping a session no longer leaves an `octave-workspace` file in its working directory. Octave now starts with its workspace dump on SIGHUP and SIGTERM turned off.
+- The "Launch method" line shows the start command shell-quoted, as it is run.
+
 ## [0.10.0] — 2026-10-20
 
 ### Added

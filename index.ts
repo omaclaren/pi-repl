@@ -621,7 +621,9 @@ function buildRuntimeLaunchCommand(runtime: ManagedRuntime): string {
 	if (runtime === "clj" || runtime === "clojure") return "clojure";
 	if (runtime === "ruby") return "irb";
 	if (runtime === "java") return "jshell";
-	if (runtime === "octave") return "octave-cli --quiet --interactive";
+	// Stopping a session sends Octave SIGHUP, after which it would save its
+	// workspace as octave-workspace in the session's directory.
+	if (runtime === "octave") return "octave-cli --quiet --interactive --persist --eval 'sighup_dumps_octave_core(false); sigterm_dumps_octave_core(false);'";
 	if (runtime === "matlab") return "matlab -nodesktop -nosplash";
 	if (runtime === "cpp") return "cling";
 	return runtime;
@@ -1467,8 +1469,13 @@ function buildRubyControlSource(code: string, doneFile: string, display: ReplSub
 		"rescue Exception => __pi_repl_e",
 		"  $stderr.puts __pi_repl_e.full_message(highlight: false)",
 		"ensure",
-		...completion,
-		`  File.write(${rubyStringLiteral(doneFile)}, "done\\n")`,
+		// Ctrl-C while the footer waits raises IRB::Abort, which is not a
+		// StandardError: the done file must still be written.
+		"  begin",
+		...completion.map((line) => `  ${line}`),
+		"  ensure",
+		`    File.write(${rubyStringLiteral(doneFile)}, "done\\n")`,
+		"  end",
 		// IRB checks echo? immediately after evaluating the loader. Suppress
 		// just that result, restoring the original method before returning.
 		"  begin",
@@ -2538,7 +2545,7 @@ async function startDefaultReplSession(
 			? `Started default ${getSessionDisplayName(target)} REPL session: ${sessionName}`
 			: `Default ${getSessionDisplayName(target)} REPL session is already running; reused without restarting (requested: ${runtime}).`,
 		...(created ? [
-			`Launch method: ${shellLaunch.shell} -i -l -c '${buildRuntimeLaunchCommand(runtime)}' inside tmux.`,
+			`Launch method: ${shellLaunch.shell} -i -l -c ${shellQuote(buildRuntimeLaunchCommand(runtime))} inside tmux.`,
 			...(target === "python" ? ["This respects your normal shell-level Python setup (aliases, pyenv/virtualenv/conda activation, shell init, etc.)."] : []),
 			...(target === "clojure" ? ["`clojure` is used without rlwrap; `/repl clj` remains an alias."] : []),
 			...(target === "gnuplot" ? ["An inherited ownership marker identifies this session's interpreter and Qt helpers during explicit stop; plotting settings are unchanged."] : []),

@@ -1459,6 +1459,37 @@ test("julia footer closes its pipe when a child of the helper holds it open", {
 	assert.equal(readdirSync(process.env.PI_REPL_CONTROL_ROOT).length, 0);
 });
 
+test("ruby footer still completes when Ctrl-C interrupts its cursor query", {
+	timeout: 30000, skip: !(optionalRuntimes.has("all") || optionalRuntimes.has("ruby")),
+}, async (t) => {
+	const f = await fixture(t, { runtime: "ruby" });
+	if (!f) return;
+	const realTmux = binary("tmux");
+	const pidPath = join(f.cwd, "query.pid");
+	writeFileSync(join(f.cwd, "bin", "tmux"), `#!/bin/sh\nif [ -n "\${TMUX_PANE:-}" ]; then\n  echo $$ > ${quote(pidPath)}\n  exec /bin/sleep 10\nfi\nexec ${quote(realTmux)} "$@"\n`, { mode: 0o700 });
+	// Ctrl-C at the terminal while the footer waits for the cursor column
+	// raises IRB::Abort, which is not a StandardError.
+	const interrupt = (async () => {
+		await eventually(() => existsSync(pidPath), 10000);
+		await f.tmux("send-keys", "-t", `${f.sessionName}:^`, "C-c");
+	})();
+	const result = await f.send('print "interrupted footer"', { timeoutMs: 8000 });
+	await interrupt;
+	assert.match(result.content[0].text, /Output:\n[\s\S]*interrupted footer/);
+	assert.match((await f.send('puts "after the interrupt"')).content[0].text, /Output:\n[\s\S]*after the interrupt/);
+	assert.equal(readdirSync(process.env.PI_REPL_CONTROL_ROOT).length, 0);
+});
+
+test("stopping octave leaves no octave-workspace file", {
+	timeout: 60000, skip: !(optionalRuntimes.has("all") || optionalRuntimes.has("octave")),
+}, async (t) => {
+	const f = await fixture(t, { runtime: "octave" });
+	if (!f) return;
+	assert.match((await f.send("pi_kept = 3;\ndisp(pi_kept)")).content[0].text, /Output:\n3/);
+	await assertVerifiedStop(f);
+	assert.equal(existsSync(join(f.cwd, "octave-workspace")), false, readdirSync(f.cwd).join(", "));
+});
+
 test("ghci shell fallback preserves the footer gap if Node cannot start", {
 	timeout: 30000, skip: !(optionalRuntimes.has("all") || optionalRuntimes.has("ghci")),
 }, async (t) => {

@@ -15,11 +15,15 @@ after(() => {
 	rmSync(root, { recursive: true, force: true });
 });
 
+// The launch command as the shell sees it, matched literally.
+const shellWord = (text) => `'${text.replace(/'/g, `'"'"'`)}'`;
+const literal = (text) => text.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
+
 const runtimes = [
 	["python", "python", ">>>"], ["ipython", "ipython", "In [1]:"],
 	["julia", "julia", "julia>"], ["r", "R", ">"], ["ghci", "ghci", "ghci>"],
 	["clojure", "clojure", "user=>"], ["ruby", "irb", "irb(main):001:0>"], ["java", "jshell", "jshell>"],
-	["octave", "octave-cli --quiet --interactive", "octave:1>"], ["matlab", "matlab -nodesktop -nosplash", ">>"],
+	["octave", "octave-cli --quiet --interactive --persist --eval 'sighup_dumps_octave_core(false); sigterm_dumps_octave_core(false);'", "octave:1>"], ["matlab", "matlab -nodesktop -nosplash", ">>"],
 	["gnuplot", "gnuplot", "gnuplot>"], ["cpp", "cling", "[cling]$"],
 ];
 
@@ -108,7 +112,7 @@ for (const [runtime, executable, prompt] of runtimes) {
 			assert.match(marker, /^[a-f0-9]{32}$/);
 			assert.ok(launch.args.includes(`PI_REPL_GNUPLOT_OWNER=${marker}`));
 		} else assert.equal(launch.args.includes("-e"), false);
-		assert.match(launch.args.at(-1), new RegExp(` -i -l -c '${executable}${runtime === "matlab" ? " -sd " : "'$"}`));
+		assert.match(launch.args.at(-1), new RegExp(runtime === "matlab" ? ` -i -l -c '${literal(executable)} -sd ` : ` -i -l -c ${literal(shellWord(executable))}$`));
 		const pipe = f.calls.find((call) => call.args[0] === "pipe-pane");
 		assert.ok(pipe.args.includes("%9"));
 		assert.ok(pipe.args.at(-1).includes(f.state.sessionName));

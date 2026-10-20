@@ -28,7 +28,11 @@ function fixture() {
 	};
 }
 
-for (const [runtime, alias, executable] of [["ruby", " IRB ", "irb"], ["java", " JShell ", "jshell"], ["octave", " OCTAVE ", "octave-cli --quiet --interactive"], ["matlab", " MATLAB ", "matlab -nodesktop -nosplash"], ["gnuplot", " GNUPLOT ", "gnuplot"], ["cpp", " CPP ", "cling"]]) {
+// The launch command as the shell sees it, matched literally.
+const shellWord = (text) => `'${text.replace(/'/g, `'"'"'`)}'`;
+const literal = (text) => text.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
+
+for (const [runtime, alias, executable] of [["ruby", " IRB ", "irb"], ["java", " JShell ", "jshell"], ["octave", " OCTAVE ", "octave-cli --quiet --interactive --persist --eval 'sighup_dumps_octave_core(false); sigterm_dumps_octave_core(false);'"], ["matlab", " MATLAB ", "matlab -nodesktop -nosplash"], ["gnuplot", " GNUPLOT ", "gnuplot"], ["cpp", " CPP ", "cling"]]) {
 	test(`${runtime} command and tool routing never fall back to Python`, async () => {
 		const f = fixture();
 		for (const target of [runtime, alias]) {
@@ -48,7 +52,7 @@ for (const [runtime, alias, executable] of [["ruby", " IRB ", "irb"], ["java", "
 		const launch = f.calls.find((call) => call.args[0] === "new-session");
 		assert.ok(launch);
 		assert.ok(launch.args.includes(`pi-repl-${runtime}`));
-		assert.match(launch.args.at(-1), new RegExp(`'${executable}${runtime === "matlab" ? " -sd " : "'$"}`));
+		assert.match(launch.args.at(-1), new RegExp(runtime === "matlab" ? `'${literal(executable)} -sd ` : `${literal(shellWord(executable))}$`));
 		const count = f.calls.length;
 		await f.command(`${runtime} --name example`);
 		assert.match(f.notifications.at(-1).message, /Named .* sessions are not implemented/);
