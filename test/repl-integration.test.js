@@ -1505,15 +1505,17 @@ test("octave's footer helper is bounded, and Ctrl-C while it waits still finishe
 	let began = Date.now();
 	assert.match((await f.send(`setenv('NODE_OPTIONS','--require=${keep}');\nfprintf('kept alive')`, { timeoutMs: 20000 })).content[0].text, /Output:\nkept alive$/);
 	assert.ok(Date.now() - began < 5000, `took ${Date.now() - began} ms`);
-	// One that blocks Node is cut off after 5 s.
-	const stall = hook("stall.cjs", "Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0, 30000);\n");
+	// One that blocks Node is stopped after 5 s, leaving only the cell's output.
+	const stall = hook("stall.cjs", "Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0, 10000);\n");
 	began = Date.now();
-	assert.match((await f.send(`setenv('NODE_OPTIONS','--require=${stall}');\nfprintf('stalled')`, { timeoutMs: 20000 })).content[0].text, /Output:\nstalled$/);
-	assert.ok(Date.now() - began < 12000, `took ${Date.now() - began} ms`);
+	const timed = await f.send(`setenv('NODE_OPTIONS','--require=${stall}');\nfprintf('timed')`, { timeoutMs: 20000 });
+	const took = Date.now() - began;
+	assert.equal(timed.content[0].text.split("Output:\n")[1], "timed");
+	assert.ok(took > 4500 && took < 10000, `took ${took} ms`);
 	// Ctrl-C while the footer waits interrupts Octave's cleanup action, which
-	// must still write the done file.
+	// must still write the done file; the helper must not outlive it.
 	const started = join(f.cwd, "started");
-	const marked = hook("marked.cjs", `require("node:fs").writeFileSync(${JSON.stringify(started)}, "");\nAtomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0, 4000);\n`);
+	const marked = hook("marked.cjs", `require("node:fs").writeFileSync(${JSON.stringify(started)}, String(process.pid));\nAtomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0, 4000);\n`);
 	const interrupt = (async () => {
 		await eventually(() => existsSync(started), 15000);
 		await f.tmux("send-keys", "-t", `${f.sessionName}:^`, "C-c");
@@ -1521,6 +1523,11 @@ test("octave's footer helper is bounded, and Ctrl-C while it waits still finishe
 	const interrupted = f.send(`setenv('NODE_OPTIONS','--require=${marked}');\nfprintf('interrupted')`, { timeoutMs: 20000 });
 	await interrupt;
 	assert.match((await interrupted).content[0].text, /Output:\n[\s\S]*interrupted/);
+	const helper = Number(readFileSync(started, "utf8"));
+	await eventually(() => {
+		try { process.kill(helper, 0); return false; }
+		catch (error) { if (error.code === "ESRCH") return true; throw error; }
+	}, 6000);
 	assert.match((await f.send("unsetenv('NODE_OPTIONS');\ndisp(6*7)")).content[0].text, /Output:\n42/);
 	assert.equal(readdirSync(process.env.PI_REPL_CONTROL_ROOT).length, 0);
 });

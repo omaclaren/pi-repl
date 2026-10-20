@@ -42,7 +42,10 @@ test("the footer's helper is bounded, and Octave writes the done file even if th
 	const display = createReplSubmissionDisplay({ entryId: "m-finish", origin: "pi-repl", code: "1", mode: "summary" });
 	const command = boundedCursorColumnCommand("/opt/node's/bin/node");
 	assert.match(command, /^\/bin\/sh -c '/);
-	assert.match(command, /kill -9/);
+	assert.match(command, /perl -e '"'"'alarm shift; exec @ARGV or exit 1'"'"' 5 /);
+	assert.doesNotMatch(command, /kill -9|; kill /);
+	assert.match(command, /trap '"'"'rm -f "\$f"'"'"' EXIT; trap '"'"'exit 1'"'"' HUP INT TERM/);
+	assert.match(command, /\[ "\$s" = 0 \]'$/);
 	assert.match(command, /process\.exit\(code\)/);
 	assert.match(command, /\/opt\/node'"'"'"'"'"'"'"'"'s\/bin\/node/);
 	assert.match(CURSOR_COLUMN_QUERY, /writeSync\(1,[\s\S]*process\.exit\(code\)/);

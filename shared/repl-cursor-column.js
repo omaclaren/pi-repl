@@ -9,22 +9,26 @@ const shellQuote = (value) => `'${value.replace(/'/g, `'"'"'`)}'`;
 
 /**
  * A command that runs the query under /bin/sh, whatever the caller's shell
- * (MATLAB's system() uses $SHELL), and kills the helper after 5 s, for
- * runtimes whose own process call can't be bounded (Octave and MATLAB
- * system()). The column passes through a temporary file, so a child the
- * helper leaves behind can't hold the caller's pipe open. The shell's own
- * messages, such as the one for the killed watchdog, are discarded.
+ * (MATLAB's system() uses $SHELL), for runtimes whose own process call can't
+ * be bounded (Octave and MATLAB system()). Perl's alarm outlives its exec, so
+ * it stops the helper itself after 5 s, with no process ID to reuse and no
+ * watchdog left behind. The column passes through a temporary file, so a
+ * child the helper leaves behind can't hold the caller's pipe open; the file
+ * is removed even when the script is interrupted. The shell's messages are
+ * discarded, and it exits only 0 or 1, so the caller never prints a signal
+ * status. Without perl, exec fails and it exits 1.
  */
 export function boundedCursorColumnCommand(nodePath) {
 	const script = [
 		"exec 2>/dev/null",
 		"f=$(mktemp) || exit 1",
-		`${shellQuote(nodePath)} -e ${shellQuote(CURSOR_COLUMN_QUERY)} >"$f" 2>/dev/null </dev/null & p=$!`,
-		'(sleep 5; kill -9 "$p") >/dev/null 2>&1 </dev/null & w=$!',
-		'wait "$p"; s=$?',
-		'kill "$w" 2>/dev/null',
-		'cat "$f"; rm -f "$f"',
-		'exit "$s"',
+		// Ctrl-C reaches this shell too; the file goes either way.
+		`trap 'rm -f "$f"' EXIT`,
+		"trap 'exit 1' HUP INT TERM",
+		`perl -e 'alarm shift; exec @ARGV or exit 1' 5 ${shellQuote(nodePath)} -e ${shellQuote(CURSOR_COLUMN_QUERY)} >"$f" </dev/null`,
+		"s=$?",
+		'cat "$f"',
+		'[ "$s" = 0 ]',
 	].join("; ");
 	return `/bin/sh -c ${shellQuote(script)}`;
 }
