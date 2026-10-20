@@ -4,6 +4,11 @@ All notable changes to `pi-repl` are documented here.
 
 ## [Unreleased]
 
+## [0.10.2] — 2026-10-20
+
+### Added
+- `stopVerifiedReplSession` takes an optional `isGnuplotSession` predicate, so a host such as pi-studio that names its own sessions can have its gnuplot sessions' marked Qt helpers cleaned up. It must return `true`; pi-repl's default still matches only `pi-repl-gnuplot`, so its behaviour is unchanged.
+
 ## [0.10.1] — 2026-10-20
 
 ### Fixed
