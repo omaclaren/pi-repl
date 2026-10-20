@@ -5,9 +5,11 @@ All notable changes to `pi-repl` are documented here.
 ## [Unreleased]
 
 ### Fixed
-- Ruby: Ctrl-C while a send's footer waits for the cursor column no longer leaves the send unfinished. irb raises `IRB::Abort`, which is not a `StandardError`, so the wrapper skipped writing its done file; it now always writes it.
+- Ruby: Ctrl-C while a send's footer waits for the cursor column no longer leaves the send unfinished. irb raises `IRB::Abort`, which is not a `StandardError`, so the wrapper skipped writing its done file; the done file is now written from an `ensure` block even when the footer is interrupted.
 - Octave: stopping a session no longer leaves an `octave-workspace` file in its working directory. Octave now starts with its workspace dump on SIGHUP and SIGTERM turned off.
 - The "Launch method" line shows the start command shell-quoted, as it is run.
+- Octave and MATLAB: the footer's Node helper is now limited to 5 s in all, as the other runtimes' helpers have been since 0.8.6. A Node startup hook (`NODE_OPTIONS`) that kept Node running or blocked it left the send unfinished. The helper runs under `/bin/sh` with a watchdog, and passes the column through a temporary file.
+- Octave: Ctrl-C while a send's footer waits no longer leaves the send unfinished. It interrupted Octave's cleanup action before the done file was written; the footer now runs inside `unwind_protect`.
 
 ## [0.10.0] — 2026-10-20
 

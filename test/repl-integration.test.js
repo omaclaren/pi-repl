@@ -1490,6 +1490,41 @@ test("stopping octave leaves no octave-workspace file", {
 	assert.equal(existsSync(join(f.cwd, "octave-workspace")), false, readdirSync(f.cwd).join(", "));
 });
 
+test("octave's footer helper is bounded, and Ctrl-C while it waits still finishes the send", {
+	timeout: 120000, skip: !(optionalRuntimes.has("all") || optionalRuntimes.has("octave")),
+}, async (t) => {
+	const f = await fixture(t, { runtime: "octave" });
+	if (!f) return;
+	const hook = (name, body) => {
+		const path = join(f.cwd, name);
+		writeFileSync(path, body);
+		return path;
+	};
+	// A startup hook that keeps Node alive no longer holds up the footer.
+	const keep = hook("keep.cjs", "setInterval(() => {}, 1000);\n");
+	let began = Date.now();
+	assert.match((await f.send(`setenv('NODE_OPTIONS','--require=${keep}');\nfprintf('kept alive')`, { timeoutMs: 20000 })).content[0].text, /Output:\nkept alive$/);
+	assert.ok(Date.now() - began < 5000, `took ${Date.now() - began} ms`);
+	// One that blocks Node is cut off after 5 s.
+	const stall = hook("stall.cjs", "Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0, 30000);\n");
+	began = Date.now();
+	assert.match((await f.send(`setenv('NODE_OPTIONS','--require=${stall}');\nfprintf('stalled')`, { timeoutMs: 20000 })).content[0].text, /Output:\nstalled$/);
+	assert.ok(Date.now() - began < 12000, `took ${Date.now() - began} ms`);
+	// Ctrl-C while the footer waits interrupts Octave's cleanup action, which
+	// must still write the done file.
+	const started = join(f.cwd, "started");
+	const marked = hook("marked.cjs", `require("node:fs").writeFileSync(${JSON.stringify(started)}, "");\nAtomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0, 4000);\n`);
+	const interrupt = (async () => {
+		await eventually(() => existsSync(started), 15000);
+		await f.tmux("send-keys", "-t", `${f.sessionName}:^`, "C-c");
+	})();
+	const interrupted = f.send(`setenv('NODE_OPTIONS','--require=${marked}');\nfprintf('interrupted')`, { timeoutMs: 20000 });
+	await interrupt;
+	assert.match((await interrupted).content[0].text, /Output:\n[\s\S]*interrupted/);
+	assert.match((await f.send("unsetenv('NODE_OPTIONS');\ndisp(6*7)")).content[0].text, /Output:\n42/);
+	assert.equal(readdirSync(process.env.PI_REPL_CONTROL_ROOT).length, 0);
+});
+
 test("ghci shell fallback preserves the footer gap if Node cannot start", {
 	timeout: 30000, skip: !(optionalRuntimes.has("all") || optionalRuntimes.has("ghci")),
 }, async (t) => {

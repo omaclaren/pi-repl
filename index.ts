@@ -37,6 +37,7 @@ import {
 } from "./shared/repl-control-files.js";
 
 import { createPrivateReplHistoryFile } from "./shared/repl-history.js";
+import { CURSOR_COLUMN_QUERY } from "./shared/repl-cursor-column.js";
 import { advancePaneView, describePaneActivity, observePane, paneActivityEnabled, paneActivityMode, paneActivitySince } from "./shared/repl-pane-activity.js";
 import { stopVerifiedReplSession } from "./shared/repl-session-stop.js";
 import { mStringLiteral, buildMLanguageControlSource, buildMLanguageDriverSource } from "./shared/repl-m-language.js";
@@ -1241,12 +1242,8 @@ function buildClojureDisplayStatements(display: ReplSubmissionDisplay, indent = 
 	return display.prefixLines.map((line) => `${indent}(clojure.core/println ${JSON.stringify(line)})`);
 }
 
-// Prints the pane's cursor column, or exits non-zero; tmux gets 500 ms. A
-// wrapper runs it with Node and ends a line before its footer unless it
-// prints 0. Only the wrapper reads its output, so it never reaches the pane.
-// process.exit ends Node even if a startup hook in NODE_OPTIONS would keep it
-// running, and each wrapper also limits the whole helper to 5 s.
-const CURSOR_COLUMN_QUERY = 'let code = 1; try { require("node:fs").writeSync(1, require("node:child_process").execFileSync("tmux", ["-N", "display-message", "-p", "-t", process.env.TMUX_PANE, "#{cursor_x}"], { encoding: "utf8", timeout: 500, killSignal: "SIGKILL", maxBuffer: 128, stdio: ["ignore", "pipe", "ignore"] }).trim()); code = 0; } catch {} process.exit(code);';
+// CURSOR_COLUMN_QUERY (shared/repl-cursor-column.js) prints the pane's cursor
+// column; each wrapper below also limits the whole helper to 5 s.
 
 function buildPythonFooter(display: ReplSubmissionDisplay): string[] {
 	if (!display.enabled) return [];
