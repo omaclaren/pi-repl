@@ -1644,7 +1644,7 @@ function buildReplCompletionLine(runtime: ImplementedRuntime, doneFile: string, 
 		// left open is ended, also when the query fails; then the display's
 		// suffix lines, if any. GHCi passes Ctrl-C to this shell, which would
 		// otherwise die before the done file; the trap isn't inherited, so the
-		// helper itself is still interrupted.
+		// helper's query is still interrupted.
 		const suffix = display.suffixLines.map((line) => `command printf '%s\\n' ${shellQuote(line)}; `).join("");
 		return `:! trap : INT; c=$(${boundedCursorColumnCommand(process.execPath)}) || c=; [ "$c" = 0 ] || command printf '\\n'; ${suffix}touch ${shellQuote(doneFile)}`;
 	}

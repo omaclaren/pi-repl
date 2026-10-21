@@ -1,7 +1,7 @@
 import test from "node:test";
 import assert from "node:assert/strict";
 import { mStringLiteral, buildMLanguageControlSource, buildMLanguageDriverSource, buildMLanguageFinish } from "../shared/repl-m-language.js";
-import { CURSOR_COLUMN_QUERY, boundedCursorColumnCommand } from "../shared/repl-cursor-column.js";
+import { CURSOR_COLUMN_QUERY, CURSOR_COLUMN_SUPERVISOR, boundedCursorColumnCommand } from "../shared/repl-cursor-column.js";
 import { createReplSubmissionDisplay } from "../shared/repl-submission-display.js";
 
 test("M-language strings quote ASCII and encode newlines, backslashes and Unicode as UTF-8", () => {
@@ -47,8 +47,9 @@ test("the footer's helper is bounded, and Octave writes the done file even if th
 	const display = createReplSubmissionDisplay({ entryId: "m-finish", origin: "pi-repl", code: "1", mode: "summary" });
 	const command = boundedCursorColumnCommand("/opt/node's/bin/node");
 	assert.match(command, /^\/bin\/sh -c '/);
-	assert.match(command, /perl -e '"'"'alarm shift; exec @ARGV or exit 1'"'"' 5 /);
-	assert.doesNotMatch(command, /kill -9|; kill /);
+	const script = command.slice("/bin/sh -c '".length, -1).replaceAll(`'"'"'`, "'");
+	assert.ok(script.includes(`NODE_OPTIONS= '/opt/node'"'"'s/bin/node' -e '${CURSOR_COLUMN_SUPERVISOR}' -- "\${NODE_OPTIONS-}" >"$f" </dev/null; s=$?`));
+	assert.doesNotMatch(command, /perl|alarm|kill -9|; kill /);
 	assert.match(command, /trap '"'"'rm -f "\$f"'"'"' EXIT; trap '"'"'exit 1'"'"' HUP INT TERM/);
 	assert.match(command, /\[ "\$s" = 0 \]'$/);
 	assert.match(command, /process\.exit\(code\)/);
@@ -57,7 +58,7 @@ test("the footer's helper is bounded, and Octave writes the done file even if th
 	const octave = buildMLanguageFinish("octave", "/tmp/123.done", display).split("\n");
 	assert.equal(octave[0], "unwind_protect");
 	assert.deepEqual(octave.slice(-3), ["unwind_protect_cleanup", "fclose(fopen('/tmp/123.done','w'));", "end_unwind_protect"]);
-	assert.ok(octave.some((line) => line.includes("system(") && line.includes("/bin/sh -c")));
+	assert.ok(octave.includes(`  [pi_repl_status,pi_repl_column]=system(${mStringLiteral(boundedCursorColumnCommand(process.execPath))});`));
 	// MATLAB has no unwind_protect, and completes its cleanup action anyway.
 	const matlab = buildMLanguageFinish("matlab", "/tmp/123.done", display).split("\n");
 	assert.ok(!matlab.some((line) => /unwind_protect/.test(line)));
