@@ -4,6 +4,14 @@ All notable changes to `pi-repl` are documented here.
 
 ## [Unreleased]
 
+## [0.10.5] — 2026-10-21
+
+### Fixed
+- GHCi, Octave and MATLAB: the footer's Node helper is now stopped after 5 s by a small Node supervisor, from pi-studio 0.11.0, instead of perl's `alarm`. A Node startup hook (`NODE_OPTIONS`) that caught SIGALRM held the send for as long as it stalled. The supervisor runs without `NODE_OPTIONS` and kills its query with SIGKILL, which can't be caught. The helper no longer needs perl.
+
+### Added
+- `shared/repl-cursor-column.js` exports `CURSOR_COLUMN_SUPERVISOR`, so pi-studio can use the same supervisor.
+
 ## [0.10.4] — 2026-10-21
 
 ### Fixed
