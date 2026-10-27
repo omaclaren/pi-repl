@@ -14,6 +14,8 @@
 //   sleep:<ms>     waits before replying, without reading other requests
 //   abort          an execute_reply with status "aborted", without running
 //   foreign-idle   an idle status for another request, then "real" 100 ms later
+//   ansi, cr, split-escape, display, clear   output for terminal-text cleaning
+//   exit:<n>       "dying", then onExit(n), as a runtime error ends LFortran's kernel
 import { createHmac, randomUUID } from "node:crypto";
 import net from "node:net";
 
@@ -120,7 +122,7 @@ class Peer {
 	}
 }
 
-export async function startFakeKernel({ key = randomUUID(), ignoreFirstKernelInfoPublishes = 0, delayFirstKernelInfoReplyMs = 0, stallChannels = [] } = {}) {
+export async function startFakeKernel({ key = randomUUID(), ignoreFirstKernelInfoPublishes = 0, delayFirstKernelInfoReplyMs = 0, stallChannels = [], onExit } = {}) {
 	const session = randomUUID();
 	const sign = (parts) => createHmac("sha256", key).update(Buffer.concat(parts.map((p) => Buffer.from(p)))).digest("hex");
 	const peers = { shell: [], stdin: [], control: [], iopub: [], hb: [] };
@@ -177,7 +179,26 @@ export async function startFakeKernel({ key = randomUUID(), ignoreFirstKernelInf
 			publish("stream", { name: "stdout", text: "forged" }, parent, { badSignature: true });
 			publish("stream", { name: "stdout", text: "genuine" }, parent);
 		} else if (code.startsWith("sleep:")) await new Promise((r) => setTimeout(r, Number(code.slice(6))));
-		else if (code === "foreign-idle") {
+		else if (code === "ansi") publish("stream", { name: "stderr", text: "\x1b[31mred\x1b[0m warning\n" }, parent);
+		else if (code === "cr") {
+			publish("stream", { name: "stdout", text: "50%\r" }, parent);
+			publish("stream", { name: "stdout", text: "100%\n" }, parent);
+		} else if (code === "split-escape") {
+			publish("stream", { name: "stdout", text: "a\x1b[3" }, parent);
+			publish("stream", { name: "stdout", text: "1mb\n" }, parent);
+		} else if (code === "display") {
+			publish("display_data", { data: { "image/png": "iVBOR" }, metadata: {} }, parent);
+			publish("execute_result", { data: { "text/plain": "42" }, metadata: {}, execution_count: 1 }, parent);
+		} else if (code === "clear") {
+			publish("stream", { name: "stdout", text: "x\n" }, parent);
+			publish("clear_output", { wait: false }, parent);
+			publish("stream", { name: "stdout", text: "y\n" }, parent);
+		} else if (code.startsWith("exit:")) {
+			publish("stream", { name: "stdout", text: "dying\n" }, parent);
+			await new Promise((r) => setTimeout(r, 50));
+			onExit?.(Number(code.slice(5)));
+			return;
+		} else if (code === "foreign-idle") {
 			publish("status", { execution_state: "idle" }, { ...parent, msg_id: "another-request" });
 			await new Promise((r) => setTimeout(r, 100));
 			publish("stream", { name: "stdout", text: "real" }, parent);

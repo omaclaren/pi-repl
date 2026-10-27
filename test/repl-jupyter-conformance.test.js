@@ -120,3 +120,53 @@ test("ipykernel: cells, a result, input() and an error", { skip: !IPYKERNEL_PYTH
 	assert.equal(failed.reply.content.status, "error");
 	assert.equal(failed.iopub.find((m) => m.header.msg_type === "error")?.content.ename, "ZeroDivisionError");
 });
+
+test("the helper with LFortran: a cell, a READ, another client's cell, and a runtime error ending the kernel", { skip: !LFORTRAN && "set PI_REPL_LFORTRAN" }, async (t) => {
+	const { HelperClient, JupyterHelper } = await import("../shared/repl-jupyter-helper.js");
+	const dir = mkdtempSync("/tmp/pi-rj-conf-");
+	const helper = new JupyterHelper({ dir, kernelCommand: (file) => [LFORTRAN, ["kernel", "-f", file, "--managed"]], startTimeoutMs: 60_000 });
+	t.after(async () => {
+		await helper.stop({ killKernel: true });
+		rmSync(dir, { recursive: true, force: true });
+	});
+	await helper.start();
+	const client = await HelperClient.connect(helper.paths.socket);
+	t.after(() => client.close());
+	const { lifetimeId } = await client.request("hello");
+	let n = 0;
+	const settle = async (snapshot, untilInput = false) => {
+		while (!["completed", "unconfirmed", "not-sent"].includes(snapshot.state) && !(untilInput && snapshot.state === "waiting-input")) {
+			snapshot = await client.request("wait", { executionId: snapshot.executionId, since: snapshot.version, timeoutMs: 30_000 }, { timeoutMs: 40_000 });
+		}
+		return snapshot;
+	};
+	const run = (code, untilInput) => client.request("execute", { lifetimeId, submissionId: `conformance-${process.pid}-${++n}`, code }).then((s) => settle(s, untilInput));
+
+	const printed = await run("print *, 6 * 7");
+	assert.equal(printed.status, "ok");
+	assert.match(printed.output.text, /^\s*42\s*$/);
+
+	const waiting = await run("integer :: k\nread(*,*) k\nprint *, 'got', k", true);
+	assert.equal(waiting.state, "waiting-input");
+	const read = await settle(await client.request("input", { lifetimeId, token: waiting.input.token, text: "9\n" }));
+	assert.equal(read.status, "ok");
+	assert.match(read.output.text, /got\s+9/);
+
+	const other = await JupyterClient.connect(readConnectionFile(helper.paths.connection), { timeoutMs: 30_000 });
+	t.after(() => other.close());
+	await run2(other, "print *, k + 1");
+	const journal = await client.request("journal", { since: 1, limit: 1000 });
+	assert.ok(journal.events.some((e) => e.kind === "iopub" && e.msgType === "execute_input" && e.code === "print *, k + 1" && e.parentSession === other.session.session));
+
+	const crashed = await run("integer :: a(3), m\nm = 5\na(m) = 1");
+	assert.equal(crashed.state, "unconfirmed");
+	assert.equal(crashed.outcome.exit.code, 1);
+	assert.equal((await client.request("status")).state, "kernel-exited");
+});
+
+async function run2(client, code) {
+	const request = client.prepareExecute(code);
+	const done = waitForExecution(client, request, { timeoutMs: 60_000 });
+	client.post("shell", request);
+	return done;
+}
