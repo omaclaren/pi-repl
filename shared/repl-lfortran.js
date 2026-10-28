@@ -231,7 +231,7 @@ export async function answerLfortranInput({ tmux, token, text, timeoutMs = 20_00
 			if (error.code === "invalid-input") throw new Error(`${error.message} Nothing was sent; the READ still waits for its token.`);
 			if (error.code === "input-not-sent") throw new Error(`${error.message} The READ still waits for its token.`);
 			if (error.code) throw new Error(`The LFortran session refused the answer: ${error.message}`);
-			throw new Error(`The connection to the LFortran session's helper failed while answering (${error.message}); the answer may or may not have been delivered, and its token can't be used again. Check repl_status target='lfortran'.`);
+			throw new Error(`The connection to the LFortran session's helper failed while answering (${error.message}), so whether the answer arrived isn't known. Check repl_status target='lfortran' before answering again: if the READ still waits with this token, the answer didn't arrive; if not, it did.`);
 		}
 		snapshot = await waitForTransition(client, snapshot, { deadline, signal });
 		return { text: formatExecution(snapshot, { timeoutMs }), details: executionDetails({ ...snapshot, lifetimeId: hello.lifetimeId }, hello) };
@@ -256,7 +256,7 @@ export async function lfortranStatus({ tmux, execution }) {
 			return { text: formatExecution(found), details: { runtime: "lfortran", sessionName: LFORTRAN_SESSION_NAME, running: true, execution: executionDetails(found) } };
 		} catch (error) {
 			if (error.code === "unknown-execution") throw new Error(`No cell with that ID reached this LFortran session (${execution}); if a send failed before the helper took it, it didn't run here.`);
-			if (error.code === "expired") throw new Error(`That cell ran (${error.details?.state}${error.details?.status ? `, ${error.details.status}` : ""}), but this session no longer keeps its output.`);
+			if (error.code === "expired") throw new Error(`This session no longer keeps that cell's output; its last state was ${error.details?.state}${error.details?.status ? ` (${error.details.status})` : ""}. It won't be run again.`);
 			throw error;
 		} finally {
 			client.close();
@@ -293,14 +293,20 @@ export async function lfortranStatus({ tmux, execution }) {
 	};
 }
 
-/** The verified stop, as the person asked for it. */
-export async function stopLfortranSession({ tmux }) {
+/**
+ * The verified stop, as the person asked for it.
+ * @param {{ tmux: Tmux, stop?: typeof stopVerifiedJupyterSession }} options
+ */
+export async function stopLfortranSession({ tmux, stop = stopVerifiedJupyterSession }) {
 	const identity = await readSessionIdentity(tmux, LFORTRAN_SESSION_NAME);
 	if (!identity) return { text: noSession(), details: { stopped: false, warnings: [] } };
-	const result = await stopVerifiedJupyterSession({ tmux });
+	const result = await stop({ tmux });
 	const cleaned = result.signals.length ? ` Cleaned up ${new Set(result.signals.map((entry) => entry.pid)).size} surviving process(es).` : "";
+	const said = result.verified
+		? `Stopped the shared LFortran session: ${LFORTRAN_SESSION_NAME}. Its prompt, helper and kernel exited, which ends the session for every client of the kernel.${cleaned}`
+		: `Partly stopped the shared LFortran session: the tmux session ${LFORTRAN_SESSION_NAME} was removed, and the processes pi-repl found have ended${result.signals.length ? ` (${new Set(result.signals.map((entry) => entry.pid)).size} after a signal)` : ""}. It couldn't confirm that the session's helper and kernel ended too: check for them before starting a new one.`;
 	return {
-		text: `Stopped the shared LFortran session: ${LFORTRAN_SESSION_NAME}. Its prompt, helper and kernel exited, which ends the session for every client of the kernel.${cleaned}${result.warnings.length ? `\n${result.warnings.join("\n")}` : ""}`,
+		text: `${said}${result.warnings.length ? `\n${result.warnings.join("\n")}` : ""}`,
 		details: { stopped: true, ...result },
 	};
 }

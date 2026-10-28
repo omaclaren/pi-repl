@@ -10,8 +10,8 @@
 
 import { execFile } from "node:child_process";
 import { randomBytes } from "node:crypto";
-import { chmodSync, closeSync, constants, fstatSync, lstatSync, mkdirSync, openSync, readdirSync, readSync, realpathSync, rmdirSync, unlinkSync, writeSync } from "node:fs";
-import { basename, join } from "node:path";
+import { chmodSync, closeSync, constants, fstatSync, lstatSync, mkdirSync, openSync, readdirSync, readSync, realpathSync, renameSync, rmdirSync, unlinkSync, writeSync } from "node:fs";
+import { basename, dirname, join } from "node:path";
 import { fileURLToPath } from "node:url";
 import { HELPER_FILES, HELPER_PROTOCOL_VERSION, HelperClient, checkPrivateDirectory } from "./repl-jupyter-helper.js";
 import { readOwnerMarkers } from "./repl-gnuplot-processes.js";
@@ -133,20 +133,12 @@ export function validSessionDir(dir, { root = "/tmp", uid = process.getuid() } =
  * `owner`; otherwise null.
  */
 export function sessionDirOwnedBy(dir, owner, { root = "/tmp", uid = process.getuid() } = {}) {
-	if (!OWNER.test(owner ?? "") || !validSessionDir(dir, { root, uid })) return null;
-	let fd;
+	if (!OWNER.test(owner ?? "") || !validSessionDir(dir, { root, uid }) || readLaunch(dir, uid) !== owner) return null;
 	try {
-		fd = openSync(join(dir, LAUNCH_FILE), constants.O_RDONLY | constants.O_NOFOLLOW | constants.O_NONBLOCK);
-		const stat = fstatSync(fd);
-		if (!stat.isFile() || stat.uid !== uid || stat.size > 64) return null;
-		const buffer = Buffer.alloc(64);
-		if (buffer.subarray(0, readSync(fd, buffer, 0, buffer.length, 0)).toString("ascii").trim() !== owner) return null;
 		const { dev, ino } = lstatSync(dir);
 		return { dev, ino };
 	} catch {
 		return null;
-	} finally {
-		if (fd !== undefined) closeSync(fd);
 	}
 }
 
@@ -387,34 +379,83 @@ export async function startJupyterSession({
 
 /**
  * Removes a stopped session's control files from DIR, and then DIR, but only
- * while DIR is still the directory `expected` names ({ dev, ino }) and its
- * launch file names `owner`: only the names pi-repl and the helper write, and
- * only regular files and sockets of this user's; nothing is followed through
- * a link. The launch file goes last. Resolves with warnings for what stays.
+ * the directory `expected` names ({ dev, ino }), whose launch file names
+ * `owner`. DIR is first renamed to a private name beside it, and checked
+ * there, so that what is removed stays bound to that directory even if its
+ * path is reused meanwhile; before each removal it is checked again, and the
+ * removal stops if it has changed. Only the names pi-repl and the helper
+ * write are removed, only regular files and sockets of this user's, and
+ * nothing is followed through a link; the launch file goes last. Resolves
+ * with warnings for what stays. `hooks` let tests act between the steps.
  */
-export function removeSessionDir(dir, { root = "/tmp", uid = process.getuid(), owner, expected } = {}) {
+export function removeSessionDir(dir, { root = "/tmp", uid = process.getuid(), owner, expected, hooks = {} } = {}) {
+	const leftAlone = [`The session's directory ${dir} isn't this session's any more (or never was); it was left alone.`];
 	const owned = sessionDirOwnedBy(dir, owner, { root, uid });
-	if (!owned || (expected && (owned.dev !== expected.dev || owned.ino !== expected.ino))) {
-		return [`The session's directory ${dir} isn't this session's any more (or never was); it was left alone.`];
+	if (!owned || (expected && (owned.dev !== expected.dev || owned.ino !== expected.ino))) return leftAlone;
+	hooks.beforeRename?.();
+	const retiring = join(dirname(dir), `.removing-${basename(dir)}-${randomBytes(4).toString("hex")}`);
+	try {
+		renameSync(dir, retiring);
+	} catch (error) {
+		return [`Could not remove ${dir}: ${error.message}`];
 	}
+	const same = () => {
+		try {
+			const stat = lstatSync(retiring);
+			return stat.isDirectory() && stat.dev === owned.dev && stat.ino === owned.ino;
+		} catch {
+			return false;
+		}
+	};
+	if (!same() || readLaunch(retiring, uid) !== owner) {
+		// Not the directory that was checked: it is put back, untouched.
+		try { renameSync(retiring, dir); } catch {}
+		return leftAlone;
+	}
+	hooks.afterRename?.(retiring);
 	const warnings = [];
 	const known = new Set([...Object.values(HELPER_FILES), LAUNCH_FILE]);
-	const names = readdirSync(dir).sort((a, b) => (a === LAUNCH_FILE) - (b === LAUNCH_FILE));
+	const names = readdirSync(retiring).sort((a, b) => (a === LAUNCH_FILE) - (b === LAUNCH_FILE));
 	for (const name of names) {
-		const path = join(dir, name);
+		const path = join(retiring, name);
 		if (!known.has(name) && !/^out-[0-9a-f]{32}\.txt$/.test(name) && !/^\.ready-[0-9a-f]{12}$/.test(name)) {
-			warnings.push(`Left ${path}: pi-repl didn't make it.`);
+			warnings.push(`Left ${join(dir, name)}: pi-repl didn't make it.`);
 			continue;
+		}
+		if (!same()) {
+			warnings.push(`${dir} changed while it was being removed; the rest was left in ${retiring}.`);
+			return warnings;
 		}
 		const stat = lstatSync(path);
 		if ((!stat.isFile() && !stat.isSocket()) || stat.uid !== uid) {
-			warnings.push(`Left ${path}: it isn't a file or socket of this user's.`);
+			warnings.push(`Left ${join(dir, name)}: it isn't a file or socket of this user's.`);
 			continue;
 		}
-		try { unlinkSync(path); } catch (error) { if (error.code !== "ENOENT") warnings.push(`Could not remove ${path}: ${error.message}`); }
+		try { unlinkSync(path); } catch (error) { if (error.code !== "ENOENT") warnings.push(`Could not remove ${join(dir, name)}: ${error.message}`); }
 	}
-	try { rmdirSync(dir); } catch (error) { if (error.code !== "ENOENT") warnings.push(`Could not remove ${dir}: ${error.message}`); }
+	if (warnings.length) {
+		// What was left stays where it was found.
+		try { renameSync(retiring, dir); } catch { warnings.push(`What was left is in ${retiring}.`); }
+		return warnings;
+	}
+	try { rmdirSync(retiring); } catch (error) { if (error.code !== "ENOENT") warnings.push(`Could not remove ${retiring}: ${error.message}`); }
 	return warnings;
+}
+
+/** DIR/launch's owner marker, read without following a link, if it is a small file of this user's. */
+function readLaunch(dir, uid) {
+	let fd;
+	try {
+		fd = openSync(join(dir, LAUNCH_FILE), constants.O_RDONLY | constants.O_NOFOLLOW | constants.O_NONBLOCK);
+		const stat = fstatSync(fd);
+		if (!stat.isFile() || stat.uid !== uid || stat.size > 64) return null;
+		const buffer = Buffer.alloc(64);
+		return buffer.subarray(0, readSync(fd, buffer, 0, buffer.length, 0)).toString("ascii").trim();
+	} catch {
+		return null;
+	} finally {
+		if (fd !== undefined) closeSync(fd);
+	}
 }
 
 /** A PID in a file of DIR's, read without following a link. */
@@ -479,7 +520,8 @@ export async function findMarkedJupyterProcesses(table, { owner, dir, lfortran, 
 			if (p.uid === uid && p.ppid === 1 && /^\?+$/.test(p.tty) && live(p) && startedAtSeconds(p.startedAt) >= since - 2) candidates.add(p.pid);
 		}
 	}
-	const inspected = [...candidates].filter((pid) => table.some((p) => p.pid === pid && p.uid === uid && live(p)));
+	const byPid = new Map(table.map((p) => [p.pid, p]));
+	const inspected = [...candidates].filter((pid) => byPid.get(pid)?.uid === uid && live(byPid.get(pid)));
 	const incomplete = inspected.length > MAX_MARKER_CANDIDATES;
 	const rows = [];
 	for (let i = 0; i < Math.min(inspected.length, MAX_MARKER_CANDIDATES); i += MARKER_BATCH) {
@@ -493,7 +535,7 @@ export async function findMarkedJupyterProcesses(table, { owner, dir, lfortran, 
 		const unread = failed.find((row) => fresh.some((p) => p.pid === row.pid && live(p) && processKey(p) === processKey(known(row.pid))));
 		if (unread) throw new Error(`Could not inspect LFortran session ownership for PID ${unread.pid}; refusing unverified cleanup.`);
 	}
-	return { marked: rows.filter((row) => row.owner === owner && !row.gone && !row.error).map((row) => table.find((p) => p.pid === row.pid)).filter(Boolean), incomplete };
+	return { marked: rows.filter((row) => row.owner === owner && !row.gone && !row.error).map((row) => byPid.get(row.pid)).filter(Boolean), incomplete };
 }
 
 /** The owner-marker values safe to compare inside a tmux format. */
@@ -572,8 +614,18 @@ export async function stopVerifiedJupyterSession({
 			throw new Error("Session ownership changed while preparing shutdown; nothing was stopped.");
 		}
 		await rememberMarked(repeatTable, repeatPanes);
+		// The marker readers take time: births, panes and the marker's sole owner are checked
+		// again after them, from a fresh snapshot, before tmux acts.
+		const freshPanes = await readPanes(tmux);
+		const freshTable = await snapshot();
+		guardOwner(await readSessionIdentities(tmux));
+		const freshSelected = sessionPanes(freshPanes);
+		if (!freshSelected.length || fingerprint(freshSelected) !== originalFingerprint || !freshTable.some((p) => live(p) && processKey(p) === processKey(server)) ||
+			selected.filter((pane) => pane.dead === "0").some((pane) => !freshTable.some((p) => live(p) && p.pid === pane.pid && tracker.owned.has(processKey(p))))) {
+			throw new Error("Session ownership changed during process inspection; nothing was stopped.");
+		}
 		// The descendants known now stay known after their parents go and they are reparented.
-		tracker.refresh(repeatTable, others(repeatPanes));
+		tracker.refresh(freshTable, others(freshPanes));
 	} catch (error) {
 		if (/nothing was stopped|no signal was sent|Nothing was stopped/.test(error.message)) throw error;
 		throw new Error(`${error.message} Nothing was stopped.`, { cause: error });
@@ -594,7 +646,12 @@ export async function stopVerifiedJupyterSession({
 		await rememberMarked(currentTable, currentPanes);
 		return tracker.refresh(currentTable, currentPanes);
 	}
-	const recheck = async () => tracker.refresh(await snapshot(), await readPanes(tmux));
+	// Immediately before each signal: fresh births and pane protections, and the marker still this session's alone.
+	const recheck = async () => {
+		const freshPanes = await readPanes(tmux);
+		guardOwner(await readSessionIdentities(tmux));
+		return tracker.refresh(await snapshot(), freshPanes);
+	};
 	let signals;
 	try {
 		signals = await endVerifiedSurvivors({ tracker, inspect, recheck, signal, graceMs, termMs, killMs });
@@ -602,9 +659,10 @@ export async function stopVerifiedJupyterSession({
 		throw new Error(`Stop requested for ${sessionName}, but runtime cleanup could not be fully verified: ${error.message} Inspect remaining processes manually; its directory${dir ? ` (${dir})` : ""} and clean records were kept.`, { cause: error });
 	}
 	if (incomplete) {
-		warnings.push(`Too many detached processes to inspect them all for the session's marker; some that the kernel started may remain. Its directory (${dir ?? "unknown"}) was kept.`);
+		warnings.push(`There were too many detached processes to inspect them all for the session's marker, so its helper, kernel or what the kernel started may still be running. Its directory (${dir ?? "unknown"}) was kept.`);
 	} else if (dir) {
 		warnings.push(...removeSessionDir(dir, { root, uid, owner, expected: dirIdentity }));
 	}
-	return { sessionName, processCount: tracker.owned.size, signals, warnings, dir };
+	// `verified`: every process found ended. Not so if the search was incomplete.
+	return { sessionName, processCount: tracker.owned.size, signals, warnings, dir, verified: !incomplete };
 }

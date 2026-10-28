@@ -3066,7 +3066,7 @@ async function handleLfortranCommand(pi: ExtensionAPI, ctx: ExtensionCommandCont
 			notify(ctx, (await lfortranStatus({ tmux })).text, "info");
 		} else if (command === "stop") {
 			const result = await stopLfortranSession({ tmux });
-			notify(ctx, result.text, result.details.stopped && !result.details.warnings?.length ? "info" : "warning");
+			notify(ctx, result.text, result.details.stopped && (result.details as { verified?: boolean }).verified !== false && !result.details.warnings?.length ? "info" : "warning");
 		} else {
 			notify(ctx, [formatAttachInstructions("pi-repl-lfortran", pi), "LFortran's own prompt is the session's first window; the helper runs in the second."].join("\n"), "info");
 		}

@@ -5,9 +5,12 @@ import assert from "node:assert/strict";
 import { execFile } from "node:child_process";
 import { randomUUID } from "node:crypto";
 import { getEventListeners } from "node:events";
+import { mkdtempSync, rmSync } from "node:fs";
+import net from "node:net";
+import { join } from "node:path";
 import { promisify } from "node:util";
 import { DEFAULT_MAX_BYTES } from "@earendil-works/pi-coding-agent";
-import { formatExecution } from "../shared/repl-lfortran.js";
+import { answerLfortranInput, formatExecution, lfortranStatus } from "../shared/repl-lfortran.js";
 import { REAL_LFORTRAN, defer, lfortranFixture, until } from "./helpers/repl-test-lfortran.js";
 
 const exec = promisify(execFile);
@@ -166,6 +169,35 @@ test("an outcome says only what's known: the kernel's exit, a lost connection, a
 	assert.match(spool({ state: "complete", full: true }), /The full received output is in \/d\/out\.txt/);
 	assert.match(spool({ state: "complete", full: false, capped: true }), /Part of the rest is in \/d\/out\.txt; the file reached its size limit/);
 	assert.match(spool({ state: "failed", error: "ENOSPC" }), /writing the rest to a file failed \(ENOSPC\)/);
+});
+
+test("recovery messages say only what's known: an expired cell's last state, and an answer whose delivery is unknown", async (t) => {
+	const dir = mkdtempSync("/tmp/pi-rj-fh-");
+	defer(t, () => rmSync(dir, { recursive: true, force: true }));
+	const owner = "b".repeat(32);
+	// A helper that answers hello, says a cell is no longer kept, and drops the connection mid-answer.
+	const server = net.createServer((socket) => {
+		let buffered = "";
+		socket.on("error", () => {});
+		socket.on("data", (chunk) => {
+			buffered += chunk;
+			let newline;
+			while ((newline = buffered.indexOf("\n")) >= 0) {
+				const request = JSON.parse(buffered.slice(0, newline));
+				buffered = buffered.slice(newline + 1);
+				if (request.op === "hello") socket.write(JSON.stringify({ id: request.id, ok: true, result: { protocol: 1, launchId: owner, lifetimeId: "c".repeat(32), state: "ready" } }) + "\n");
+				else if (request.op === "lookup") socket.write(JSON.stringify({ id: request.id, ok: false, error: { code: "expired", message: "gone", executionId: "e".repeat(32), state: "not-sent", status: null } }) + "\n");
+				else socket.destroy();
+			}
+		});
+	});
+	await new Promise((resolve) => server.listen(join(dir, "h.sock"), resolve));
+	defer(t, () => new Promise((resolve) => server.close(resolve)));
+	const tmux = async (args) => args[0] === "list-sessions"
+		? { code: 0, stdout: ["pi-repl-lfortran", "$1", "1800000000", "lfortran", "jupyter-helper", owner, dir, "", "%1", "%2"].join("\t") + "\n", stderr: "" }
+		: { code: 1, stdout: "", stderr: "not in this test" };
+	await assert.rejects(lfortranStatus({ tmux, execution: "e".repeat(32) }), (error) => /no longer keeps that cell's output; its last state was not-sent/.test(error.message) && !/\bran\b/.test(error.message));
+	await assert.rejects(answerLfortranInput({ tmux, token: "d".repeat(32), text: "1" }), (error) => /whether the answer arrived isn't known[\s\S]*if the READ still waits with this token, the answer didn't arrive/.test(error.message) && !/can't be used again/.test(error.message));
 });
 
 test("with LFortran: repl_start, repl_send, and a READ through repl_input", { skip: !REAL_LFORTRAN && "set PI_REPL_LFORTRAN" }, async (t) => {

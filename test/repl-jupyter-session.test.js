@@ -1,7 +1,7 @@
 import test from "node:test";
 import assert from "node:assert/strict";
 import { execFile } from "node:child_process";
-import { chmodSync, existsSync, lstatSync, mkdirSync, mkdtempSync, readFileSync, rmSync, symlinkSync, writeFileSync } from "node:fs";
+import { chmodSync, existsSync, lstatSync, mkdirSync, mkdtempSync, readFileSync, readdirSync, renameSync, rmSync, symlinkSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
 import { HelperClient } from "../shared/repl-jupyter-helper.js";
 import {
@@ -87,7 +87,8 @@ test("a session directory is new, private, short and claimed; only its own launc
 	assert.match(removeSessionDir(dir, { root, uid, owner, expected: { dev: -1, ino: -1 } })[0], /isn't this session's/);
 	assert.ok(existsSync(join(dir, "k.json")));
 	const warnings = removeSessionDir(dir, { root, uid, owner, expected: sessionDirOwnedBy(dir, owner, { root, uid }) });
-	assert.equal(warnings.length, 3, warnings.join("\n"));
+	// What can't be removed is left where it was, in DIR.
+	assert.equal(warnings.length, 2, warnings.join("\n"));
 	assert.match(warnings.join("\n"), /notes\.txt: pi-repl didn't make it/);
 	assert.match(warnings.join("\n"), /h\.sock: it isn't a file or socket/);
 	assert.ok(existsSync(join(dir, "notes.txt")) && lstatSync(join(dir, "h.sock")).isSymbolicLink());
@@ -100,6 +101,116 @@ test("a session directory is new, private, short and claimed; only its own launc
 	assert.match(removeSessionDir(open, { root, uid, owner })[0], /left alone/);
 	assert.ok(existsSync(join(open, "k.json")));
 	assert.throws(() => createSessionDir({ root, uid }), /owner marker/);
+
+	// DIR replaced after it was checked and before it was taken: the replacement is put back, untouched.
+	const first = createSessionDir({ root, uid, owner });
+	const checked = sessionDirOwnedBy(first, owner, { root, uid });
+	const replace = (path, marker) => {
+		renameSync(path, `${path}.moved`);
+		mkdirSync(path, { mode: 0o700 });
+		writeFileSync(join(path, LAUNCH_FILE), `${marker}\n`);
+		writeFileSync(join(path, "k.json"), "theirs");
+	};
+	const swapped = removeSessionDir(first, { root, uid, owner, expected: checked, hooks: { beforeRename: () => replace(first, "b".repeat(32)) } });
+	assert.match(swapped[0], /isn't this session's/);
+	assert.equal(readFileSync(join(first, "k.json"), "utf8"), "theirs");
+	// DIR's path reused once it was taken: only the taken directory is emptied, and the new one at the path is left alone.
+	const second = createSessionDir({ root, uid, owner });
+	writeFileSync(join(second, "k.json"), "ours");
+	const removed = removeSessionDir(second, { root, uid, owner, expected: sessionDirOwnedBy(second, owner, { root, uid }), hooks: { afterRename: () => {
+		mkdirSync(second, { mode: 0o700 });
+		writeFileSync(join(second, LAUNCH_FILE), `${"b".repeat(32)}\n`);
+		writeFileSync(join(second, "k.json"), "theirs");
+	} } });
+	assert.deepEqual(removed, []);
+	assert.equal(readFileSync(join(second, "k.json"), "utf8"), "theirs");
+	assert.deepEqual(readdirSync(join(root, `pi-rj-${uid}`)).filter((name) => name.startsWith(".removing-")), [], "the taken directory is gone");
+	// Changed while it was being emptied: the removal stops.
+	const third = createSessionDir({ root, uid, owner });
+	for (const name of ["k.json", "kernel.log", "ready.json"]) writeFileSync(join(third, name), "x");
+	const stopped = removeSessionDir(third, { root, uid, owner, expected: sessionDirOwnedBy(third, owner, { root, uid }), hooks: { afterRename: (taken) => {
+		renameSync(taken, `${taken}.elsewhere`);
+		mkdirSync(taken, { mode: 0o700 });
+		writeFileSync(join(taken, "k.json"), "theirs");
+	} } });
+	assert.match(stopped.join("\n"), /changed while it was being removed/);
+});
+
+/**
+ * The verified stop against a fake tmux and process table, so that a test
+ * can change things exactly during a marker scan: the person's pane %1, the
+ * helper's %2, and the kernel 1003, the helper's child, which the kill leaves
+ * running.
+ */
+function fakeStop({ onMarked, incomplete = false } = {}) {
+	const owner = "a".repeat(32);
+	const birth = "Wed Oct 28 10:00:00 2026";
+	const proc = (pid, extra = {}) => ({ pid, ppid: 900, pgid: pid, uid, tty: "ttys100", startedAt: birth, state: "S", ...extra });
+	const session = (name, id, marker) => [name, id, "1800000000", "lfortran", JUPYTER_SEND_PATH, marker, "", "", "%1", "%2"].join("\t");
+	const state = {
+		owner,
+		sessions: [session("pi-repl-lfortran", "$1", owner)],
+		panes: [["%1", 1001, "/dev/ttys100", "@1", 0], ["%2", 1002, "/dev/ttys101", "@2", 1]],
+		table: [proc(900, { ppid: 1, tty: "??" }), proc(1001), proc(1002, { tty: "ttys101" }), proc(1003, { ppid: 1002, tty: "??" }), proc(9999, { ppid: 1, tty: "??" })],
+		calls: [], signals: [], marked: 0, killed: false,
+		share() { state.sessions.push(session("elsewhere", "$9", owner)); },
+	};
+	const tmux = async (args) => {
+		state.calls.push(args[0]);
+		if (args[0] === "list-sessions") return { code: 0, stdout: state.sessions.join("\n") + "\n", stderr: "" };
+		if (args[0] === "list-panes") return { code: 0, stdout: state.panes.map(([paneId, pid, tty, windowId, windowIndex]) => [900, "$1", "pi-repl-lfortran", "1800000000", paneId, pid, tty, "0", windowId, windowIndex, 0, "0", "", ""].join("\t")).join("\n") + "\n", stderr: "" };
+		if (args[0] === "if-shell") {
+			// The kill ends the panes' processes; the detached kernel goes on.
+			state.killed = true;
+			state.sessions = state.sessions.filter((row) => !row.startsWith("pi-repl-lfortran\t"));
+			state.panes = [];
+			state.table = state.table.filter((p) => p.pid !== 1001 && p.pid !== 1002);
+			return { code: 0, stdout: "", stderr: "" };
+		}
+		throw new Error(`unexpected tmux ${args[0]}`);
+	};
+	const stop = () => stopVerifiedJupyterSession({
+		tmux, currentPid: 9999, uid, graceMs: 0, termMs: 0, killMs: 10,
+		snapshot: async () => state.table.map((p) => ({ ...p })),
+		signal: (pid, value) => { state.signals.push({ pid, value }); state.table = state.table.filter((p) => p.pid !== pid); },
+		findMarked: async (table) => {
+			onMarked?.(state, ++state.marked);
+			return { marked: table.filter((p) => p.pid === 1003), incomplete };
+		},
+	});
+	return { state, stop, tmux };
+}
+
+test("stop rechecks births after its marker scans, and the marker's owner before each signal", async () => {
+	// A pane's process replaced during the second marker scan, before the kill.
+	const reborn = fakeStop({ onMarked: (state, call) => {
+		if (call === 2) state.table = state.table.map((p) => (p.pid === 1001 ? { ...p, startedAt: "Wed Oct 28 11:00:00 2026" } : p));
+	} });
+	await assert.rejects(reborn.stop(), /changed during process inspection; nothing was stopped/);
+	assert.equal(reborn.state.calls.includes("if-shell"), false, "nothing was killed");
+
+	// The marker shared during the last scan before a signal: no signal is sent.
+	const shared = fakeStop({ onMarked: (state, call) => { if (state.killed && call === 4) state.share(); } });
+	await assert.rejects(shared.stop(), /shared with another session/);
+	assert.deepEqual(shared.state.signals, []);
+
+	// Untouched, it stops the kernel too.
+	const plain = fakeStop();
+	const result = await plain.stop();
+	assert.deepEqual(plain.state.signals, [{ pid: 1003, value: "SIGTERM" }]);
+	assert.equal(result.verified, true);
+});
+
+test("a stop whose search was incomplete says it is partial", async () => {
+	const f = fakeStop({ incomplete: true });
+	const result = await f.stop();
+	assert.equal(result.verified, false);
+	assert.match(result.warnings.join("\n"), /too many detached processes[\s\S]*may still be running/);
+	const { stopLfortranSession } = await import("../shared/repl-lfortran.js");
+	const again = fakeStop({ incomplete: true });
+	const told = await stopLfortranSession({ tmux: again.tmux, stop: () => again.stop() });
+	assert.match(told.text, /^Partly stopped the shared LFortran session[\s\S]*couldn't confirm that the session's helper and kernel ended too/);
+	assert.doesNotMatch(told.text, /Its prompt, helper and kernel exited/);
 });
 
 test("the person's window waits for the helper, then becomes LFortran's prompt, or says why not", async (t) => {
