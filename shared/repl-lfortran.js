@@ -231,7 +231,7 @@ export async function answerLfortranInput({ tmux, token, text, timeoutMs = 20_00
 			if (error.code === "invalid-input") throw new Error(`${error.message} Nothing was sent; the READ still waits for its token.`);
 			if (error.code === "input-not-sent") throw new Error(`${error.message} The READ still waits for its token.`);
 			if (error.code) throw new Error(`The LFortran session refused the answer: ${error.message}`);
-			throw new Error(`The connection to the LFortran session's helper failed while answering (${error.message}), so whether the answer arrived isn't known. Check repl_status target='lfortran' before answering again: if the READ still waits with this token, the answer didn't arrive; if not, it did.`);
+			throw new Error(`The connection to the LFortran session's helper failed while answering (${error.message}), so whether the answer arrived isn't known. Check repl_status target='lfortran' before answering again: if the READ still waits with this token, the answer didn't arrive. If it doesn't, that alone doesn't show the answer arrived (the kernel may have ended, for one); the cell's state there says what is known.`);
 		}
 		snapshot = await waitForTransition(client, snapshot, { deadline, signal });
 		return { text: formatExecution(snapshot, { timeoutMs }), details: executionDetails({ ...snapshot, lifetimeId: hello.lifetimeId }, hello) };

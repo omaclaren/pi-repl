@@ -2,7 +2,7 @@ import test from "node:test";
 import assert from "node:assert/strict";
 import { execFile } from "node:child_process";
 import { chmodSync, existsSync, lstatSync, mkdirSync, mkdtempSync, readFileSync, readdirSync, renameSync, rmSync, symlinkSync, writeFileSync } from "node:fs";
-import { join } from "node:path";
+import { basename, join } from "node:path";
 import { HelperClient } from "../shared/repl-jupyter-helper.js";
 import {
 	JUPYTER_OWNER_ENV, JUPYTER_SEND_PATH, LAUNCH_FILE, createSessionDir, findMarkedJupyterProcesses, personCommand, preflightLfortran, readReadyMarker,
@@ -87,12 +87,16 @@ test("a session directory is new, private, short and claimed; only its own launc
 	assert.match(removeSessionDir(dir, { root, uid, owner, expected: { dev: -1, ino: -1 } })[0], /isn't this session's/);
 	assert.ok(existsSync(join(dir, "k.json")));
 	const warnings = removeSessionDir(dir, { root, uid, owner, expected: sessionDirOwnedBy(dir, owner, { root, uid }) });
-	// What can't be removed is left where it was, in DIR.
-	assert.equal(warnings.length, 2, warnings.join("\n"));
-	assert.match(warnings.join("\n"), /notes\.txt: pi-repl didn't make it/);
-	assert.match(warnings.join("\n"), /h\.sock: it isn't a file or socket/);
-	assert.ok(existsSync(join(dir, "notes.txt")) && lstatSync(join(dir, "h.sock")).isSymbolicLink());
-	assert.equal(existsSync(join(dir, "k.json")) || existsSync(join(dir, "kernel.pid")) || existsSync(join(dir, LAUNCH_FILE)), false);
+	// What can't be removed stays under the private name DIR was moved to, which the first warning gives.
+	const movedTo = (said) => /^\S+ was moved to (\S+) to be removed; what was left stays there\.$/.exec(said[0])?.[1];
+	const kept = movedTo(warnings);
+	assert.ok(kept?.startsWith(join(root, `pi-rj-${uid}`, `.removing-${basename(dir)}-`)), warnings.join("\n"));
+	assert.equal(warnings.length, 3, warnings.join("\n"));
+	assert.ok(warnings.includes(`Left ${join(kept, "notes.txt")}: pi-repl didn't make it.`), warnings.join("\n"));
+	assert.ok(warnings.includes(`Left ${join(kept, "h.sock")}: it isn't a file or socket of this user's.`), warnings.join("\n"));
+	assert.ok(existsSync(join(kept, "notes.txt")) && lstatSync(join(kept, "h.sock")).isSymbolicLink());
+	assert.equal(existsSync(join(kept, "k.json")) || existsSync(join(kept, "kernel.pid")) || existsSync(join(kept, LAUNCH_FILE)), false);
+	assert.equal(existsSync(dir), false);
 
 	// A directory that isn't private any more is left alone.
 	const open = createSessionDir({ root, uid, owner });
@@ -124,7 +128,7 @@ test("a session directory is new, private, short and claimed; only its own launc
 	} } });
 	assert.deepEqual(removed, []);
 	assert.equal(readFileSync(join(second, "k.json"), "utf8"), "theirs");
-	assert.deepEqual(readdirSync(join(root, `pi-rj-${uid}`)).filter((name) => name.startsWith(".removing-")), [], "the taken directory is gone");
+	assert.deepEqual(readdirSync(join(root, `pi-rj-${uid}`)).filter((name) => name.startsWith(`.removing-${basename(second)}-`)), [], "the taken directory is gone");
 	// Changed while it was being emptied: the removal stops.
 	const third = createSessionDir({ root, uid, owner });
 	for (const name of ["k.json", "kernel.log", "ready.json"]) writeFileSync(join(third, name), "x");
@@ -134,6 +138,28 @@ test("a session directory is new, private, short and claimed; only its own launc
 		writeFileSync(join(taken, "k.json"), "theirs");
 	} } });
 	assert.match(stopped.join("\n"), /changed while it was being removed/);
+	// Leftovers, and DIR's path reused once it was taken: the new directory stays, and the leftovers beside it.
+	const fourth = createSessionDir({ root, uid, owner });
+	writeFileSync(join(fourth, "notes.txt"), "ours");
+	let reused;
+	const leftover = removeSessionDir(fourth, { root, uid, owner, expected: sessionDirOwnedBy(fourth, owner, { root, uid }), hooks: { afterRename: () => {
+		mkdirSync(fourth, { mode: 0o700 });
+		reused = lstatSync(fourth).ino;
+	} } });
+	assert.equal(lstatSync(fourth).ino, reused, "the new directory is still there");
+	assert.deepEqual(readdirSync(fourth), []);
+	assert.equal(readFileSync(join(movedTo(leftover), "notes.txt"), "utf8"), "ours");
+	// Replaced before it was taken, and something at its path again once it was: the replacement isn't moved over it.
+	const fifth = createSessionDir({ root, uid, owner });
+	let again;
+	const occupied = removeSessionDir(fifth, { root, uid, owner, expected: sessionDirOwnedBy(fifth, owner, { root, uid }), hooks: {
+		beforeRename: () => replace(fifth, "b".repeat(32)),
+		taken: () => { mkdirSync(fifth, { mode: 0o700 }); again = lstatSync(fifth).ino; },
+	} });
+	const at = /it is untouched, at (\S+), because something is at /.exec(occupied[0])?.[1];
+	assert.ok(at, occupied.join("\n"));
+	assert.equal(lstatSync(fifth).ino, again);
+	assert.equal(readFileSync(join(at, "k.json"), "utf8"), "theirs");
 });
 
 /**

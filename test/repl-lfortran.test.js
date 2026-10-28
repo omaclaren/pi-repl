@@ -218,7 +218,7 @@ test("recovery messages say only what's known: an expired cell's last state, and
 		? { code: 0, stdout: ["pi-repl-lfortran", "$1", "1800000000", "lfortran", "jupyter-helper", owner, dir, "", "%1", "%2"].join("\t") + "\n", stderr: "" }
 		: { code: 1, stdout: "", stderr: "not in this test" };
 	await assert.rejects(lfortranStatus({ tmux, execution: "e".repeat(32) }), (error) => /no longer keeps that cell's output; its last state was not-sent/.test(error.message) && !/\bran\b/.test(error.message));
-	await assert.rejects(answerLfortranInput({ tmux, token: "d".repeat(32), text: "1" }), (error) => /whether the answer arrived isn't known[\s\S]*if the READ still waits with this token, the answer didn't arrive/.test(error.message) && !/can't be used again/.test(error.message));
+	await assert.rejects(answerLfortranInput({ tmux, token: "d".repeat(32), text: "1" }), (error) => /whether the answer arrived isn't known[\s\S]*if the READ still waits with this token, the answer didn't arrive\. If it doesn't, that alone doesn't show the answer arrived/.test(error.message) && !/can't be used again|if not, it did/.test(error.message));
 });
 
 test("with LFortran: repl_start, repl_send, and a READ through repl_input", { skip: !REAL_LFORTRAN && "set PI_REPL_LFORTRAN" }, async (t) => {

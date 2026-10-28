@@ -385,8 +385,10 @@ export async function startJupyterSession({
  * path is reused meanwhile; before each removal it is checked again, and the
  * removal stops if it has changed. Only the names pi-repl and the helper
  * write are removed, only regular files and sockets of this user's, and
- * nothing is followed through a link; the launch file goes last. Resolves
- * with warnings for what stays. `hooks` let tests act between the steps.
+ * nothing is followed through a link; the launch file goes last. What is
+ * left stays under the private name, since moving it back could replace a
+ * directory made at DIR's path since. Resolves with warnings for what stays.
+ * `hooks` let tests act between the steps.
  */
 export function removeSessionDir(dir, { root = "/tmp", uid = process.getuid(), owner, expected, hooks = {} } = {}) {
 	const leftAlone = [`The session's directory ${dir} isn't this session's any more (or never was); it was left alone.`];
@@ -399,6 +401,7 @@ export function removeSessionDir(dir, { root = "/tmp", uid = process.getuid(), o
 	} catch (error) {
 		return [`Could not remove ${dir}: ${error.message}`];
 	}
+	hooks.taken?.(retiring);
 	const same = () => {
 		try {
 			const stat = lstatSync(retiring);
@@ -408,9 +411,20 @@ export function removeSessionDir(dir, { root = "/tmp", uid = process.getuid(), o
 		}
 	};
 	if (!same() || readLaunch(retiring, uid) !== owner) {
-		// Not the directory that was checked: it is put back, untouched.
-		try { renameSync(retiring, dir); } catch {}
-		return leftAlone;
+		// Not the directory that was checked: it is put back, untouched, if nothing is at its path
+		// now, as rename would replace an empty directory there. DIR's parent is private, so only
+		// this user's own processes could make one meanwhile.
+		try {
+			lstatSync(dir);
+		} catch (error) {
+			if (error.code === "ENOENT") {
+				try {
+					renameSync(retiring, dir);
+					return leftAlone;
+				} catch {}
+			}
+		}
+		return [`The directory at ${dir} was replaced as it was being removed, and isn't this session's; it is untouched, at ${retiring}, because something is at ${dir} now or it couldn't be moved back.`];
 	}
 	hooks.afterRename?.(retiring);
 	const warnings = [];
@@ -419,7 +433,7 @@ export function removeSessionDir(dir, { root = "/tmp", uid = process.getuid(), o
 	for (const name of names) {
 		const path = join(retiring, name);
 		if (!known.has(name) && !/^out-[0-9a-f]{32}\.txt$/.test(name) && !/^\.ready-[0-9a-f]{12}$/.test(name)) {
-			warnings.push(`Left ${join(dir, name)}: pi-repl didn't make it.`);
+			warnings.push(`Left ${path}: pi-repl didn't make it.`);
 			continue;
 		}
 		if (!same()) {
@@ -428,16 +442,12 @@ export function removeSessionDir(dir, { root = "/tmp", uid = process.getuid(), o
 		}
 		const stat = lstatSync(path);
 		if ((!stat.isFile() && !stat.isSocket()) || stat.uid !== uid) {
-			warnings.push(`Left ${join(dir, name)}: it isn't a file or socket of this user's.`);
+			warnings.push(`Left ${path}: it isn't a file or socket of this user's.`);
 			continue;
 		}
-		try { unlinkSync(path); } catch (error) { if (error.code !== "ENOENT") warnings.push(`Could not remove ${join(dir, name)}: ${error.message}`); }
+		try { unlinkSync(path); } catch (error) { if (error.code !== "ENOENT") warnings.push(`Could not remove ${path}: ${error.message}`); }
 	}
-	if (warnings.length) {
-		// What was left stays where it was found.
-		try { renameSync(retiring, dir); } catch { warnings.push(`What was left is in ${retiring}.`); }
-		return warnings;
-	}
+	if (warnings.length) return [`${dir} was moved to ${retiring} to be removed; what was left stays there.`, ...warnings];
 	try { rmdirSync(retiring); } catch (error) { if (error.code !== "ENOENT") warnings.push(`Could not remove ${retiring}: ${error.message}`); }
 	return warnings;
 }
