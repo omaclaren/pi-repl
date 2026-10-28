@@ -177,7 +177,9 @@ function executionDetails(snapshot, identity) {
 	return {
 		runtime: "lfortran", sessionName: LFORTRAN_SESSION_NAME, lifetimeId: snapshot.lifetimeId ?? null, executionId: snapshot.executionId, submissionId: snapshot.submissionId,
 		state: snapshot.state, status: snapshot.status ?? null, timedOut: Boolean(snapshot.timedOut), outcome: snapshot.outcome ?? null,
-		input: snapshot.input ? { token: snapshot.input.token, prompt: snapshot.input.prompt } : null, outputPath: snapshot.output?.spool?.full ? snapshot.output.spool.path : null,
+		input: snapshot.input ? { token: snapshot.input.token, prompt: snapshot.input.prompt } : null,
+		outputPath: snapshot.output?.spool?.full ? snapshot.output.spool.path : null, outputTruncated: Boolean(snapshot.output?.truncated),
+		outputWriting: snapshot.output?.spool?.state === "writing" ? snapshot.output.spool.path : null,
 		kernelSession: identity?.kernelSession ?? null,
 	};
 }
@@ -216,15 +218,29 @@ export async function sendLfortranCode({ tmux, code, timeoutMs = 20_000, signal,
 /**
  * Answers the current cell's READ with one record, and waits for what comes
  * next: its result, its next READ, or the end of the wait. Resolves as
- * sendLfortranCode does.
- * @param {{ tmux: Tmux, token: string, text: string, timeoutMs?: number, signal?: AbortSignal }} options
+ * sendLfortranCode does. With `waiting`, as for the person's /repl input,
+ * the token may be left out to answer the READ that waits now, and the
+ * details say whether that READ asked for a password.
+ * @param {{ tmux: Tmux, token?: string, text: string, waiting?: boolean, timeoutMs?: number, signal?: AbortSignal }} options
  */
-export async function answerLfortranInput({ tmux, token, text, timeoutMs = 20_000, signal }) {
-	if (typeof token !== "string" || !token) throw new Error("repl_input needs the token that the READ's result gave.");
+export async function answerLfortranInput({ tmux, token, text, waiting = false, timeoutMs = 20_000, signal }) {
+	if (!waiting && (typeof token !== "string" || !token)) throw new Error("repl_input needs the token that the READ's result gave.");
 	const deadline = Date.now() + timeoutMs;
 	const { client, hello } = await connectHelper(tmux, signal, "the answer wasn't given, and the READ still waits.");
 	try {
 		if (signal?.aborted) throw cancelled("the answer wasn't given, and the READ still waits.");
+		let password;
+		if (waiting) {
+			let pending;
+			try {
+				pending = (await client.request("status", {}, { timeoutMs: 3000 })).current?.input;
+			} catch (error) {
+				throw new Error(`The LFortran session's helper didn't say which READ waits (${error.message}). Nothing was sent.`);
+			}
+			if (!token && !pending) throw new Error("No READ from pi-repl is waiting in the LFortran session, so nothing was sent.");
+			token ||= pending.token;
+			password = pending?.token === token ? Boolean(pending.password) : null;
+		}
 		let snapshot;
 		try {
 			snapshot = await client.request("input", { lifetimeId: hello.lifetimeId, token, text }, { timeoutMs: 10_000 });
@@ -236,7 +252,8 @@ export async function answerLfortranInput({ tmux, token, text, timeoutMs = 20_00
 			throw new Error(`The connection to the LFortran session's helper failed while answering (${error.message}), so whether the answer arrived isn't known. Check repl_status target='lfortran' before answering again: if the READ still waits with this token, the answer didn't arrive. If it doesn't, that alone doesn't show the answer arrived (the kernel may have ended, for one); the cell's state there says what is known.`);
 		}
 		snapshot = await waitForTransition(client, snapshot, { deadline, signal });
-		return { text: formatExecution(snapshot, { timeoutMs }), details: executionDetails({ ...snapshot, lifetimeId: hello.lifetimeId }, hello), output: snapshot.output?.text ?? "" };
+		const details = executionDetails({ ...snapshot, lifetimeId: hello.lifetimeId }, hello);
+		return { text: formatExecution(snapshot, { timeoutMs }), details: waiting ? { ...details, answeredPassword: password } : details, output: snapshot.output?.text ?? "" };
 	} finally {
 		client.close();
 	}

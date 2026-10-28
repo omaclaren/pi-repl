@@ -232,7 +232,7 @@ type ReplCommand =
 	| { action: "export"; runtime?: ManagedRuntime }
 	| { action: "start"; runtime: SupportedRuntime; name?: string }
 	| { action: "lfortran"; command: "start" | "status" | "stop" | "attach" }
-	| { action: "input"; token: string; text: string }
+	| { action: "input"; token?: string; text: string }
 	| { action: "send"; target?: string; code: string }
 	| { action: "error"; message: string };
 
@@ -453,7 +453,7 @@ function formatUsage(): string {
 		"  /repl gnuplot",
 		"  /repl cpp",
 		"  /repl lfortran",
-		"  /repl input <token> <text>",
+		"  /repl input <text>",
 		"  /repl send [runtime], with the code on the lines below it",
 		"  /repl echo [off|summary|full]",
 		"  /repl status [python|julia|r|ghci|clojure|ruby|java|octave|matlab|gnuplot|cpp]",
@@ -480,7 +480,7 @@ function formatUsage(): string {
 		"  - /repl gnuplot manages the independent pi-repl-gnuplot session, retaining native plotting settings",
 		"  - /repl cpp starts an experimental Cling-based C++ REPL; send C++ prompt groups, not dot commands",
 		"  - /repl lfortran starts LFortran's shared session (experimental; needs LFortran main): LFortran's own prompt in the first window, and pi-repl's helper for the kernel in the second",
-		"  - /repl input <token> <text> answers an LFortran cell's READ with the text as given",
+		"  - /repl input <text> answers the READ an LFortran cell waits on with the text as given; the READ's token may come before the text",
 		"  - /repl send [runtime] sends the code on the lines below it to that running session (Python by default), as repl_send does; its result goes into the conversation, where the agent sees it too. Shift+Enter starts a new line",
 		"  - /repl status, /repl attach, /repl export, and /repl stop can target any managed runtime",
 		"  - repl_start lets pi start or reuse a session with an explicit runtime; repl_send never auto-starts one",
@@ -515,10 +515,12 @@ function parseReplCommand(args: string): ReplCommand {
 	}
 
 	if (firstLower === "input") {
-		// The answer is passed on exactly, spaces and empty text included: everything after the token's single separating space.
-		const match = /^\s*input\s+(\S+)(?: ([\s\S]*))?$/i.exec(args);
-		if (!match) return { action: "error", message: "Usage: /repl input <token> <text>" };
-		return { action: "input", token: match[1], text: match[2] ?? "" };
+		// The answer is passed on exactly, spaces included: everything after the single separating space, and after the READ's token when that comes first.
+		const rest = /^\s*input(?: ([\s\S]*))?$/i.exec(args)?.[1] ?? "";
+		const token = /^([0-9a-f]{32})(?: |$)/.exec(rest);
+		if (token) return { action: "input", token: token[1], text: rest.slice(token[0].length) };
+		if (!rest) return { action: "error", message: "Usage: /repl input <text>, or /repl input <token> <text>" };
+		return { action: "input", text: rest };
 	}
 
 	if (firstLower === "send") {
@@ -2558,23 +2560,22 @@ async function sendReplCommand(pi: ExtensionAPI, ctx: ExtensionCommandContext, t
 type LfortranCommandResult = {
 	text: string;
 	output: string;
-	details: { state?: string; status?: string | null; input?: { token: string; prompt?: string } | null; outputPath?: string | null };
+	details: {
+		state?: string; status?: string | null; input?: { token: string; prompt?: string } | null;
+		outputPath?: string | null; outputTruncated?: boolean; outputWriting?: string | null; answeredPassword?: boolean | null;
+	};
 };
 
 /** An LFortran result for the agent, bounded as the tools' are, with how to answer a READ from here. */
 function lfortranCommandText(result: LfortranCommandResult): string {
 	const { text } = boundToolText(result.text);
-	const token = result.details.state === "waiting-input" ? result.details.input?.token : undefined;
-	return token ? `${text}\n\nTo answer it from here: /repl input ${token} <text>` : text;
+	return result.details.state === "waiting-input" && result.details.input ? `${text}\n\nTo answer it from here: /repl input <text>` : text;
 }
 
 /** An LFortran result for the person: what came of the cell, without the IDs the agent uses. */
 function lfortranCommandView(title: string, result: LfortranCommandResult, code?: string): ReplCommandView {
-	const { state, status, input, outputPath } = result.details;
-	const notes = [
-		...(state === "waiting-input" && input ? [`Answer it with /repl input ${input.token} <text>`] : []),
-		...(outputPath ? [`The full output is in ${outputPath}.`] : []),
-	];
+	const { state, status, input, outputPath, outputTruncated, outputWriting } = result.details;
+	const notes = state === "waiting-input" && input ? ["Answer it with /repl input <text>"] : [];
 	const [said, tone]: [string, ReplCommandView["tone"]] =
 		state === "completed" && status === "ok" ? ["completed", "success"]
 		: state === "completed" && status === "error" ? ["completed, with an error", "error"]
@@ -2582,7 +2583,13 @@ function lfortranCommandView(title: string, result: LfortranCommandResult, code?
 		: state === "waiting-input" ? [`waiting for input${input?.prompt?.trim() ? `: its READ asks ${JSON.stringify(input.prompt)}` : ""}`, "warning"]
 		: state === "submitted" || state === "running" ? ["still running; it goes on, and /repl status lfortran shows it", "warning"]
 		: [result.text.split("\n")[0], "warning"];
-	return replCommandView({ title, status: said, tone, code, notes }, result.output);
+	const view = replCommandView({ title, status: said, tone, code, notes }, result.output);
+	// The file is named only when some of the output isn't here.
+	if (outputTruncated || view.cutLines > 0) {
+		if (outputPath) view.notes.push(`The full output is in ${outputPath}.`);
+		else if (outputWriting) view.notes.push(`The full output is being written to ${outputWriting}.`);
+	}
+	return view;
 }
 
 /**
@@ -3264,8 +3271,10 @@ async function handleRepl(pi: ExtensionAPI, args: string, ctx: ExtensionCommandC
 			return;
 		case "input":
 			try {
-				const result = await answerLfortranInput({ tmux: lfortranTmux(pi, ctx.cwd), token: parsed.token, text: parsed.text });
-				postReplCommandResult(pi, ctx, `/repl input answered a READ in ${result.details.sessionName}`, lfortranCommandText(result), lfortranCommandView(`/repl input · ${result.details.sessionName}`, result));
+				const result = await answerLfortranInput({ tmux: lfortranTmux(pi, ctx.cwd), token: parsed.token, text: parsed.text, waiting: true });
+				// The answer is shown where a send shows its code, unless the READ asked for a password.
+				const answer = (result.details as LfortranCommandResult["details"]).answeredPassword === false ? parsed.text : undefined;
+				postReplCommandResult(pi, ctx, `/repl input answered a READ in ${result.details.sessionName}`, lfortranCommandText(result), lfortranCommandView(`/repl input · ${result.details.sessionName}`, result, answer));
 			} catch (error) {
 				notify(ctx, error instanceof Error ? error.message : String(error), "error");
 			}

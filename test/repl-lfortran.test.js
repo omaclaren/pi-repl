@@ -79,9 +79,9 @@ const text = (result) => result.content.map((part) => part.text).join("");
 test("/repl parses lfortran and input, keeping an answer's text exactly", async (t) => {
 	const f = await piFixture(t);
 	if (!f) return;
-	assert.match((await f.repl("input"))[0].message, /Usage: \/repl input <token> <text>/);
+	assert.match((await f.repl("input"))[0].message, /Usage: \/repl input <text>, or \/repl input <token> <text>/);
 	assert.match((await f.repl("status lfortran"))[0].message, /No shared LFortran session is running/);
-	assert.match((await f.repl("help"))[0].message, /\/repl lfortran[\s\S]*\/repl input <token> <text>/);
+	assert.match((await f.repl("help"))[0].message, /\/repl lfortran[\s\S]*\/repl input <text>/);
 	assert.ok(f.tools.has("repl_input"));
 	assert.ok(f.tools.get("repl_start").parameters.properties.runtime.enum.includes("lfortran"));
 	await assert.rejects(f.send("print:x"), /No shared LFortran session is running/);
@@ -100,15 +100,25 @@ test("/repl send lfortran runs the code below it, and a READ it asks is answered
 	assert.match(message.content, /^\/repl send to pi-repl-lfortran:\n\n```\nCompleted\.\nExecution: [0-9a-f]{32}\n\nSubmitted code:\nprint:hello\n\nOutput:\nhello\n```$/);
 	// The person sees what came of it, the code and the output, without the execution's ID.
 	assert.deepEqual(f.shown(message), ["/repl send · pi-repl-lfortran  completed", "print:hello", "hello"]);
+	// A long output shows its end, and names the file with all of it; a short one names none.
+	const lines = Array.from({ length: 300 }, (_, i) => `line ${i + 1}`);
+	await f.repl(`send lfortran\nprint:${lines.join("\n")}`);
+	const long = f.shown(f.messages.at(-1).message, 200);
+	assert.deepEqual(long.slice(-14, -1), ["… 288 earlier line(s) (ctrl+o to expand)", ...lines.slice(-12)], long.join("\n"));
+	assert.match(long.at(-1), /^The full output (is in|is being written to) \/.*\.txt\.$/);
+
+	// A READ is answered without its token, and the answer is shown with what came of it.
 	await f.repl("send LFortran\nread");
 	const reading = f.messages.at(-1).message.content;
-	const token = TOKEN.exec(reading)[1];
-	assert.ok(reading.endsWith(`\n\nTo answer it from here: /repl input ${token} <text>\n\`\`\``), reading);
-	assert.deepEqual(f.shown(f.messages.at(-1).message), ["/repl send · pi-repl-lfortran  waiting for input: its READ asks \"? \"", "read", "(no output)", `Answer it with /repl input ${token} <text>`]);
+	assert.ok(reading.endsWith("\n\nTo answer it from here: /repl input <text>\n```"), reading);
+	assert.deepEqual(f.shown(f.messages.at(-1).message), ["/repl send · pi-repl-lfortran  waiting for input: its READ asks \"? \"", "read", "(no output)", "Answer it with /repl input <text>"]);
 	assert.ok(f.shown(f.messages.at(-1).message, 24).length > 4, "it wraps within a narrow terminal");
-	await f.repl(`input ${token} 7`);
+	await f.repl("input 7");
 	assert.match(f.messages.at(-1).message.content, /^\/repl input answered a READ in pi-repl-lfortran:[\s\S]*Output:\ngot 7\n```$/);
-	assert.deepEqual(f.shown(f.messages.at(-1).message), ["/repl input · pi-repl-lfortran  completed", "got 7"]);
+	assert.deepEqual(f.shown(f.messages.at(-1).message), ["/repl input · pi-repl-lfortran  completed", "7", "got 7"]);
+	const posted = f.messages.length;
+	assert.match((await f.repl("input 8"))[0].message, /^No READ from pi-repl is waiting in the LFortran session, so nothing was sent\.$/);
+	assert.equal(f.messages.length, posted);
 	await f.repl("send lfortran\nfail");
 	assert.equal(f.shown(f.messages.at(-1).message)[0], "/repl send · pi-repl-lfortran  completed, with an error");
 });
