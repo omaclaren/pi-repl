@@ -8,14 +8,17 @@ export const GNUPLOT_OWNER_ENV = "PI_REPL_GNUPLOT_OWNER";
 export const GNUPLOT_OWNER_OPTION = "@pi_repl_gnuplot_owner";
 export const validGnuplotOwner = (value) => typeof value === "string" && value.length === 32 && /^[a-f0-9]{32}$/.test(value);
 
+// An ownership marker's variable: what readOwnerMarkers looks for.
+const MARKER_VARIABLE = /^[A-Z][A-Z0-9_]*$/;
+
 // On macOS, ps flattens argv/environment into ambiguous text. Read the native
 // NUL-delimited KERN_PROCARGS2 buffer instead. Only the requested marker leaves
 // this isolated stdlib-only process: never print argv or other environment data.
-const macOwnerScript = String.raw`
+const macOwnerScript = (variable) => String.raw`
 import ctypes, errno, json, struct, sys
 libc = ctypes.CDLL('/usr/lib/libSystem.B.dylib', use_errno=True)
 libc.sysctl.argtypes = [ctypes.POINTER(ctypes.c_int), ctypes.c_uint, ctypes.c_void_p, ctypes.POINTER(ctypes.c_size_t), ctypes.c_void_p, ctypes.c_size_t]
-key = b'PI_REPL_GNUPLOT_OWNER='
+key = b'${variable}='
 rows = []
 for value in sys.argv[1:]:
     pid = int(value)
@@ -66,28 +69,34 @@ export function parseGnuplotCandidates(text, uid) {
 	});
 }
 
-export function ownerFromEnvironment(data) {
-	const values = data.toString("utf8").split("\0").filter((value) => value.startsWith(`${GNUPLOT_OWNER_ENV}=`));
-	if (values.length > 1) throw new Error("Duplicate gnuplot ownership marker.");
-	return values.length ? values[0].slice(GNUPLOT_OWNER_ENV.length + 1) : null;
+export function ownerFromEnvironment(data, variable = GNUPLOT_OWNER_ENV, label = "gnuplot") {
+	const values = data.toString("utf8").split("\0").filter((value) => value.startsWith(`${variable}=`));
+	if (values.length > 1) throw new Error(`Duplicate ${label} ownership marker.`);
+	return values.length ? values[0].slice(variable.length + 1) : null;
 }
 
-export async function readGnuplotOwners(pids, { platform = process.platform, execute = exec, read = readFile } = {}) {
+/**
+ * The ownership marker in each process's initial environment, as variable
+ * `variable` (32 lowercase hex characters, or null), without reading or
+ * returning anything else of it. `label` names whose markers they are, in errors.
+ */
+export async function readOwnerMarkers(pids, { variable, label, platform = process.platform, execute = exec, read = readFile } = {}) {
+	if (typeof variable !== "string" || !MARKER_VARIABLE.test(variable)) throw new Error("Invalid ownership marker variable.");
 	if (!pids.length) return [];
-	if (pids.length > 128 || pids.some((pid) => !Number.isSafeInteger(pid) || pid <= 1)) throw new Error("Invalid or excessive gnuplot process candidates.");
+	if (pids.length > 128 || pids.some((pid) => !Number.isSafeInteger(pid) || pid <= 1)) throw new Error(`Invalid or excessive ${label} process candidates.`);
 	if (platform === "darwin") {
 		let result, rows;
 		try {
-			result = await execute("python3", ["-I", "-S", "-c", macOwnerScript, ...pids.map(String)], {
+			result = await execute("python3", ["-I", "-S", "-c", macOwnerScript(variable), ...pids.map(String)], {
 				timeout: 3000, killSignal: "SIGKILL", maxBuffer: 64 * 1024,
 			});
 		} catch {
-			throw new Error("Could not inspect gnuplot process ownership on macOS; an existing python3 is required. No installation was attempted.");
+			throw new Error(`Could not inspect ${label} process ownership on macOS; an existing python3 is required. No installation was attempted.`);
 		}
 		try { rows = JSON.parse(result.stdout); }
-		catch { throw new Error("Invalid gnuplot ownership inspection result."); }
+		catch { throw new Error(`Invalid ${label} ownership inspection result.`); }
 		if (!Array.isArray(rows) || rows.length !== pids.length || rows.some((row, i) => row.pid !== pids[i] || (!row.gone && !row.error && row.owner !== null && typeof row.owner !== "string"))) {
-			throw new Error("Invalid gnuplot ownership inspection result.");
+			throw new Error(`Invalid ${label} ownership inspection result.`);
 		}
 		return rows;
 	}
@@ -96,15 +105,19 @@ export async function readGnuplotOwners(pids, { platform = process.platform, exe
 			try {
 				const data = await read(`/proc/${pid}/environ`);
 				if (data.length > 1024 * 1024) throw new Error("Excessive process metadata.");
-				const owner = ownerFromEnvironment(data);
+				const owner = ownerFromEnvironment(data, variable, label);
 				return { pid, owner: validGnuplotOwner(owner) ? owner : null };
 			} catch (error) {
 				if (error.code === "ENOENT" || error.code === "ESRCH") return { pid, gone: true };
-				throw new Error(`Could not inspect gnuplot ownership for PID ${pid}.`, { cause: error });
+				throw new Error(`Could not inspect ${label} ownership for PID ${pid}.`, { cause: error });
 			}
 		}));
 	}
-	throw new Error("Detached gnuplot ownership inspection requires macOS or Linux.");
+	throw new Error(`Detached ${label} ownership inspection requires macOS or Linux.`);
+}
+
+export function readGnuplotOwners(pids, options = {}) {
+	return readOwnerMarkers(pids, { ...options, variable: GNUPLOT_OWNER_ENV, label: "gnuplot" });
 }
 
 export async function findOwnedGnuplotProcesses(table, owner, { uid = process.getuid?.(), execute = exec, inspect = readGnuplotOwners } = {}) {

@@ -310,9 +310,10 @@ test("the helper starts the kernel, publishes ready.json and answers hello", asy
 	assert.equal(ready.launchId, helper.launchId);
 	assert.equal(ready.kernelPid, helper.kernel.pid);
 	assert.ok(ready.kernelSession);
-	for (const path of [helper.paths.ready, helper.paths.socket, helper.paths.connection, helper.paths.kernelLog]) {
+	for (const path of [helper.paths.ready, helper.paths.socket, helper.paths.connection, helper.paths.kernelLog, helper.paths.pid]) {
 		assert.equal(lstatSync(path).mode & 0o777, 0o600, path);
 	}
+	assert.equal(readFileSync(helper.paths.pid, "utf8"), `${process.pid}\n`);
 	const hello = await client.request("hello");
 	assert.equal(hello.protocol, 1);
 	assert.equal(hello.kernelSession, ready.kernelSession);

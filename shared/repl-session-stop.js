@@ -4,9 +4,9 @@ import { GNUPLOT_OWNER_OPTION, validGnuplotOwner, findOwnedGnuplotProcesses, sna
 
 const exec = promisify(execFile);
 const sleep = (ms) => new Promise((resolve) => setTimeout(resolve, ms));
-const processKey = (p) => `${p.pid}:${p.uid}:${p.startedAt}`;
-const live = (p) => Boolean(p && !p.state.startsWith("Z"));
-const fingerprintFormat = "#{pid}|#{session_id}|#{session_name}|#{session_created}|#{W:#{window_id}:#{window_linked}:#{P:#{pane_id}:#{pane_pid}:#{pane_dead};};}";
+export const processKey = (p) => `${p.pid}:${p.uid}:${p.startedAt}`;
+export const live = (p) => Boolean(p && !p.state.startsWith("Z"));
+export const fingerprintFormat = "#{pid}|#{session_id}|#{session_name}|#{session_created}|#{W:#{window_id}:#{window_linked}:#{P:#{pane_id}:#{pane_pid}:#{pane_dead};};}";
 const paneFormat = "#{pid}\t#{session_id}\t#{session_name}\t#{session_created}\t#{pane_id}\t#{pane_pid}\t#{pane_tty}\t#{pane_dead}\t#{window_id}\t#{window_index}\t#{pane_index}\t#{window_linked}\t#{@pi_repl_gnuplot_owner}\t#{@pi_repl_record_id}";
 
 export function parseStopProcessTable(text) {
@@ -37,7 +37,7 @@ function parsePanes(text) {
 	});
 }
 
-async function readPanes(tmux) {
+export async function readPanes(tmux) {
 	const result = await tmux(["list-panes", "-a", "-F", paneFormat]);
 	if (result.code !== 0) {
 		if (/no server running|(?:error connecting|failed to connect).*?(?:No such file|Connection refused)/i.test(result.stderr)) return [];
@@ -46,7 +46,7 @@ async function readPanes(tmux) {
 	return parsePanes(result.stdout);
 }
 
-function fingerprint(panes) {
+export function fingerprint(panes) {
 	const first = panes[0];
 	let windows = "", previousWindow;
 	for (const p of [...panes].sort((a, b) => a.windowIndex - b.windowIndex || a.paneIndex - b.paneIndex)) {
@@ -83,20 +83,26 @@ function protectedProcesses(table, panes, currentPid, serverPid) {
 	return ids;
 }
 
-/** Snapshot-based, session-scoped counterpart to the independent test tracker. */
+/**
+ * Snapshot-based, session-scoped counterpart to the independent test tracker.
+ * `retained` names pinned panes that may be dead (remain-on-exit): they are
+ * accepted, and their stale PIDs are never taken as owners.
+ */
 export class SessionStopProcesses {
-	constructor({ table, panes, selected, currentPid, uid }) {
+	constructor({ table, panes, selected, currentPid, uid, retained = new Set(), label = "gnuplot" }) {
 		this.owned = new Map();
 		this.groups = new Map();
 		this.uid = uid;
 		this.currentPid = currentPid;
 		this.serverPid = selected[0].serverPid;
 		this.issues = new Set();
+		this.label = label;
 		const otherPanes = panes.filter((p) => p.sessionId !== selected[0].sessionId);
 		const protectedIds = protectedProcesses(table, otherPanes, currentPid, this.serverPid);
 		const roots = [];
 		for (const pane of selected) {
 			if (pane.linked !== "0" || otherPanes.some((p) => p.paneId === pane.paneId)) throw new Error("A REPL window is linked to another session. Unlink it before stopping; nothing was stopped.");
+			if (pane.dead !== "0" && retained.has(pane.paneId)) continue;
 			const p = table.find((candidate) => candidate.pid === pane.pid);
 			if (pane.dead !== "0" || !live(p) || p.tty !== pane.tty || p.pgid !== p.pid) {
 				throw new Error(`Cannot verify the runtime owner of pane ${pane.paneId}; nothing was stopped. Inspect dead or detached panes manually.`);
@@ -118,7 +124,7 @@ export class SessionStopProcesses {
 		const protectedIds = protectedProcesses(table, panes, this.currentPid, this.serverPid);
 		for (const p of processes) {
 			if (!live(p) || p.uid !== this.uid || protectedIds.has(p.pid)) {
-				throw new Error(`Marked gnuplot PID ${p.pid} overlaps a protected process; no signal was sent to it.`);
+				throw new Error(`Marked ${this.label} PID ${p.pid} overlaps a protected process; no signal was sent to it.`);
 			}
 			this.owned.set(processKey(p), p);
 		}
@@ -154,6 +160,50 @@ export class SessionStopProcesses {
 }
 
 export const PI_REPL_STOP_SESSION_NAME = /^pi-repl-(python|julia|r|ghci|clojure|ruby|java|octave|matlab|gnuplot|cpp)$/;
+
+/**
+ * After kill-session: waits `graceMs`, then sends SIGTERM and, within
+ * `killMs`, SIGKILL to the verified processes that remain. `inspect` gives
+ * them, freshly verified; `recheck` refreshes birth identities and pane
+ * protections again immediately before each signal. No pkill or group kills.
+ * Throws with the tracker's issues, if any; resolves with the signals sent.
+ */
+export async function endVerifiedSurvivors({ tracker, inspect, recheck, signal, graceMs, termMs, killMs, settleWhenEmpty = true }) {
+	const signals = [];
+	async function wait(ms) {
+		const deadline = Date.now() + ms;
+		while (true) {
+			const remaining = await inspect();
+			if ((!remaining.length && settleWhenEmpty) || Date.now() >= deadline) return remaining;
+			await sleep(100);
+		}
+	}
+	async function sendVerified(p, value) {
+		// Fresh pane protection + fresh process birth identity before every
+		// individual signal, including KILL escalation.
+		const remaining = await inspect();
+		if (!remaining.some((candidate) => processKey(candidate) === processKey(p))) return;
+		// Marker inspection can involve a subprocess. Refresh ordinary birth
+		// identities and pane protections again immediately before signalling.
+		const fresh = await recheck();
+		if (!fresh.some((candidate) => processKey(candidate) === processKey(p))) return;
+		try { signal(p.pid, value); signals.push({ pid: p.pid, signal: value }); }
+		catch (error) {
+			if (error.code !== "ESRCH") tracker.issues.add(`Could not send ${value} to verified PID ${p.pid}: ${error.message}`);
+		}
+	}
+	let remaining = await wait(graceMs);
+	for (const p of remaining) await sendVerified(p, "SIGTERM");
+	remaining = await wait(termMs);
+	const deadline = Date.now() + killMs;
+	while (remaining.length && Date.now() < deadline) {
+		for (const p of remaining) await sendVerified(p, "SIGKILL");
+		remaining = await wait(100);
+	}
+	if (remaining.length) tracker.issues.add(`Surviving verified PIDs: ${remaining.map((p) => p.pid).join(", ")}.`);
+	if (tracker.issues.size) throw new Error([...tracker.issues].join(" "));
+	return signals;
+}
 
 /**
  * Explicit stop only. Never used by send, startup, reload, or shutdown hooks.
@@ -231,7 +281,6 @@ export async function stopVerifiedReplSession({ tmux, sessionName, sessionNamePa
 	const stopped = await tmux(["if-shell", "-F", "-t", original.sessionId, condition, `kill-session -t '${original.sessionId}'`, "display-message -p PI_REPL_STOP_CHANGED"]);
 	if (stopped.code !== 0 || stopped.stdout.includes("PI_REPL_STOP_CHANGED")) throw new Error(`tmux refused or could not complete the stop; no follow-up signals were sent. ${stopped.stderr.trim() || stopped.stdout.trim()}`);
 
-	const signals = [];
 	async function inspect() {
 		const currentPanes = await readPanes(tmux);
 		const currentTable = await snapshot();
@@ -241,43 +290,15 @@ export async function stopVerifiedReplSession({ tmux, sessionName, sessionNamePa
 		if (owner) await rememberMarked(currentTable, currentPanes);
 		return tracker.refresh(currentTable, currentPanes);
 	}
-	async function wait(ms) {
-		const deadline = Date.now() + ms;
-		while (true) {
-			const remaining = await inspect();
-			// Allow a bounded quiet grace for startDetached's launcher to exec;
-			// an empty ancestry snapshot alone does not establish settlement.
-			if ((!remaining.length && !owner) || Date.now() >= deadline) return remaining;
-			await sleep(100);
-		}
-	}
-	async function sendVerified(p, value) {
-		// Fresh pane protection + fresh process birth identity before every
-		// individual signal, including KILL escalation. No pkill/group kills.
-		const remaining = await inspect();
-		if (!remaining.some((candidate) => processKey(candidate) === processKey(p))) return;
-		// Marker inspection can involve a subprocess. Refresh ordinary birth
-		// identities and pane protections again immediately before signalling.
+	async function recheck() {
 		const freshPanes = await readPanes(tmux);
 		guardOwner(freshPanes);
-		const fresh = tracker.refresh(await snapshot(), freshPanes);
-		if (!fresh.some((candidate) => processKey(candidate) === processKey(p))) return;
-		try { signal(p.pid, value); signals.push({ pid: p.pid, signal: value }); }
-		catch (error) {
-			if (error.code !== "ESRCH") tracker.issues.add(`Could not send ${value} to verified PID ${p.pid}: ${error.message}`);
-		}
+		return tracker.refresh(await snapshot(), freshPanes);
 	}
 	try {
-		let remaining = await wait(graceMs);
-		for (const p of remaining) await sendVerified(p, "SIGTERM");
-		remaining = await wait(termMs);
-		const deadline = Date.now() + killMs;
-		while (remaining.length && Date.now() < deadline) {
-			for (const p of remaining) await sendVerified(p, "SIGKILL");
-			remaining = await wait(100);
-		}
-		if (remaining.length) tracker.issues.add(`Surviving verified PIDs: ${remaining.map((p) => p.pid).join(", ")}.`);
-		if (tracker.issues.size) throw new Error([...tracker.issues].join(" "));
+		// Allow a bounded quiet grace for startDetached's launcher to exec;
+		// an empty ancestry snapshot alone does not establish settlement.
+		const signals = await endVerifiedSurvivors({ tracker, inspect, recheck, signal, graceMs, termMs, killMs, settleWhenEmpty: !owner });
 		if (socketInspectionFailed) warnings.push("Qt processes exited, but their socket files could not be fully inspected; unverified files were left untouched (lsof may be unavailable).");
 		try { warnings.push(...await cleanupSockets([...sockets.values()], { uid })); }
 		catch { warnings.push("Qt processes exited, but socket cleanup could not be fully verified; unverified files were left untouched."); }

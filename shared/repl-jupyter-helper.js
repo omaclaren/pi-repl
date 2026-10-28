@@ -8,8 +8,8 @@
 //   PI_REPL_JUPYTER_OWNER=<32 hex> node repl-jupyter-helper.js --dir DIR --lfortran /abs/path/to/lfortran
 //
 // DIR is new for each launch, and the helper claims it before anything else.
-// It holds k.json (the connection file), h.sock, ready.json, kernel.log and
-// output spools. The helper runs until it is signalled; when the kernel ends
+// It holds k.json (the connection file), h.sock, ready.json, kernel.log,
+// helper.pid and output spools. The helper runs until it is signalled; when the kernel ends
 // it stays, to report.
 
 import { createHash, randomBytes, timingSafeEqual } from "node:crypto";
@@ -22,7 +22,7 @@ import { pathToFileURL } from "node:url";
 import { JupyterClient, readConnectionFile } from "./repl-jupyter.js";
 
 export const HELPER_PROTOCOL_VERSION = 1;
-export const HELPER_FILES = { connection: "k.json", socket: "h.sock", ready: "ready.json", kernelLog: "kernel.log" };
+export const HELPER_FILES = { connection: "k.json", socket: "h.sock", ready: "ready.json", kernelLog: "kernel.log", pid: "helper.pid" };
 const MAX_REQUEST_LINE_BYTES = 32 * 1024 * 1024;
 const MAX_RESPONSE_LINE_BYTES = 64 * 1024 * 1024;
 const MAX_CODE_BYTES = 16 * 1024 * 1024;
@@ -640,7 +640,8 @@ export class JupyterHelper extends EventEmitter {
 	/**
 	 * DIR must be new: none of the helper's files there. kernel.log, created
 	 * exclusively, is this launch's claim; a second helper given the same DIR
-	 * stops before it changes anything.
+	 * stops before it changes anything. Then helper.pid names this process,
+	 * for the person's window, which waits while it lives.
 	 */
 	claim() {
 		for (const name of Object.values(HELPER_FILES)) {
@@ -653,6 +654,8 @@ export class JupyterHelper extends EventEmitter {
 			throw error;
 		}
 		this.claimed = true;
+		const fd = openSync(this.paths.pid, constants.O_WRONLY | constants.O_CREAT | constants.O_EXCL | constants.O_NOFOLLOW, 0o600);
+		try { writeSync(fd, `${process.pid}\n`); } finally { closeSync(fd); }
 	}
 
 	startKernel() {
