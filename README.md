@@ -149,7 +149,7 @@ for i in 1:3
 end
 ```
 
-The result goes into the conversation as a message, so it stays in the scrollback and the agent sees it at its next turn, together with any pane text it hadn't seen yet. It doesn't start a turn, or a session.
+The result goes into the conversation as a message, so it stays in the scrollback and the agent sees it at its next turn, together with any pane text it hadn't seen yet. It doesn't start a turn, or a session. Pi shows you the code and the end of its output; Ctrl+O shows the rest.
 
 ## Tools used by pi
 

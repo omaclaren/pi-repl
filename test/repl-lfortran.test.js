@@ -10,6 +10,7 @@ import net from "node:net";
 import { join } from "node:path";
 import { promisify } from "node:util";
 import { DEFAULT_MAX_BYTES } from "@earendil-works/pi-coding-agent";
+import { visibleWidth } from "@earendil-works/pi-tui";
 import { answerLfortranInput, formatExecution, lfortranStatus } from "../shared/repl-lfortran.js";
 import { REAL_LFORTRAN, defer, lfortranFixture, until } from "./helpers/repl-test-lfortran.js";
 
@@ -20,12 +21,13 @@ const TOKEN = /token='([0-9a-f]{32})'/;
 async function piFixture(t, options = {}) {
 	const f = lfortranFixture(t, options);
 	if (!f) return null;
-	const tools = new Map(), commands = new Map(), notifications = [], messages = [];
+	const tools = new Map(), commands = new Map(), notifications = [], messages = [], renderers = new Map();
 	const pi = {
 		registerTool: (tool) => tools.set(tool.name, tool),
 		registerCommand: (name, definition) => commands.set(name, definition),
 		on() {},
 		sendMessage: (message, options) => messages.push({ message, options }),
+		registerMessageRenderer: (customType, renderer) => renderers.set(customType, renderer),
 		async exec(command, args, execOptions = {}) {
 			if (command === "tmux") {
 				assert.equal(args[0], "-u", `tmux without -u: ${args.join(" ")}`);
@@ -56,6 +58,13 @@ async function piFixture(t, options = {}) {
 	defer(t, () => repl("stop lfortran"));
 	return {
 		...f, tools, notifications, messages,
+		// A posted message as Pi renders it, without colours, its lines trimmed; none is wider than `width`.
+		shown(message, width = 100) {
+			const plain = { fg: (_color, text) => text, bg: (_color, text) => text, bold: (text) => text };
+			const lines = renderers.get(message.customType)(message, { expanded: false, outputPad: 1 }, plain).render(width);
+			for (const line of lines) assert.ok(visibleWidth(line) <= width, `wider than ${width}: ${JSON.stringify(line)}`);
+			return lines.map((line) => line.trim()).filter(Boolean);
+		},
 		start: (params = {}) => tool("repl_start", { runtime: "lfortran", timeoutMs: 30_000, ...params }),
 		send: (code, params = {}, signal) => tool("repl_send", { code, target: "lfortran", ...params }, signal),
 		input: (token, text, params = {}, signal) => tool("repl_input", { token, text, ...params }, signal),
@@ -89,13 +98,19 @@ test("/repl send lfortran runs the code below it, and a READ it asks is answered
 	assert.equal(message.display, true);
 	assert.deepEqual(options, { triggerTurn: false });
 	assert.match(message.content, /^\/repl send to pi-repl-lfortran:\n\n```\nCompleted\.\nExecution: [0-9a-f]{32}\n\nSubmitted code:\nprint:hello\n\nOutput:\nhello\n```$/);
-	assert.equal(message.details.state, "completed");
+	// The person sees what came of it, the code and the output, without the execution's ID.
+	assert.deepEqual(f.shown(message), ["/repl send · pi-repl-lfortran  completed", "print:hello", "hello"]);
 	await f.repl("send LFortran\nread");
 	const reading = f.messages.at(-1).message.content;
 	const token = TOKEN.exec(reading)[1];
 	assert.ok(reading.endsWith(`\n\nTo answer it from here: /repl input ${token} <text>\n\`\`\``), reading);
+	assert.deepEqual(f.shown(f.messages.at(-1).message), ["/repl send · pi-repl-lfortran  waiting for input: its READ asks \"? \"", "read", "(no output)", `Answer it with /repl input ${token} <text>`]);
+	assert.ok(f.shown(f.messages.at(-1).message, 24).length > 4, "it wraps within a narrow terminal");
 	await f.repl(`input ${token} 7`);
 	assert.match(f.messages.at(-1).message.content, /^\/repl input answered a READ in pi-repl-lfortran:[\s\S]*Output:\ngot 7\n```$/);
+	assert.deepEqual(f.shown(f.messages.at(-1).message), ["/repl input · pi-repl-lfortran  completed", "got 7"]);
+	await f.repl("send lfortran\nfail");
+	assert.equal(f.shown(f.messages.at(-1).message)[0], "/repl send · pi-repl-lfortran  completed, with an error");
 });
 
 test("repl_start, repl_send, a READ answered with repl_input and /repl input, repl_status, and /repl stop", async (t) => {

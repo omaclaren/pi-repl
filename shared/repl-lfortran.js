@@ -185,6 +185,7 @@ function executionDetails(snapshot, identity) {
 /**
  * Sends a cell and waits up to `timeoutMs` for it to settle or to ask for
  * input. A wait that runs out leaves the cell running; nothing is resent.
+ * Resolves with the result's text, its details, and the output it holds.
  * @param {{ tmux: Tmux, code: string, timeoutMs?: number, signal?: AbortSignal, label?: string, ownerKey?: string }} options
  */
 export async function sendLfortranCode({ tmux, code, timeoutMs = 20_000, signal, label = "", ownerKey = "" }) {
@@ -206,7 +207,7 @@ export async function sendLfortranCode({ tmux, code, timeoutMs = 20_000, signal,
 			throw new Error(`The connection to the LFortran session's helper failed while sending (${error.message}). The cell may or may not have been taken; it won't be resent. Look it up with ${lookup(submissionId)}.`);
 		}
 		snapshot = await waitForTransition(client, snapshot, { deadline, signal });
-		return { text: formatExecution(snapshot, { code, timeoutMs }), details: { ...executionDetails({ ...snapshot, lifetimeId: hello.lifetimeId }, hello), submittedCode: code, ...(snapshot.waitFailed ? { waitFailed: snapshot.waitFailed } : {}) } };
+		return { text: formatExecution(snapshot, { code, timeoutMs }), details: { ...executionDetails({ ...snapshot, lifetimeId: hello.lifetimeId }, hello), submittedCode: code, ...(snapshot.waitFailed ? { waitFailed: snapshot.waitFailed } : {}) }, output: snapshot.output?.text ?? "" };
 	} finally {
 		client.close();
 	}
@@ -214,7 +215,8 @@ export async function sendLfortranCode({ tmux, code, timeoutMs = 20_000, signal,
 
 /**
  * Answers the current cell's READ with one record, and waits for what comes
- * next: its result, its next READ, or the end of the wait.
+ * next: its result, its next READ, or the end of the wait. Resolves as
+ * sendLfortranCode does.
  * @param {{ tmux: Tmux, token: string, text: string, timeoutMs?: number, signal?: AbortSignal }} options
  */
 export async function answerLfortranInput({ tmux, token, text, timeoutMs = 20_000, signal }) {
@@ -234,7 +236,7 @@ export async function answerLfortranInput({ tmux, token, text, timeoutMs = 20_00
 			throw new Error(`The connection to the LFortran session's helper failed while answering (${error.message}), so whether the answer arrived isn't known. Check repl_status target='lfortran' before answering again: if the READ still waits with this token, the answer didn't arrive. If it doesn't, that alone doesn't show the answer arrived (the kernel may have ended, for one); the cell's state there says what is known.`);
 		}
 		snapshot = await waitForTransition(client, snapshot, { deadline, signal });
-		return { text: formatExecution(snapshot, { timeoutMs }), details: executionDetails({ ...snapshot, lifetimeId: hello.lifetimeId }, hello) };
+		return { text: formatExecution(snapshot, { timeoutMs }), details: executionDetails({ ...snapshot, lifetimeId: hello.lifetimeId }, hello), output: snapshot.output?.text ?? "" };
 	} finally {
 		client.close();
 	}

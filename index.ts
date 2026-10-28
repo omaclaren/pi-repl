@@ -8,6 +8,7 @@ import {
 } from "@earendil-works/pi-coding-agent";
 import type { ExtensionAPI, ExtensionCommandContext, ExtensionContext } from "@earendil-works/pi-coding-agent";
 import { StringEnum } from "@earendil-works/pi-ai";
+import { Box, Text, stripTerminalSequences } from "@earendil-works/pi-tui";
 import { Type } from "typebox";
 import { randomUUID } from "node:crypto";
 import { existsSync, mkdtempSync, writeFileSync } from "node:fs";
@@ -2534,7 +2535,7 @@ async function sendReplCommand(pi: ExtensionAPI, ctx: ExtensionCommandContext, t
 			const result = await sendLfortranCode({
 				tmux: lfortranTmux(pi, ctx.cwd), code, timeoutMs: clampReplSendTimeout(undefined), label: "/repl send", ownerKey: lfortranOwnerKey(ctx),
 			});
-			postReplCommandResult(pi, ctx, `/repl send to ${result.details.sessionName}`, lfortranCommandText(result), result.details);
+			postReplCommandResult(pi, ctx, `/repl send to ${result.details.sessionName}`, lfortranCommandText(result), lfortranCommandView(`/repl send · ${result.details.sessionName}`, result, code));
 			return;
 		}
 		// In the conversation the agent reads this result too, so it is also told what the pane
@@ -2543,25 +2544,106 @@ async function sendReplCommand(pi: ExtensionAPI, ctx: ExtensionCommandContext, t
 			requestId: `command:send:${randomUUID()}`, label: "/repl send", mode: "raw",
 		}, typeof pi.sendMessage === "function");
 		const formatted = formatReplSendResult(execution.output, execution.details);
-		postReplCommandResult(pi, ctx, `/repl send to ${execution.details.sessionName}`, formatted.text, formatted.details);
+		const notes = [
+			...(formatted.details.fullOutputPath ? [`The full output is in ${formatted.details.fullOutputPath}.`] : []),
+			...(execution.details.recordWarning ? [`Shared record warning: ${execution.details.recordWarning}`] : []),
+		];
+		postReplCommandResult(pi, ctx, `/repl send to ${execution.details.sessionName}`, formatted.text,
+			replCommandView({ title: `/repl send · ${execution.details.sessionName}`, status: "done", tone: "muted", code, notes }, execution.output));
 	} catch (error) {
 		notify(ctx, error instanceof Error ? error.message : String(error), "error");
 	}
 }
 
-/** An LFortran result for the person, bounded as the tools' are, with how to answer a READ from here. */
-function lfortranCommandText(result: { text: string; details: { state?: string; input?: { token: string } | null } }): string {
+type LfortranCommandResult = {
+	text: string;
+	output: string;
+	details: { state?: string; status?: string | null; input?: { token: string; prompt?: string } | null; outputPath?: string | null };
+};
+
+/** An LFortran result for the agent, bounded as the tools' are, with how to answer a READ from here. */
+function lfortranCommandText(result: LfortranCommandResult): string {
 	const { text } = boundToolText(result.text);
 	const token = result.details.state === "waiting-input" ? result.details.input?.token : undefined;
 	return token ? `${text}\n\nTo answer it from here: /repl input ${token} <text>` : text;
 }
 
+/** An LFortran result for the person: what came of the cell, without the IDs the agent uses. */
+function lfortranCommandView(title: string, result: LfortranCommandResult, code?: string): ReplCommandView {
+	const { state, status, input, outputPath } = result.details;
+	const notes = [
+		...(state === "waiting-input" && input ? [`Answer it with /repl input ${input.token} <text>`] : []),
+		...(outputPath ? [`The full output is in ${outputPath}.`] : []),
+	];
+	const [said, tone]: [string, ReplCommandView["tone"]] =
+		state === "completed" && status === "ok" ? ["completed", "success"]
+		: state === "completed" && status === "error" ? ["completed, with an error", "error"]
+		: state === "completed" && status === "aborted" ? ["not run: a cell before it failed", "warning"]
+		: state === "waiting-input" ? [`waiting for input${input?.prompt?.trim() ? `: its READ asks ${JSON.stringify(input.prompt)}` : ""}`, "warning"]
+		: state === "submitted" || state === "running" ? ["still running; it goes on, and /repl status lfortran shows it", "warning"]
+		: [result.text.split("\n")[0], "warning"];
+	return replCommandView({ title, status: said, tone, code, notes }, result.output);
+}
+
+/**
+ * What /repl send and /repl input show the person, in place of the text the
+ * agent reads: the title, what came of it, the code, and the end of the
+ * output, bounded here as the message's details are kept in the session.
+ */
+type ReplCommandView = {
+	title: string;
+	status: string;
+	tone: "success" | "error" | "warning" | "muted";
+	code?: string;
+	output: string;
+	// Output lines before the ones kept.
+	cutLines: number;
+	notes: string[];
+};
+
+const REPL_VIEW_OUTPUT = { maxLines: 200, maxBytes: 16 * 1024 };
+const REPL_VIEW_COLLAPSED_LINES = 12;
+
+function replCommandView(view: Omit<ReplCommandView, "output" | "cutLines">, output: string): ReplCommandView {
+	const kept = truncateTail(displayText(output).replace(/\n+$/, ""), REPL_VIEW_OUTPUT);
+	return { ...view, code: view.code === undefined ? undefined : displayText(view.code).replace(/\n+$/, ""), output: kept.content, cutLines: kept.totalLines - kept.outputLines };
+}
+
+/** Terminal text made safe to lay out: no escape sequences or other controls, and tabs as spaces. */
+function displayText(text: string): string {
+	return stripTerminalSequences(text).replace(/\r\n?/g, "\n").replace(/\t/g, "    ").replace(/[\x00-\x08\x0b-\x1f\x7f]/g, "");
+}
+
+/** Renders a /repl send or /repl input message from its view; one without a view is rendered as Pi renders any message. */
+const renderReplCommandMessage: Parameters<ExtensionAPI["registerMessageRenderer"]>[1] = (message, { expanded, outputPad }, theme) => {
+	const view = (message.details as { view?: ReplCommandView } | undefined)?.view;
+	if (!view) return undefined;
+	const lines = [`${theme.bold(theme.fg("customMessageLabel", view.title))}  ${theme.fg(view.tone, view.status)}`];
+	if (view.code) {
+		const code = view.code.split("\n");
+		const shown = expanded ? code : code.slice(0, REPL_VIEW_COLLAPSED_LINES);
+		lines.push("", ...shown.map((line) => theme.fg("mdCodeBlock", line)));
+		if (shown.length < code.length) lines.push(theme.fg("dim", `… ${code.length - shown.length} more line(s) (ctrl+o to expand)`));
+	}
+	const output = view.output ? view.output.split("\n") : [];
+	const shown = expanded ? output : output.slice(-REPL_VIEW_COLLAPSED_LINES);
+	const earlier = view.cutLines + output.length - shown.length;
+	lines.push("");
+	if (earlier > 0) lines.push(theme.fg("dim", `… ${earlier} earlier line(s)${shown.length < output.length ? " (ctrl+o to expand)" : ""}`));
+	lines.push(...(shown.length ? shown.map((line) => theme.fg("text", line)) : [theme.fg("dim", "(no output)")]));
+	if (view.notes.length) lines.push("", ...view.notes.map((note) => theme.fg("muted", note)));
+	const box = new Box(outputPad, 1, (text) => theme.bg("customMessageBg", text));
+	box.addChild(new Text(lines.join("\n"), 0, 0));
+	return box;
+};
+
 /**
  * A command's REPL result as a message in the conversation: shown to the
- * person, kept in the scrollback, and seen by the agent at its next turn. It
- * starts no turn. Hosts without messages show it as a notice.
+ * person from its view, kept in the scrollback, and seen by the agent, as
+ * `text`, at its next turn. It starts no turn. Hosts without messages show
+ * the text as a notice.
  */
-function postReplCommandResult(pi: ExtensionAPI, ctx: ExtensionCommandContext, heading: string, text: string, details: unknown): void {
+function postReplCommandResult(pi: ExtensionAPI, ctx: ExtensionCommandContext, heading: string, text: string, view: ReplCommandView): void {
 	const longest = Math.max(0, ...(text.match(/`+/g) ?? []).map((run) => run.length));
 	const fence = "`".repeat(Math.max(3, longest + 1));
 	const content = `${heading}:\n\n${fence}\n${text}\n${fence}`;
@@ -2569,7 +2651,7 @@ function postReplCommandResult(pi: ExtensionAPI, ctx: ExtensionCommandContext, h
 		notify(ctx, content, "info");
 		return;
 	}
-	pi.sendMessage({ customType: "pi-repl-send", content, display: true, details }, { triggerTurn: false });
+	pi.sendMessage({ customType: "pi-repl-send", content, display: true, details: { view } }, { triggerTurn: false });
 }
 
 async function startDefaultReplSession(
@@ -3183,7 +3265,7 @@ async function handleRepl(pi: ExtensionAPI, args: string, ctx: ExtensionCommandC
 		case "input":
 			try {
 				const result = await answerLfortranInput({ tmux: lfortranTmux(pi, ctx.cwd), token: parsed.token, text: parsed.text });
-				postReplCommandResult(pi, ctx, `/repl input answered a READ in ${result.details.sessionName}`, lfortranCommandText(result), result.details);
+				postReplCommandResult(pi, ctx, `/repl input answered a READ in ${result.details.sessionName}`, lfortranCommandText(result), lfortranCommandView(`/repl input · ${result.details.sessionName}`, result));
 			} catch (error) {
 				notify(ctx, error instanceof Error ? error.message : String(error), "error");
 			}
@@ -3343,6 +3425,7 @@ export default function (pi: ExtensionAPI) {
 			pendingViews = [];
 		});
 	}
+	pi.registerMessageRenderer?.("pi-repl-send", renderReplCommandMessage);
 	pi.registerCommand("repl", {
 		description: "Manage collaborative tmux-backed REPL sessions",
 		handler: async (args, ctx) => {

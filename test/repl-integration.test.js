@@ -10,6 +10,7 @@ import { acquireReplSessionSendLease, readReplSessionRecord, upsertReplSessionRe
 import { createReplSubmissionDisplay } from "../shared/repl-submission-display.js";
 import { gnuplotStringLiteral } from "../shared/repl-gnuplot.js";
 import { createTestTmux, readProcessTable } from "./helpers/repl-test-tmux.js";
+import { visibleWidth } from "@earendil-works/pi-tui";
 
 const exec = promisify(execFile);
 const originalEnv = { TMPDIR: process.env.TMPDIR, PI_REPL_CONTROL_ROOT: process.env.PI_REPL_CONTROL_ROOT, SHELL: process.env.SHELL, PI_REPL_ECHO_MODE: process.env.PI_REPL_ECHO_MODE };
@@ -112,6 +113,7 @@ async function fixture(t, { index = 0, runtime = "python", controlName, startWit
 	const commands = new Map();
 	const notifications = [];
 	const messages = [];
+	const renderers = new Map();
 	let afterEnter;
 	let beforePaste;
 	let beforeStop;
@@ -122,6 +124,7 @@ async function fixture(t, { index = 0, runtime = "python", controlName, startWit
 		registerCommand: (name, definition) => commands.set(name, definition),
 		on: (event, handler) => handlers.set(event, [...(handlers.get(event) ?? []), handler]),
 		sendMessage: (message, options) => messages.push({ message, options }),
+		registerMessageRenderer: (customType, renderer) => renderers.set(customType, renderer),
 		async exec(command, args, options) {
 			// pi-repl passes -u to every tmux command; the harness adds its own.
 			if (command === "tmux") {
@@ -212,7 +215,7 @@ async function fixture(t, { index = 0, runtime = "python", controlName, startWit
 	} catch (error) {
 		throw new Error(`${runtime} startup failed: ${startupOutput}`, { cause: error });
 	}
-	return { cwd, calls, notifications, messages, withoutMessages: () => { pi.sendMessage = undefined; }, tmux, sessionName, target, repl, send, status, start, otherAgent, fire, onExec: (override) => { execOverride = override; }, owned: () => tmuxHarness.owned(), cleanup: () => tmuxHarness.cleanup(), onEnter: (callback) => { afterEnter = callback; }, onBeforePaste: (callback) => { beforePaste = callback; }, onBeforeStop: (callback) => { beforeStop = callback; } };
+	return { cwd, calls, notifications, messages, renderers, withoutMessages: () => { pi.sendMessage = undefined; }, tmux, sessionName, target, repl, send, status, start, otherAgent, fire, onExec: (override) => { execOverride = override; }, owned: () => tmuxHarness.owned(), cleanup: () => tmuxHarness.cleanup(), onEnter: (callback) => { afterEnter = callback; }, onBeforePaste: (callback) => { beforePaste = callback; }, onBeforeStop: (callback) => { beforeStop = callback; } };
 }
 
 async function assertCompletionGap(f, result) {
@@ -812,6 +815,14 @@ test("other agents' sends and the user's commands do not hide pane text from an 
 	assert.match(paneReport(await conversation.send("print(2)")), /^This agent has not seen this session's pane before[\s\S]*pi_human = 73/);
 });
 
+// A posted message as Pi renders it at `width` columns, in a theme without colours; no line may be wider.
+function renderPosted(f, message, width, expanded = false) {
+	const plain = { fg: (_color, text) => text, bg: (_color, text) => text, bold: (text) => text };
+	const lines = f.renderers.get(message.customType)(message, { expanded, outputPad: 1 }, plain).render(width);
+	for (const line of lines) assert.ok(visibleWidth(line) <= width, `wider than ${width}: ${JSON.stringify(line)}`);
+	return lines;
+}
+
 test("/repl send runs the person's code below it and posts the result to the conversation", { timeout: 60000 }, async (t) => {
 	const f = await fixture(t, { startWithTool: true });
 	if (!f) return;
@@ -832,6 +843,19 @@ test("/repl send runs the person's code below it and posts the result to the con
 	assert.equal(entry.label, "/repl send");
 	assert.equal(entry.mode, "raw");
 	assert.equal(entry.output, "0\n1\n2\nfin");
+	// The person sees the code and its output, as wide as the terminal at most, without the agent's text.
+	const shown = renderPosted(f, message, 30);
+	assert.deepEqual(shown.map((line) => line.trim()).filter(Boolean), ["/repl send · pi-repl-python", "done", "for i in range(3):", "print(i)", "print('fin')", "0", "1", "2", "fin"]);
+	// Long output shows its end until expanded; escapes, tabs and long lines are laid out within the width.
+	await f.repl(`send\nfor i in range(30): print(i)\nprint("\\t\\x1b[31mred\\x1b[0m" + "x" * 100)`);
+	const long = f.messages.at(-1).message;
+	assert.ok(renderPosted(f, long, 40).length > 0);
+	const collapsed = renderPosted(f, long, 60).map((line) => line.trim()).filter(Boolean);
+	assert.ok(collapsed.includes("… 19 earlier line(s) (ctrl+o to expand)"), collapsed.join("\n"));
+	assert.ok(collapsed.includes("29") && !collapsed.includes("18"), collapsed.join("\n"));
+	assert.ok(collapsed.some((line) => line.startsWith("red") && !line.includes("\x1b")), collapsed.join("\n"));
+	const expanded = renderPosted(f, long, 40, true).map((line) => line.trim());
+	assert.ok(expanded.includes("0") && expanded.includes("18") && !expanded.some((line) => line.includes("earlier line")), expanded.join("\n"));
 	// Code with backticks gets a longer fence; a named target is used, not Python.
 	await f.repl("send python\nprint('```')");
 	assert.match(f.messages.at(-1).message.content, /^\/repl send to pi-repl-python:\n\n````\n[\s\S]*Output:\n```\n````$/);
