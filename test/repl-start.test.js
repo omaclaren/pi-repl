@@ -133,13 +133,15 @@ test("repl_start requires a canonical explicit runtime; no send auto-start or de
 	const f = fixture();
 	const schema = f.tools.get("repl_start").parameters;
 	assert.ok(schema.required.includes("runtime"));
-	assert.deepEqual(schema.properties.runtime.enum, runtimes.map(([runtime]) => runtime));
+	// LFortran's shared session starts through its own path, after the pane runtimes.
+	assert.deepEqual(schema.properties.runtime.enum, [...runtimes.map(([runtime]) => runtime), "lfortran"]);
 	assert.equal(schema.properties.runtime.anyOf, undefined);
 	for (const runtime of [undefined, "", "bun", "unknown", "irb", "jshell"]) {
 		await assert.rejects(f.start({ runtime }), /explicit supported runtime/);
 	}
 	assert.equal(f.calls.length, 0);
-	assert.deepEqual([...f.tools.keys()].sort(), ["repl_send", "repl_start", "repl_status"]);
+	// repl_input only answers an LFortran READ; there is still no tool that stops or resets a session.
+	assert.deepEqual([...f.tools.keys()].sort(), ["repl_input", "repl_send", "repl_start", "repl_status"]);
 	await assert.rejects(f.tools.get("repl_send").execute("test", { code: "print(1)" }, undefined, undefined, { cwd: root }), /No default/);
 	assert.equal(f.calls.some((call) => call.args[0] === "new-session"), false);
 });

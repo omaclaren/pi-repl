@@ -44,6 +44,7 @@ import { mStringLiteral, buildMLanguageControlSource, buildMLanguageDriverSource
 import { buildGnuplotSubmissionLine, buildGnuplotGuardSource, buildGnuplotDriverSource } from "./shared/repl-gnuplot.js";
 import { cppInclude, buildCppDriverSource, buildCppRequest, createCppControlCleanup, prepareCppSubmission, readCppCompletion } from "./shared/repl-cpp.js";
 import { GNUPLOT_OWNER_ENV, GNUPLOT_OWNER_OPTION } from "./shared/repl-gnuplot-processes.js";
+import { LFORTRAN_GUIDELINES, answerLfortranInput, lfortranStatus, sendLfortranCode, startLfortranRuntime, stopLfortranSession } from "./shared/repl-lfortran.js";
 
 const SUPPORTED_RUNTIMES = ["julia", "python", "ipython", "r", "ghci", "clojure", "clj", "ruby", "java", "octave", "matlab", "gnuplot", "cpp", "bun"] as const;
 const DEFAULT_PYTHON_SESSION = "pi-repl-python";
@@ -229,6 +230,8 @@ type ReplCommand =
 	| { action: "attach"; runtime?: ManagedRuntime }
 	| { action: "export"; runtime?: ManagedRuntime }
 	| { action: "start"; runtime: SupportedRuntime; name?: string }
+	| { action: "lfortran"; command: "start" | "status" | "stop" | "attach" }
+	| { action: "input"; token: string; text: string }
 	| { action: "error"; message: string };
 
 type SharedReplRecordEntry = {
@@ -286,10 +289,10 @@ type ReplSendDetails = {
 };
 
 const REPL_SEND_PARAMS = Type.Object({
-	code: Type.String({ description: "Python, IPython, Julia, R, GHCi, Clojure, Ruby, Java, Octave, MATLAB, gnuplot, or C++ code to execute in the shared REPL session." }),
+	code: Type.String({ description: "Python, IPython, Julia, R, GHCi, Clojure, Ruby, Java, Octave, MATLAB, gnuplot, C++ or Fortran (LFortran) code to execute in the shared REPL session." }),
 	target: Type.Optional(
 		Type.String({
-			description: "Optional target REPL: python, julia, r, ghci, clojure, ruby, java, octave, matlab, gnuplot, or cpp. If omitted, repl_send uses the shared Python/IPython session.",
+			description: "Optional target REPL: python, julia, r, ghci, clojure, ruby, java, octave, matlab, gnuplot, cpp, or lfortran. If omitted, repl_send uses the shared Python/IPython session.",
 		}),
 	),
 	timeoutMs: Type.Optional(
@@ -320,8 +323,10 @@ function getToolSubmissionLabel(): string {
 }
 
 const REPL_START_RUNTIMES = ["python", "ipython", "julia", "r", "ghci", "clojure", "ruby", "java", "octave", "matlab", "gnuplot", "cpp"] as const;
+// LFortran's shared session runs through its own helper, not by pasting into a pane, so it isn't one of REPL_START_RUNTIMES.
+const REPL_START_TOOL_RUNTIMES = [...REPL_START_RUNTIMES, "lfortran"] as const;
 const REPL_START_PARAMS = Type.Object({
-	runtime: StringEnum(REPL_START_RUNTIMES, {
+	runtime: StringEnum(REPL_START_TOOL_RUNTIMES, {
 		description: "Runtime to start explicitly. Python and IPython share one session; an existing session is reused without switching its interpreter.",
 	}),
 	timeoutMs: Type.Optional(Type.Number({
@@ -334,9 +339,24 @@ const REPL_START_PARAMS = Type.Object({
 const REPL_STATUS_PARAMS = Type.Object({
 	target: Type.Optional(
 		Type.String({
-			description: "Optional session target: python, julia, r, ghci, ruby, java, clojure, octave, matlab, gnuplot, or cpp. If omitted, report all shared REPL sessions.",
+			description: "Optional session target: python, julia, r, ghci, ruby, java, clojure, octave, matlab, gnuplot, cpp, or lfortran. If omitted, report all shared REPL sessions.",
 		}),
 	),
+	execution: Type.Optional(
+		Type.String({
+			description: "LFortran only: an execution ID, or a submission ID, from an earlier result; reports that cell exactly.",
+		}),
+	),
+});
+
+const REPL_INPUT_PARAMS = Type.Object({
+	token: Type.String({ description: "The token from the result that said the LFortran cell is waiting for input." }),
+	text: Type.String({ description: "The answer: one line, as the READ reads it. One trailing newline is removed; other line breaks are refused. Spaces are kept, and empty text is an empty line." }),
+	timeoutMs: Type.Optional(Type.Number({
+		description: "How long to wait for what comes next, its result or its next READ, in milliseconds (default 20000).",
+		minimum: 1000,
+		maximum: MAX_REPL_SEND_TIMEOUT_MS,
+	})),
 });
 
 function tokenizeArgs(args: string): string[] {
@@ -430,12 +450,15 @@ function formatUsage(): string {
 		"  /repl matlab",
 		"  /repl gnuplot",
 		"  /repl cpp",
+		"  /repl lfortran",
+		"  /repl input <token> <text>",
 		"  /repl echo [off|summary|full]",
 		"  /repl status [python|julia|r|ghci|clojure|ruby|java|octave|matlab|gnuplot|cpp]",
 		"  /repl env [python]",
 		"  /repl attach [python|julia|r|ghci|clojure|ruby|java|octave|matlab|gnuplot|cpp]",
 		"  /repl export [python|julia|r|ghci|clojure|ruby|java|octave|matlab|gnuplot|cpp]",
 		"  /repl stop [python|julia|r|ghci|clojure|ruby|java|octave|matlab|gnuplot|cpp]",
+		"  /repl status lfortran, /repl attach lfortran, /repl stop lfortran",
 		"",
 		"Supported runtimes right now: python, ipython, julia, r, ghci, clojure, ruby, java, octave, matlab, gnuplot, cpp",
 		"For R, both /repl R and /repl r work. The same applies to /lab, /repl status, /repl attach, /repl export, and /repl stop.",
@@ -453,6 +476,8 @@ function formatUsage(): string {
 		"  - /repl octave and /repl matlab manage separate terminal sessions; they never substitute for each other",
 		"  - /repl gnuplot manages the independent pi-repl-gnuplot session, retaining native plotting settings",
 		"  - /repl cpp starts an experimental Cling-based C++ REPL; send C++ prompt groups, not dot commands",
+		"  - /repl lfortran starts LFortran's shared session (experimental; needs LFortran main): LFortran's own prompt in the first window, and pi-repl's helper for the kernel in the second",
+		"  - /repl input <token> <text> answers an LFortran cell's READ with the text as given",
 		"  - /repl status, /repl attach, /repl export, and /repl stop can target any managed runtime",
 		"  - repl_start lets pi start or reuse a session with an explicit runtime; repl_send never auto-starts one",
 		"  - /repl echo controls the bounded submitted-code display in the raw pane; PI_REPL_ECHO_MODE sets the startup default",
@@ -483,6 +508,18 @@ function parseReplCommand(args: string): ReplCommand {
 
 	if (["help", "-h", "--help", "?"].includes(firstLower)) {
 		return { action: "help" };
+	}
+
+	if (firstLower === "input") {
+		// The answer is passed on exactly, spaces and empty text included: everything after the token's single separating space.
+		const match = /^\s*input\s+(\S+)(?: ([\s\S]*))?$/i.exec(args);
+		if (!match) return { action: "error", message: "Usage: /repl input <token> <text>" };
+		return { action: "input", token: match[1], text: match[2] ?? "" };
+	}
+
+	if (firstLower === "lfortran" && rest.length === 0) return { action: "lfortran", command: "start" };
+	if ((firstLower === "status" || firstLower === "stop" || firstLower === "attach") && rest.length === 1 && rest[0].toLowerCase() === "lfortran") {
+		return { action: "lfortran", command: firstLower };
 	}
 
 	if (firstLower === "echo") {
@@ -2985,6 +3022,59 @@ async function exportReplRecord(
 	}
 }
 
+function lfortranTmux(pi: ExtensionAPI, cwd: string) {
+	return (args: string[]) => execTmux(pi, args, cwd, 10_000);
+}
+
+// The preflight's commands, through Pi's exec as other lookups are.
+function lfortranRun(pi: ExtensionAPI) {
+	return async (file: string, args: string[], options: { cwd?: string; timeoutMs?: number } = {}) => {
+		try {
+			const result = await pi.exec(file, args, { cwd: options.cwd, timeout: options.timeoutMs });
+			return { code: result.code ?? 1, stdout: result.stdout ?? "", stderr: result.stderr ?? "" };
+		} catch (error) {
+			return { code: 1, stdout: "", stderr: error instanceof Error ? error.message : String(error) };
+		}
+	};
+}
+
+// Ownership follows the Pi session where Pi gives one, so it survives a resume; otherwise it is this host process's slot.
+function lfortranOwnerKey(ctx: ExtensionContext): string {
+	const sessionId = (ctx as { sessionManager?: { getSessionId?: () => string } }).sessionManager?.getSessionId?.();
+	return sessionId ? `pi-session:${sessionId}` : `host-process:${process.pid}`;
+}
+
+/** Bounds a tool's text as repl_send's is bounded; the complete text is saved privately when it's cut. */
+function boundToolText(fullText: string): { text: string; truncation?: TruncationResult; fullOutputPath?: string } {
+	const initial = truncateHead(fullText, { maxLines: DEFAULT_MAX_LINES, maxBytes: DEFAULT_MAX_BYTES });
+	if (!initial.truncated) return { text: fullText };
+	const tempDir = mkdtempSync(join(tmpdir(), "pi-repl-output-"));
+	const tempFile = join(tempDir, "submission.txt");
+	writeFileSync(tempFile, fullText, { encoding: "utf8", mode: 0o600, flag: "wx" });
+	const notice = `\n\n[REPL response truncated. Full submitted code and output saved to: ${tempFile}]`;
+	const truncation = truncateHead(fullText, { maxLines: DEFAULT_MAX_LINES - 3, maxBytes: DEFAULT_MAX_BYTES - Buffer.byteLength(notice, "utf8") });
+	return { text: truncation.content + notice, truncation, fullOutputPath: tempFile };
+}
+
+async function handleLfortranCommand(pi: ExtensionAPI, ctx: ExtensionCommandContext, command: "start" | "status" | "stop" | "attach"): Promise<void> {
+	const tmux = lfortranTmux(pi, ctx.cwd);
+	try {
+		if (command === "start") {
+			const result = await startLfortranRuntime({ tmux, cwd: ctx.cwd, timeoutMs: DEFAULT_STARTUP_WAIT_MS, run: lfortranRun(pi) });
+			notify(ctx, result.text, result.details.ready ? "info" : "warning");
+		} else if (command === "status") {
+			notify(ctx, (await lfortranStatus({ tmux })).text, "info");
+		} else if (command === "stop") {
+			const result = await stopLfortranSession({ tmux });
+			notify(ctx, result.text, result.details.stopped && !result.details.warnings?.length ? "info" : "warning");
+		} else {
+			notify(ctx, [formatAttachInstructions("pi-repl-lfortran", pi), "LFortran's own prompt is the session's first window; the helper runs in the second."].join("\n"), "info");
+		}
+	} catch (error) {
+		notify(ctx, `${command === "stop" ? "Could not fully stop pi-repl-lfortran: " : ""}${error instanceof Error ? error.message : String(error)}`, "error");
+	}
+}
+
 async function handleRepl(pi: ExtensionAPI, args: string, ctx: ExtensionCommandContext): Promise<void> {
 	const parsed = parseReplCommand(args);
 
@@ -3018,6 +3108,17 @@ async function handleRepl(pi: ExtensionAPI, args: string, ctx: ExtensionCommandC
 	}
 
 	switch (parsed.action) {
+		case "lfortran":
+			await handleLfortranCommand(pi, ctx, parsed.command);
+			return;
+		case "input":
+			try {
+				const result = await answerLfortranInput({ tmux: lfortranTmux(pi, ctx.cwd), token: parsed.token, text: parsed.text });
+				notify(ctx, result.text, "info");
+			} catch (error) {
+				notify(ctx, error instanceof Error ? error.message : String(error), "error");
+			}
+			return;
 		case "status":
 			await showReplStatus(pi, ctx, parsed.runtime ? toSessionSelector(parsed.runtime) : undefined);
 			return;
@@ -3193,12 +3294,18 @@ export default function (pi: ExtensionAPI) {
 			"Use repl_start when the user wants to start a shared REPL, choosing runtime explicitly. It uses the same startup path as /repl and /lab; Python and IPython share one session and an existing interpreter is never switched.",
 			"Check repl_start's ready result before repl_send. ready=false means inspect the pane or repl_status first; do not reset, interrupt, or send input to force readiness. A detected prompt is a snapshot, not a reservation against direct terminal input.",
 			"repl_start leaves sessions running after readiness timeout or cancellation. Stopping or restarting remains an explicit user action; repl_send never auto-starts sessions.",
+			"repl_start runtime='lfortran' starts LFortran's shared session (experimental; it needs LFortran main with `lfortran --connect`): the person uses LFortran's own prompt, and repl_send target='lfortran' runs cells through pi-repl's helper.",
 		],
 		parameters: REPL_START_PARAMS,
 		async execute(_toolCallId, params, signal, _onUpdate, ctx) {
-			if (!REPL_START_RUNTIMES.includes(params.runtime)) throw new Error(`repl_start requires an explicit supported runtime: ${REPL_START_RUNTIMES.join(", ")}.`);
 			const timeoutMs = typeof params.timeoutMs === "number" && Number.isFinite(params.timeoutMs)
 				? Math.max(1_000, Math.min(MAX_STARTUP_WAIT_MS, Math.round(params.timeoutMs))) : DEFAULT_STARTUP_WAIT_MS;
+			if (params.runtime === "lfortran") {
+				const result = await startLfortranRuntime({ tmux: lfortranTmux(pi, ctx.cwd), cwd: ctx.cwd, timeoutMs, signal, run: lfortranRun(pi) });
+				const bounded = boundToolText(result.text);
+				return { content: [{ type: "text", text: bounded.text }], details: { ...result.details, ...(bounded.truncation ? { truncation: bounded.truncation } : {}) } };
+			}
+			if (!REPL_START_RUNTIMES.includes(params.runtime)) throw new Error(`repl_start requires an explicit supported runtime: ${REPL_START_TOOL_RUNTIMES.join(", ")}.`);
 			const result = await startDefaultReplSession(pi, ctx.cwd, params.runtime, timeoutMs, signal);
 			const truncation = truncateHead(result.text, { maxLines: DEFAULT_MAX_LINES - 2, maxBytes: DEFAULT_MAX_BYTES - 256 });
 			return {
@@ -3218,11 +3325,25 @@ export default function (pi: ExtensionAPI) {
 			"For Octave use repl_status target='octave'; for MATLAB use target='matlab'; for gnuplot use target='gnuplot'; for C++ use target='cpp'. They use separate shared sessions.",
 			"If the user asks specifically about Julia, use target='julia'. If they ask specifically about R, use target='r'. If they ask specifically about GHCi or Haskell, use target='ghci'. If they ask specifically about Clojure, use target='clojure'. If they ask specifically about Ruby or IRB, use target='ruby'. If they ask specifically about Java or jshell, use target='java'. If they ask specifically about Python or IPython, use target='python'.",
 			"If you need context about prior direct REPL interaction, inspect repl_status details and read the session history file listed there.",
+			"For LFortran use target='lfortran': it shows the person's prompt, the helper and kernel, and the latest cell sent through pi-repl. To follow a particular cell, such as one that outlasted repl_send's wait or whose send failed, pass its execution or submission ID as execution.",
 		],
 		parameters: REPL_STATUS_PARAMS,
 		async execute(_toolCallId, params, _signal, _onUpdate, ctx) {
 			const targetRaw = typeof (params as { target?: string }).target === "string" ? (params as { target?: string }).target?.trim().toLowerCase() : undefined;
 			let target: SessionSelector | undefined;
+			const execution = typeof (params as { execution?: string }).execution === "string" ? (params as { execution?: string }).execution?.trim() : undefined;
+			if (targetRaw === "lfortran" || targetRaw === "fortran" || (execution && !targetRaw)) {
+				const status = await lfortranStatus({ tmux: lfortranTmux(pi, ctx.cwd), execution: execution || undefined });
+				const bounded = boundToolText(status.text);
+				return { content: [{ type: "text", text: bounded.text }], details: { lfortran: status.details, ...(bounded.truncation ? { truncation: bounded.truncation, fullOutputPath: bounded.fullOutputPath } : {}) } };
+			}
+			if (execution) throw new Error("repl_status's execution parameter is for LFortran cells: use it with target='lfortran'.");
+			// LFortran's session isn't one of the pane sessions; the overview shows it after them, and is bounded with it.
+			const lfortran = targetRaw ? null : await lfortranStatus({ tmux: lfortranTmux(pi, ctx.cwd) }).catch(() => null);
+			const withLfortran = (text: string, sessionsRunning: boolean) => {
+				if (!lfortran?.details.running) return text;
+				return boundToolText(sessionsRunning ? `${text}\n\nLFortran session:\n${lfortran.text}` : lfortran.text).text;
+			};
 			if (targetRaw) {
 				if (targetRaw === "julia") target = "julia";
 				else if (targetRaw === "r") target = "r";
@@ -3253,18 +3374,19 @@ export default function (pi: ExtensionAPI) {
 				};
 			}
 
+			const lfortranDetails = lfortran?.details.running ? { lfortran: lfortran.details } : {};
 			if (sessions.length === 0) {
 				return {
-					content: [{ type: "text", text: "No shared REPL sessions are running." }],
-					details,
+					content: [{ type: "text", text: withLfortran("No shared REPL sessions are running.", false) }],
+					details: { ...details, ...lfortranDetails },
 				};
 			}
 
 			if (sessions.length === 1) {
 				const only = sessions[0];
 				return {
-					content: [{ type: "text", text: `${getSessionDisplayName(only.selector, only.info)} REPL session is running.\n\n${await formatSessionStatus(pi, only.info, ctx.cwd)}` }],
-					details,
+					content: [{ type: "text", text: withLfortran(`${getSessionDisplayName(only.selector, only.info)} REPL session is running.\n\n${await formatSessionStatus(pi, only.info, ctx.cwd)}`, true) }],
+					details: { ...details, ...lfortranDetails },
 				};
 			}
 
@@ -3272,7 +3394,7 @@ export default function (pi: ExtensionAPI) {
 			return {
 				content: [{
 					type: "text",
-					text: [
+					text: withLfortran([
 						"Shared REPL sessions are running:",
 						"",
 						...sessions.flatMap((session, index) => [
@@ -3280,9 +3402,9 @@ export default function (pi: ExtensionAPI) {
 							statuses[index],
 							...(index < sessions.length - 1 ? [""] : []),
 						]),
-					].join("\n"),
+					].join("\n"), true),
 				}],
-				details,
+				details: { ...details, ...lfortranDetails },
 			};
 		},
 	});
@@ -3309,10 +3431,37 @@ export default function (pi: ExtensionAPI) {
 			"For C++ use target='cpp': an experimental Cling-based C++ REPL. Submit complete native prompt groups (put a function's opening brace on its declaration line); include ordinary definition/header files separately. Dot commands are terminal-only; use /repl stop cpp to stop. Earlier groups may run before a later error. Compiler/link diagnostics and caught C++ exceptions are retained; there is no replay. Exit, crashes and busy Ctrl-C can end the workspace. Completion means the evaluator returned, not that library calls succeeded. Do not queue control commands behind stdin reads or restart after timeout. Cling with matching development headers must already be on your login-shell PATH; no automatic installation or alternate-runtime fallback.",
 			"For gnuplot use repl_send target='gnuplot'. This is its own persistent runtime, not another REPL's plotting backend. Send complete native scripts; use print for console results. Preserve the user's terminal, output, print destination and settings; export figures only when requested. reset and reset session deliberately change state. In a loaded script, exit/quit returns from that script; exit gnuplot ends the process. Avoid pause/input waits unless explicitly wanted.",
 			"Avoid blocking interactive input() prompts or long-running code unless the user explicitly wants that.",
+			...LFORTRAN_GUIDELINES,
 		],
 		parameters: REPL_SEND_PARAMS,
 		async execute(toolCallId, params, signal, _onUpdate, ctx) {
-			return executeReplSend(pi, params as ReplSendParams, ctx, signal, toolCallId);
+			const send = params as ReplSendParams;
+			if (send.target?.trim().toLowerCase() === "lfortran") {
+				const result = await sendLfortranCode({
+					tmux: lfortranTmux(pi, ctx.cwd), code: send.code, timeoutMs: clampReplSendTimeout(send.timeoutMs), signal,
+					label: getToolSubmissionLabel(), ownerKey: lfortranOwnerKey(ctx),
+				});
+				const bounded = boundToolText(result.text);
+				return { content: [{ type: "text", text: bounded.text }], details: { ...result.details, ...(bounded.truncation ? { truncation: bounded.truncation, fullOutputPath: bounded.fullOutputPath } : {}) } };
+			}
+			return executeReplSend(pi, send, ctx, signal, toolCallId);
+		},
+	});
+
+	pi.registerTool({
+		name: "repl_input",
+		label: "REPL Input",
+		description: `Answer a READ that an LFortran cell sent with repl_send is waiting on, using the token its result gave, and wait for what comes next: the cell's result, or its next READ. The response text is bounded to ${DEFAULT_MAX_LINES} lines or ${formatSize(DEFAULT_MAX_BYTES)}.`,
+		promptSnippet: "Answer the READ of an LFortran cell that is waiting for input.",
+		promptGuidelines: [
+			"Use repl_input only with a token that a repl_send, repl_input or repl_status result gave for an LFortran cell waiting for input. Each token answers one READ, once.",
+			"The text is one line, given exactly as the READ should read it. Don't make up input: if the value isn't known from the conversation, ask the person. Tool calls aren't a channel for secrets.",
+		],
+		parameters: REPL_INPUT_PARAMS,
+		async execute(_toolCallId, params, signal, _onUpdate, ctx) {
+			const result = await answerLfortranInput({ tmux: lfortranTmux(pi, ctx.cwd), token: params.token, text: params.text, timeoutMs: clampReplSendTimeout(params.timeoutMs), signal });
+			const bounded = boundToolText(result.text);
+			return { content: [{ type: "text", text: bounded.text }], details: { ...result.details, ...(bounded.truncation ? { truncation: bounded.truncation } : {}) } };
 		},
 	});
 }

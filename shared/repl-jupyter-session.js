@@ -10,7 +10,7 @@
 
 import { execFile } from "node:child_process";
 import { randomBytes } from "node:crypto";
-import { chmodSync, closeSync, constants, fstatSync, lstatSync, mkdirSync, openSync, readdirSync, readSync, realpathSync, rmdirSync, unlinkSync } from "node:fs";
+import { chmodSync, closeSync, constants, fstatSync, lstatSync, mkdirSync, openSync, readdirSync, readSync, realpathSync, rmdirSync, unlinkSync, writeSync } from "node:fs";
 import { basename, join } from "node:path";
 import { fileURLToPath } from "node:url";
 import { HELPER_FILES, HELPER_PROTOCOL_VERSION, HelperClient, checkPrivateDirectory } from "./repl-jupyter-helper.js";
@@ -30,6 +30,8 @@ export const JUPYTER_OPTIONS = {
 	personPane: "@pi_repl_jupyter_person_pane",
 	helperPane: "@pi_repl_jupyter_helper_pane",
 };
+// pi-repl's claim on a session directory: the launch's owner marker.
+export const LAUNCH_FILE = "launch";
 export const HELPER_SCRIPT = fileURLToPath(new URL("./repl-jupyter-helper.js", import.meta.url));
 const OWNER = /^[0-9a-f]{32}$/;
 const PANE = /^%\d+$/;
@@ -82,9 +84,12 @@ export async function preflightLfortran({ shell = defaultShell(), cwd, run = run
 /**
  * A new private directory for one launch, short enough that DIR/h.sock fits
  * macOS's 104-byte socket paths: ROOT/pi-rj-<uid>/<8 hex>. Both levels are
- * real directories of this user's, mode 0700.
+ * real directories of this user's, mode 0700. DIR/launch, written
+ * exclusively, binds it to its launch's owner marker: a stop removes only a
+ * directory that names its own session's marker.
  */
-export function createSessionDir({ root = "/tmp", uid = process.getuid() } = {}) {
+export function createSessionDir({ root = "/tmp", uid = process.getuid(), owner }) {
+	if (!OWNER.test(owner ?? "")) throw new Error("A session directory needs its launch's owner marker.");
 	const parent = join(root, `pi-rj-${uid}`);
 	try {
 		mkdirSync(parent, { mode: 0o700 });
@@ -103,6 +108,8 @@ export function createSessionDir({ root = "/tmp", uid = process.getuid() } = {})
 		}
 		chmodSync(dir, 0o700);
 		checkPrivateDirectory(dir);
+		const fd = openSync(join(dir, LAUNCH_FILE), constants.O_WRONLY | constants.O_CREAT | constants.O_EXCL | constants.O_NOFOLLOW, 0o600);
+		try { writeSync(fd, `${owner}\n`); } finally { closeSync(fd); }
 		return dir;
 	}
 	throw new Error(`Could not make a new session directory in ${parent}.`);
@@ -117,6 +124,29 @@ export function validSessionDir(dir, { root = "/tmp", uid = process.getuid() } =
 		return true;
 	} catch {
 		return false;
+	}
+}
+
+/**
+ * DIR's identity ({ dev, ino }) if it is a valid session directory whose
+ * DIR/launch, a file of this user's read without following a link, names
+ * `owner`; otherwise null.
+ */
+export function sessionDirOwnedBy(dir, owner, { root = "/tmp", uid = process.getuid() } = {}) {
+	if (!OWNER.test(owner ?? "") || !validSessionDir(dir, { root, uid })) return null;
+	let fd;
+	try {
+		fd = openSync(join(dir, LAUNCH_FILE), constants.O_RDONLY | constants.O_NOFOLLOW | constants.O_NONBLOCK);
+		const stat = fstatSync(fd);
+		if (!stat.isFile() || stat.uid !== uid || stat.size > 64) return null;
+		const buffer = Buffer.alloc(64);
+		if (buffer.subarray(0, readSync(fd, buffer, 0, buffer.length, 0)).toString("ascii").trim() !== owner) return null;
+		const { dev, ino } = lstatSync(dir);
+		return { dev, ino };
+	} catch {
+		return null;
+	} finally {
+		if (fd !== undefined) closeSync(fd);
 	}
 }
 
@@ -147,6 +177,9 @@ while :; do
   sleep 0.2
 done
 `;
+// What a new window holds until its pane is kept after its command ends
+// (remain-on-exit) and its real command replaces it: nothing that can end first.
+const PLACEHOLDER = "exec sleep 600";
 
 /** The person's window's command: the login shell, then the waiter. */
 export function personCommand({ shell = defaultShell(), dir, lfortran }) {
@@ -161,24 +194,28 @@ export function helperCommand({ shell = defaultShell(), nodePath = process.execP
 const IDENTITY_KEYS = Object.keys(JUPYTER_OPTIONS);
 const IDENTITY_FORMAT = ["#{session_id}", "#{session_created}", ...IDENTITY_KEYS.map((key) => `#{${JUPYTER_OPTIONS[key]}}`)].join("\t");
 
-/**
- * The session's identity as tmux holds it: its ID, creation time and the
- * options pi-repl set. Null if there is no such session.
- */
-export async function readSessionIdentity(tmux, sessionName) {
+/** Every session's identity as tmux holds it: its ID, creation time and the options pi-repl set. */
+export async function readSessionIdentities(tmux) {
 	// list-sessions, not display-message: given a name that matches nothing, display-message prints empty fields and succeeds.
 	const result = await tmux(["list-sessions", "-F", `#{session_name}\t${IDENTITY_FORMAT}`]);
-	if (result.code !== 0) return null;
-	const row = result.stdout.split("\n").map((line) => line.split("\t")).find((fields) => fields[0] === sessionName);
-	if (!row) return null;
-	const fields = row.slice(1);
-	if (fields.length !== 2 + IDENTITY_KEYS.length || !SESSION.test(fields[0]) || !/^\d+$/.test(fields[1])) {
-		throw new Error(`Could not read the identity of tmux session ${sessionName}.`);
-	}
-	const identity = { sessionName, sessionId: fields[0], createdAt: fields[1] };
-	IDENTITY_KEYS.forEach((key, i) => { identity[key] = fields[2 + i]; });
-	return identity;
+	if (result.code !== 0) return [];
+	return result.stdout.split("\n").filter(Boolean).map((line) => {
+		const [sessionName, ...fields] = line.split("\t");
+		if (fields.length !== 2 + IDENTITY_KEYS.length || !SESSION.test(fields[0]) || !/^\d+$/.test(fields[1])) {
+			throw new Error(`Could not read the identity of tmux session ${sessionName}.`);
+		}
+		const identity = { sessionName, sessionId: fields[0], createdAt: fields[1] };
+		IDENTITY_KEYS.forEach((key, i) => { identity[key] = fields[2 + i]; });
+		return identity;
+	});
 }
+
+/** The session's identity, or null if there is no such session. */
+export async function readSessionIdentity(tmux, sessionName) {
+	return (await readSessionIdentities(tmux)).find((identity) => identity.sessionName === sessionName) ?? null;
+}
+
+const sameIdentity = (a, b) => Boolean(a && b) && ["sessionId", "createdAt", ...IDENTITY_KEYS].every((key) => a[key] === b[key]);
 
 async function setOption(tmux, target, name, value, scope = []) {
 	const result = await tmux(["set-option", "-q", ...scope, "-t", target, name, value]);
@@ -216,41 +253,55 @@ export async function helloFrom(identity, { connect = HelperClient.connect, time
 	}
 }
 
-/** Whether the person's pane shows LFortran's prompt as its last line. */
-export async function promptShown(tmux, paneId) {
-	const result = await tmux(["capture-pane", "-p", "-t", paneId]);
-	if (result.code !== 0) return false;
-	const last = result.stdout.split("\n").map((line) => line.trimEnd()).filter(Boolean).at(-1) ?? "";
-	return PROMPT.test(last);
+/**
+ * The person's pane: "prompt" if it is live with LFortran's prompt as its
+ * last line, "busy" if it is live otherwise, "ended" if it is kept dead, or
+ * "gone". Text left in a dead pane is no evidence of a prompt.
+ */
+export async function personPrompt(tmux, identity) {
+	const panes = await tmux(["list-panes", "-s", "-t", identity.sessionId, "-F", "#{pane_id}\t#{pane_dead}"]);
+	if (panes.code !== 0) return "gone";
+	const dead = new Map(panes.stdout.trim().split("\n").map((line) => line.split("\t"))).get(identity.personPane);
+	if (dead === undefined) return "gone";
+	if (dead !== "0") return "ended";
+	const captured = await tmux(["capture-pane", "-p", "-t", identity.personPane]);
+	if (captured.code !== 0) return "busy";
+	const last = captured.stdout.split("\n").map((line) => line.trimEnd()).filter(Boolean).at(-1) ?? "";
+	return PROMPT.test(last) ? "prompt" : "busy";
 }
 
 /**
- * Waits, until `deadline`, for both the helper's hello for this launch and
- * the person's prompt. A helper that failed ends the wait at once. The banner
+ * Waits, until `deadline`, for the helper of this launch to say that it and
+ * the kernel are ready, and for the person's live prompt, both at once. A
+ * helper that failed or a kernel that ended stops the wait. The banner
  * doesn't count: only the prompt does.
  */
 export async function waitForJupyterReady({ tmux, identity, deadline, signal, connect, pollMs = 150 }) {
 	let hello = null;
-	let prompt = false;
+	let prompt = "busy";
 	let failure = null;
 	for (;;) {
-		if (!hello && !failure && identity.dir) {
+		hello = null;
+		if (identity.dir) {
 			const marker = readReadyMarker(identity.dir);
 			if (marker && marker.launchId !== identity.owner) failure = "ready.json names another launch";
 			else if (marker?.state === "failed") failure = typeof marker.reason === "string" ? marker.reason : "the helper failed to start";
 			else if (marker?.state === "ready") {
 				try {
 					hello = await helloFrom(identity, { connect });
+					if (hello.state === "kernel-exited") failure = "the kernel has already exited";
+					else if (hello.state === "connection-lost") failure = "the helper has lost its connection to the kernel";
+					else if (hello.state !== "ready") failure = `the helper is ${hello.state}`;
 				} catch (error) {
 					if (/another launch|protocol/.test(error.message)) failure = error.message;
 				}
 			}
 		}
-		if (!prompt && identity.personPane) prompt = await promptShown(tmux, identity.personPane);
-		if ((hello && prompt) || failure || signal?.aborted || Date.now() >= deadline) break;
+		if (identity.personPane) prompt = await personPrompt(tmux, identity);
+		if ((hello?.state === "ready" && prompt === "prompt") || failure || signal?.aborted || Date.now() >= deadline) break;
 		await sleep(pollMs);
 	}
-	return { ready: Boolean(hello && prompt), hello, prompt, failure };
+	return { ready: !failure && hello?.state === "ready" && prompt === "prompt", hello, prompt: prompt === "prompt", promptEnded: prompt === "ended", failure };
 }
 
 /** A session that pi-repl started for LFortran: an owner marker and the person's pane at least. */
@@ -261,9 +312,11 @@ const complete = (identity) => identity.runtime === "lfortran" && OWNER.test(ide
  * wins tmux's creation of the name sets it up, and a loser never adds windows.
  * Identities are recorded as each part appears, so that a start cut short can
  * still be inspected and stopped: the owner marker, DIR and the person's
- * pane, then the helper's. Waits up to `timeoutMs` for the helper's hello and
- * the person's prompt; a session that isn't confirmed by then keeps starting.
- * Cancelling stops the waiting, never a session already created.
+ * pane, then the helper's. Each window holds a placeholder until its pane is
+ * kept after it ends; then its command replaces it. Waits up to `timeoutMs`
+ * for the helper and kernel to be ready and the person's prompt to show; a
+ * session that isn't confirmed by then keeps starting. Cancelling stops the
+ * waiting, never a session already created.
  */
 export async function startJupyterSession({
 	tmux, cwd, lfortran, shell = defaultShell(), nodePath = process.execPath, helperScript = HELPER_SCRIPT,
@@ -275,12 +328,12 @@ export async function startJupyterSession({
 	let created = false;
 	if (!identity) {
 		if (signal?.aborted) throw new Error(`Starting ${sessionName} was cancelled before anything was created.`);
-		const dir = createSessionDir({ root, uid });
 		const owner = randomBytes(16).toString("hex");
-		const made = await tmux(["new-session", "-d", "-P", "-F", "#{session_id}\t#{window_id}\t#{pane_id}", "-s", sessionName, "-c", cwd, personCommand({ shell, dir, lfortran })]);
+		const dir = createSessionDir({ root, uid, owner });
+		const made = await tmux(["new-session", "-d", "-P", "-F", "#{session_id}\t#{window_id}\t#{pane_id}", "-s", sessionName, "-c", cwd, PLACEHOLDER]);
 		if (made.code !== 0) {
-			// Lost the race, or tmux refused: the directory is empty and ours.
-			try { rmdirSync(dir); } catch {}
+			// Lost the race, or tmux refused: the directory holds only its claim, and is ours.
+			try { unlinkSync(join(dir, LAUNCH_FILE)); rmdirSync(dir); } catch {}
 			identity = await readSessionIdentity(tmux, sessionName);
 			if (!identity) throw new Error(`Failed to create tmux session ${sessionName}: ${made.stderr.trim() || made.stdout.trim() || `exit code ${made.code}`}`);
 		} else {
@@ -298,17 +351,19 @@ export async function startJupyterSession({
 				await setOption(tmux, sessionId, JUPYTER_OPTIONS.sendPath, JUPYTER_SEND_PATH),
 				await setOption(tmux, sessionId, JUPYTER_OPTIONS.runtime, "lfortran"),
 			];
-			// The waiter waits for the helper, so nothing in the pane ends before this is set.
-			const kept = await setOption(tmux, personWindow, "remain-on-exit", "on", ["-w"]);
 			if (recorded.includes(false)) throw new Error(`Could not record the identity of ${sessionName}; it can't be verified to stop. Inspect it with tmux; it has not been stopped.`);
-			if (!kept) warnings.push("Could not keep the person's pane after its prompt ends (remain-on-exit).");
-			const helper = await tmux(["new-window", "-d", "-a", "-t", personWindow, "-P", "-F", "#{window_id}\t#{pane_id}", "-c", cwd, "-e", `${JUPYTER_OWNER_ENV}=${owner}`, helperCommand({ shell, nodePath, helperScript, dir, lfortran })]);
+			if (!(await setOption(tmux, personWindow, "remain-on-exit", "on", ["-w"]))) warnings.push("Could not keep the person's pane after its prompt ends (remain-on-exit).");
+			const person = await tmux(["respawn-pane", "-k", "-t", personPane, "-c", cwd, personCommand({ shell, dir, lfortran })]);
+			if (person.code !== 0) throw new Error(`Could not start the person's window in ${sessionName}: ${person.stderr.trim() || `exit code ${person.code}`}. Stop the session with /repl stop lfortran.`);
+			const helper = await tmux(["new-window", "-d", "-a", "-t", personWindow, "-P", "-F", "#{window_id}\t#{pane_id}", "-c", cwd, PLACEHOLDER]);
 			const [helperWindow, helperPane] = helper.stdout.trim().split("\t");
 			if (helper.code !== 0 || !WINDOW.test(helperWindow ?? "") || !PANE.test(helperPane ?? "")) {
 				throw new Error(`Could not start the helper's window in ${sessionName}: ${helper.stderr.trim() || `exit code ${helper.code}`}. The person's window waits; stop the session with /repl stop lfortran.`);
 			}
-			if (!(await setOption(tmux, helperWindow, "remain-on-exit", "on", ["-w"]))) warnings.push("Could not keep the helper's pane if it ends (remain-on-exit).");
 			if (!(await setOption(tmux, sessionId, JUPYTER_OPTIONS.helperPane, helperPane))) throw new Error(`Could not record the helper's pane in ${sessionName}; it can't be verified to stop. It has not been stopped.`);
+			if (!(await setOption(tmux, helperWindow, "remain-on-exit", "on", ["-w"]))) warnings.push("Could not keep the helper's pane if it ends (remain-on-exit).");
+			const started = await tmux(["respawn-pane", "-k", "-t", helperPane, "-c", cwd, "-e", `${JUPYTER_OWNER_ENV}=${owner}`, helperCommand({ shell, nodePath, helperScript, dir, lfortran })]);
+			if (started.code !== 0) throw new Error(`Could not start the helper in ${sessionName}: ${started.stderr.trim() || `exit code ${started.code}`}. The person's window waits; stop the session with /repl stop lfortran.`);
 			// The person's window stays the selected one, and the lowest-indexed.
 			await tmux(["select-window", "-t", personWindow]);
 			identity = await readSessionIdentity(tmux, sessionName);
@@ -331,15 +386,21 @@ export async function startJupyterSession({
 }
 
 /**
- * Removes a stopped session's control files from DIR, and then DIR: only the
- * names the helper writes, and only regular files and sockets of this user's;
- * nothing is followed through a link. Resolves with warnings for what stays.
+ * Removes a stopped session's control files from DIR, and then DIR, but only
+ * while DIR is still the directory `expected` names ({ dev, ino }) and its
+ * launch file names `owner`: only the names pi-repl and the helper write, and
+ * only regular files and sockets of this user's; nothing is followed through
+ * a link. The launch file goes last. Resolves with warnings for what stays.
  */
-export function removeSessionDir(dir, { root = "/tmp", uid = process.getuid() } = {}) {
-	if (!validSessionDir(dir, { root, uid })) return [`The session's directory ${dir} isn't one pi-repl made, or isn't private any more; it was left alone.`];
+export function removeSessionDir(dir, { root = "/tmp", uid = process.getuid(), owner, expected } = {}) {
+	const owned = sessionDirOwnedBy(dir, owner, { root, uid });
+	if (!owned || (expected && (owned.dev !== expected.dev || owned.ino !== expected.ino))) {
+		return [`The session's directory ${dir} isn't this session's any more (or never was); it was left alone.`];
+	}
 	const warnings = [];
-	const known = new Set(Object.values(HELPER_FILES));
-	for (const name of readdirSync(dir)) {
+	const known = new Set([...Object.values(HELPER_FILES), LAUNCH_FILE]);
+	const names = readdirSync(dir).sort((a, b) => (a === LAUNCH_FILE) - (b === LAUNCH_FILE));
+	for (const name of names) {
 		const path = join(dir, name);
 		if (!known.has(name) && !/^out-[0-9a-f]{32}\.txt$/.test(name) && !/^\.ready-[0-9a-f]{12}$/.test(name)) {
 			warnings.push(`Left ${path}: pi-repl didn't make it.`);
@@ -356,32 +417,53 @@ export function removeSessionDir(dir, { root = "/tmp", uid = process.getuid() } 
 	return warnings;
 }
 
-/** PIDs that DIR names: helper.pid, and ready.json's helper and kernel. Candidates only, never authority. */
+/** A PID in a file of DIR's, read without following a link. */
+function pidFile(path) {
+	let fd;
+	try {
+		fd = openSync(path, constants.O_RDONLY | constants.O_NOFOLLOW | constants.O_NONBLOCK);
+		const buffer = Buffer.alloc(32);
+		const text = buffer.subarray(0, readSync(fd, buffer, 0, buffer.length, 0)).toString("ascii").trim();
+		return /^\d+$/.test(text) && Number(text) > 1 ? Number(text) : null;
+	} catch {
+		return null;
+	} finally {
+		if (fd !== undefined) closeSync(fd);
+	}
+}
+
+/** PIDs that DIR names: helper.pid, kernel.pid, and ready.json's helper and kernel. Candidates only, never authority. */
 function pidsFromDir(dir) {
 	const pids = new Set();
 	const marker = readReadyMarker(dir);
-	for (const value of [marker?.helperPid, marker?.kernelPid]) if (Number.isSafeInteger(value) && value > 1) pids.add(value);
-	let fd;
-	try {
-		fd = openSync(join(dir, HELPER_FILES.pid), constants.O_RDONLY | constants.O_NOFOLLOW | constants.O_NONBLOCK);
-		const buffer = Buffer.alloc(32);
-		const text = buffer.subarray(0, readSync(fd, buffer, 0, buffer.length, 0)).toString("ascii").trim();
-		if (/^\d+$/.test(text) && Number(text) > 1) pids.add(Number(text));
-	} catch {
-		// No helper.pid: the helper never claimed DIR.
-	} finally {
-		if (fd !== undefined) closeSync(fd);
+	for (const value of [marker?.helperPid, marker?.kernelPid, pidFile(join(dir, HELPER_FILES.pid)), pidFile(join(dir, HELPER_FILES.kernelPid))]) {
+		if (Number.isSafeInteger(value) && value > 1) pids.add(value);
 	}
 	return pids;
 }
 
+const MONTHS = ["Jan", "Feb", "Mar", "Apr", "May", "Jun", "Jul", "Aug", "Sep", "Oct", "Nov", "Dec"];
+/** A process's start time, from ps's lstart in UTC, in seconds; NaN if it can't be read. */
+function startedAtSeconds(startedAt) {
+	const match = /^\w{3} (\w{3})\s+(\d+) (\d\d):(\d\d):(\d\d) (\d{4})$/.exec(startedAt ?? "");
+	const month = match ? MONTHS.indexOf(match[1]) : -1;
+	if (!match || month < 0) return Number.NaN;
+	return Date.UTC(Number(match[6]), month, Number(match[2]), Number(match[3]), Number(match[4]), Number(match[5])) / 1000;
+}
+
+const MARKER_BATCH = 128;
+const MAX_MARKER_CANDIDATES = 1024;
+
 /**
  * The live processes of this user's whose initial environment carries the
- * session's owner marker, among the candidates: the PIDs DIR names, and
- * detached processes running lfortran. The marker alone authorizes; names and
- * PIDs only select what is inspected.
+ * session's owner marker, among the candidates: the PIDs DIR names, detached
+ * processes running lfortran, and detached processes left without a parent
+ * (adopted by PID 1) since the session was created, which is what anything
+ * the kernel started becomes once the kernel has gone. The marker alone
+ * authorizes; names, PIDs and times only select what is inspected.
+ * `incomplete` is set if there were too many candidates to inspect.
  */
-export async function findMarkedJupyterProcesses(table, { owner, dir, lfortran, uid, list = runCommand, readMarkers = readOwnerMarkers, snapshot = readStopProcessTable }) {
+export async function findMarkedJupyterProcesses(table, { owner, dir, lfortran, uid, since, list = runCommand, readMarkers = readOwnerMarkers, snapshot = readStopProcessTable }) {
 	if (!OWNER.test(owner)) throw new Error("Invalid LFortran session ownership marker.");
 	const candidates = new Set(dir ? pidsFromDir(dir) : []);
 	if (lfortran) {
@@ -392,8 +474,17 @@ export async function findMarkedJupyterProcesses(table, { owner, dir, lfortran, 
 			if (match && Number(match[2]) === uid && basename(match[3].trim()) === basename(lfortran)) candidates.add(Number(match[1]));
 		}
 	}
+	if (Number.isFinite(since)) {
+		for (const p of table) {
+			if (p.uid === uid && p.ppid === 1 && /^\?+$/.test(p.tty) && live(p) && startedAtSeconds(p.startedAt) >= since - 2) candidates.add(p.pid);
+		}
+	}
 	const inspected = [...candidates].filter((pid) => table.some((p) => p.pid === pid && p.uid === uid && live(p)));
-	const rows = await readMarkers(inspected, { variable: JUPYTER_OWNER_ENV, label: "LFortran" });
+	const incomplete = inspected.length > MAX_MARKER_CANDIDATES;
+	const rows = [];
+	for (let i = 0; i < Math.min(inspected.length, MAX_MARKER_CANDIDATES); i += MARKER_BATCH) {
+		rows.push(...await readMarkers(inspected.slice(i, i + MARKER_BATCH), { variable: JUPYTER_OWNER_ENV, label: "LFortran" }));
+	}
 	const failed = rows.filter((row) => row.error);
 	if (failed.length) {
 		// A process that ended, or became a zombie, while it was inspected has no metadata left; that's no failure.
@@ -402,43 +493,57 @@ export async function findMarkedJupyterProcesses(table, { owner, dir, lfortran, 
 		const unread = failed.find((row) => fresh.some((p) => p.pid === row.pid && live(p) && processKey(p) === processKey(known(row.pid))));
 		if (unread) throw new Error(`Could not inspect LFortran session ownership for PID ${unread.pid}; refusing unverified cleanup.`);
 	}
-	return rows.filter((row) => row.owner === owner && !row.gone && !row.error).map((row) => table.find((p) => p.pid === row.pid)).filter(Boolean);
+	return { marked: rows.filter((row) => row.owner === owner && !row.gone && !row.error).map((row) => table.find((p) => p.pid === row.pid)).filter(Boolean), incomplete };
 }
+
+/** The owner-marker values safe to compare inside a tmux format. */
+const formatSafe = (value) => /^[A-Za-z0-9_./%@$-]*$/.test(value);
 
 /**
  * The explicit, verified stop of an LFortran session. Its panes must be
- * exactly the pinned ones; a dead pane is accepted only as a pinned one, and
- * its stale PID is never taken as an owner. The processes are the live panes'
- * trees, and those carrying the session's owner marker: the helper and the
+ * exactly the pinned ones, all of them; a dead pane is accepted only as a
+ * pinned one, and its stale PID is never taken as an owner. Its owner marker
+ * must be its own alone. The processes are the live panes' trees, and those
+ * carrying the session's marker, with their descendants: the helper and the
  * kernel, even reparented. Nothing is signalled or disconnected until that is
- * verified, twice; then tmux kills the session only if nothing changed, the
- * survivors get SIGTERM and SIGKILL, each revalidated, and once they are
- * gone, DIR's control files are removed. That ends the session for every
- * client of the kernel, outside tmux too.
+ * verified, twice; then tmux kills the session only if its panes and identity
+ * are unchanged, the survivors get SIGTERM and SIGKILL, each revalidated, and
+ * once they are gone, DIR's control files are removed if DIR is still this
+ * launch's. That ends the session for every client of the kernel, outside
+ * tmux too.
  */
 export async function stopVerifiedJupyterSession({
 	tmux, sessionName = LFORTRAN_SESSION_NAME, root = "/tmp", snapshot = readStopProcessTable, signal = (pid, value) => process.kill(pid, value),
 	currentPid = process.pid, uid = process.getuid?.(), graceMs = 500, termMs = 1000, killMs = 2000, findMarked = findMarkedJupyterProcesses,
 }) {
 	if (typeof uid !== "number") throw new Error("Verified REPL shutdown requires a supported local Unix session.");
-	const identity = await readSessionIdentity(tmux, sessionName);
+	const identities = await readSessionIdentities(tmux);
+	const identity = identities.find((candidate) => candidate.sessionName === sessionName);
 	if (!identity) throw new Error("The selected session ended or changed before shutdown; no processes were signalled.");
 	if (identity.runtime !== "lfortran" || !OWNER.test(identity.owner)) {
 		throw new Error(`${sessionName} has no valid LFortran ownership marker, so it can't be verified; nothing was stopped. Inspect it with tmux.`);
 	}
 	const owner = identity.owner;
+	// Another session with this marker would make the marker ambiguous.
+	const guardOwner = (current) => {
+		if (current.some((other) => other.owner === owner && (other.sessionId !== identity.sessionId || other.createdAt !== identity.createdAt))) {
+			throw new Error("The LFortran session's ownership marker is shared with another session; refusing ambiguous cleanup. Nothing was stopped by this check.");
+		}
+	};
+	guardOwner(identities);
 	const warnings = [];
-	const dir = identity.dir && validSessionDir(identity.dir, { root, uid }) ? identity.dir : null;
-	if (identity.dir && !dir) warnings.push(`The session's directory ${identity.dir} isn't one pi-repl made, or isn't private any more; it was neither read nor removed.`);
-	const pinned = new Set([identity.personPane, identity.helperPane].filter((pane) => PANE.test(pane)));
+	const dirIdentity = identity.dir ? sessionDirOwnedBy(identity.dir, owner, { root, uid }) : null;
+	const dir = dirIdentity ? identity.dir : null;
+	if (identity.dir && !dir) warnings.push(`The session's directory ${identity.dir} doesn't name this session's launch, or isn't private; it was neither read nor removed.`);
+	const pinned = [identity.personPane, identity.helperPane].filter((pane) => PANE.test(pane));
 	const sessionPanes = (panes) => panes.filter((p) => p.sessionId === identity.sessionId);
 	const panes = await readPanes(tmux);
 	const selected = sessionPanes(panes);
 	if (!selected.length || selected.some((p) => p.sessionName !== sessionName || p.createdAt !== identity.createdAt)) {
 		throw new Error("The selected session ended or changed before shutdown; no processes were signalled.");
 	}
-	if (selected.some((p) => !pinned.has(p.paneId))) {
-		throw new Error(`${sessionName} has panes that pi-repl didn't make; nothing was stopped. Close them, or inspect the session with tmux.`);
+	if (selected.length !== pinned.length || selected.some((p) => !pinned.includes(p.paneId))) {
+		throw new Error(`${sessionName}'s panes aren't the ones pi-repl made: some are missing, moved or added. Nothing was stopped; inspect the session with tmux.`);
 	}
 	const original = selected[0];
 	const table = await snapshot();
@@ -447,35 +552,43 @@ export async function stopVerifiedJupyterSession({
 	const retained = new Set(selected.filter((p) => p.dead !== "0").map((p) => p.paneId));
 	const tracker = new SessionStopProcesses({ table, panes, selected, currentPid, uid, retained, label: "LFortran" });
 	const others = (currentPanes) => currentPanes.filter((p) => p.sessionId !== original.sessionId);
+	let incomplete = false;
 	const rememberMarked = async (currentTable, currentPanes) => {
-		const marked = await findMarked(currentTable, { owner, dir, lfortran: identity.lfortran, uid });
-		tracker.rememberMarked(marked, currentTable, others(currentPanes));
+		const found = await findMarked(currentTable, { owner, dir, lfortran: identity.lfortran, uid, since: Number(identity.createdAt) });
+		incomplete ||= found.incomplete;
+		tracker.rememberMarked(found.marked, currentTable, others(currentPanes));
 	};
 	try {
 		await rememberMarked(table, panes);
 		const originalFingerprint = fingerprint(selected);
 		const repeatPanes = await readPanes(tmux);
 		const repeatTable = await snapshot();
-		const repeatIdentity = await readSessionIdentity(tmux, sessionName);
+		const repeatIdentities = await readSessionIdentities(tmux);
+		guardOwner(repeatIdentities);
 		const repeatSelected = sessionPanes(repeatPanes);
-		if (!repeatSelected.length || fingerprint(repeatSelected) !== originalFingerprint || repeatIdentity?.owner !== owner || repeatIdentity.sessionId !== identity.sessionId ||
+		if (!repeatSelected.length || fingerprint(repeatSelected) !== originalFingerprint || !sameIdentity(identity, repeatIdentities.find((candidate) => candidate.sessionId === identity.sessionId)) ||
 			!repeatTable.some((p) => processKey(p) === processKey(server)) ||
 			selected.filter((pane) => pane.dead === "0").some((pane) => !repeatTable.some((p) => p.pid === pane.pid && tracker.owned.has(processKey(p))))) {
 			throw new Error("Session ownership changed while preparing shutdown; nothing was stopped.");
 		}
 		await rememberMarked(repeatTable, repeatPanes);
+		// The descendants known now stay known after their parents go and they are reparented.
+		tracker.refresh(repeatTable, others(repeatPanes));
 	} catch (error) {
-		if (/nothing was stopped|no signal was sent/.test(error.message)) throw error;
+		if (/nothing was stopped|no signal was sent|Nothing was stopped/.test(error.message)) throw error;
 		throw new Error(`${error.message} Nothing was stopped.`, { cause: error });
 	}
 	// The comparison and the kill run in the same tmux command queue, so a
 	// changed or replaced session can't slip between them.
-	const condition = `#{&&:#{==:${fingerprintFormat},${fingerprint(selected)}},#{==:#{${JUPYTER_OPTIONS.owner}},${owner}}}`;
+	const same = [`#{==:${fingerprintFormat},${fingerprint(selected)}}`, `#{==:#{${JUPYTER_OPTIONS.owner}},${owner}}`];
+	for (const key of ["dir", "personPane", "helperPane"]) if (formatSafe(identity[key])) same.push(`#{==:#{${JUPYTER_OPTIONS[key]}},${identity[key]}}`);
+	const condition = same.reduce((all, next) => `#{&&:${all},${next}}`);
 	const stopped = await tmux(["if-shell", "-F", "-t", original.sessionId, condition, `kill-session -t '${original.sessionId}'`, "display-message -p PI_REPL_STOP_CHANGED"]);
 	if (stopped.code !== 0 || stopped.stdout.includes("PI_REPL_STOP_CHANGED")) throw new Error(`tmux refused or could not complete the stop; no follow-up signals were sent. ${stopped.stderr.trim() || stopped.stdout.trim()}`);
 	async function inspect() {
 		const currentPanes = await readPanes(tmux);
 		const currentTable = await snapshot();
+		guardOwner(await readSessionIdentities(tmux));
 		const sameServer = currentTable.some((p) => processKey(p) === processKey(server));
 		if (sameServer && currentPanes.some((p) => p.serverPid === original.serverPid && p.sessionId === original.sessionId && p.createdAt === original.createdAt)) throw new Error("The original tmux session still exists; no follow-up signals were sent.");
 		await rememberMarked(currentTable, currentPanes);
@@ -488,6 +601,10 @@ export async function stopVerifiedJupyterSession({
 	} catch (error) {
 		throw new Error(`Stop requested for ${sessionName}, but runtime cleanup could not be fully verified: ${error.message} Inspect remaining processes manually; its directory${dir ? ` (${dir})` : ""} and clean records were kept.`, { cause: error });
 	}
-	if (dir) warnings.push(...removeSessionDir(dir, { root, uid }));
+	if (incomplete) {
+		warnings.push(`Too many detached processes to inspect them all for the session's marker; some that the kernel started may remain. Its directory (${dir ?? "unknown"}) was kept.`);
+	} else if (dir) {
+		warnings.push(...removeSessionDir(dir, { root, uid, owner, expected: dirIdentity }));
+	}
 	return { sessionName, processCount: tracker.owned.size, signals, warnings, dir };
 }

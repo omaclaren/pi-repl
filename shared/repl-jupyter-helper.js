@@ -9,7 +9,7 @@
 //
 // DIR is new for each launch, and the helper claims it before anything else.
 // It holds k.json (the connection file), h.sock, ready.json, kernel.log,
-// helper.pid and output spools. The helper runs until it is signalled; when the kernel ends
+// helper.pid, kernel.pid and output spools. The helper runs until it is signalled; when the kernel ends
 // it stays, to report.
 
 import { createHash, randomBytes, timingSafeEqual } from "node:crypto";
@@ -22,7 +22,7 @@ import { pathToFileURL } from "node:url";
 import { JupyterClient, readConnectionFile } from "./repl-jupyter.js";
 
 export const HELPER_PROTOCOL_VERSION = 1;
-export const HELPER_FILES = { connection: "k.json", socket: "h.sock", ready: "ready.json", kernelLog: "kernel.log", pid: "helper.pid" };
+export const HELPER_FILES = { connection: "k.json", socket: "h.sock", ready: "ready.json", kernelLog: "kernel.log", pid: "helper.pid", kernelPid: "kernel.pid" };
 const MAX_REQUEST_LINE_BYTES = 32 * 1024 * 1024;
 const MAX_RESPONSE_LINE_BYTES = 64 * 1024 * 1024;
 const MAX_CODE_BYTES = 16 * 1024 * 1024;
@@ -686,6 +686,15 @@ export class JupyterHelper extends EventEmitter {
 			}
 			this.kernel = child;
 			this.kernelGone = new Promise((done) => child.once("exit", done));
+			// Named at once, so that a stop can find the kernel even if the helper ends before ready.json.
+			if (child.pid) {
+				try {
+					const fd = openSync(this.paths.kernelPid, constants.O_WRONLY | constants.O_CREAT | constants.O_EXCL | constants.O_NOFOLLOW, 0o600);
+					try { writeSync(fd, `${child.pid}\n`); } finally { closeSync(fd); }
+				} catch (error) {
+					this.warn(`could not record the kernel's PID: ${error.message}`);
+				}
+			}
 			child.stdout.on("data", append);
 			child.stderr.on("data", append);
 			child.once("spawn", () => {
@@ -849,7 +858,7 @@ export class JupyterHelper extends EventEmitter {
 	/** Settles an execution whose reply and idle have both come. */
 	complete(execution) {
 		if (execution.reply.status === "invalid") {
-			execution.outcome = { reason: `the kernel's execute_reply had no valid status (${execution.reply.received})`, exit: null, started: Boolean(execution.started) };
+			execution.outcome = { kind: "invalid-reply", reason: `the kernel's execute_reply had no valid status (${execution.reply.received})`, exit: null, started: Boolean(execution.started) };
 			this.settle(execution, "unconfirmed");
 		} else {
 			this.settle(execution, "completed");
@@ -893,22 +902,23 @@ export class JupyterHelper extends EventEmitter {
 		}
 		if (this.state !== "ready" && this.state !== "connection-lost") return;
 		this.state = "kernel-exited";
-		this.endAdmission(`the kernel exited (${describeExit(this.kernelExit)})`);
+		this.endAdmission("kernel-exited", `the kernel exited (${describeExit(this.kernelExit)})`);
 	}
 
 	connectionEnded(channel, error) {
 		if (this.state !== "ready") return;
 		this.state = "connection-lost";
 		this.journal.append({ kind: "kernel", event: "connection-lost", channel, error: error ? clip(error.message, 1024) : null });
-		this.endAdmission(`the connection to the kernel was lost (${channel})`);
+		this.endAdmission("connection-lost", `the connection to the kernel was lost (${channel})`);
 	}
 
 	/**
 	 * No new executions. Messages already buffered are still received for
 	 * `drainMs`; then an unresolved execution settles as completed, if both its
-	 * reply and idle came, or unconfirmed.
+	 * reply and idle came, or unconfirmed. `kind` says why, for readers:
+	 * kernel-exited, connection-lost, invalid-reply or helper-stopped.
 	 */
-	endAdmission(reason) {
+	endAdmission(kind, reason) {
 		if (this.ending || this.stopping) return;
 		this.admitting = false;
 		this.ending = setTimeout(() => {
@@ -916,7 +926,7 @@ export class JupyterHelper extends EventEmitter {
 			if (execution && !TERMINAL_STATES.has(execution.state)) {
 				if (execution.reply && execution.idle) this.complete(execution);
 				else {
-					execution.outcome = { reason, exit: this.kernelExit ?? null, started: Boolean(execution.started) };
+					execution.outcome = { kind: this.kernelExit ? "kernel-exited" : kind, reason, exit: this.kernelExit ?? null, started: Boolean(execution.started) };
 					this.settle(execution, "unconfirmed");
 				}
 			}
@@ -1255,7 +1265,7 @@ export class JupyterHelper extends EventEmitter {
 		if (this.state !== "failed") this.state = "stopped";
 		const execution = this.current;
 		if (execution && !TERMINAL_STATES.has(execution.state)) {
-			execution.outcome = { reason: "the helper stopped", exit: this.kernelExit ?? null, started: Boolean(execution.started) };
+			execution.outcome = { kind: "helper-stopped", reason: "the helper stopped", exit: this.kernelExit ?? null, started: Boolean(execution.started) };
 			this.settle(execution, "unconfirmed");
 		}
 		for (const set of [...this.waiters.values()]) for (const waiter of [...set]) waiter.done(true);

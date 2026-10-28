@@ -1,91 +1,27 @@
 import test from "node:test";
 import assert from "node:assert/strict";
-import { execFile, spawnSync } from "node:child_process";
+import { execFile } from "node:child_process";
 import { chmodSync, existsSync, lstatSync, mkdirSync, mkdtempSync, readFileSync, rmSync, symlinkSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
-import { fileURLToPath } from "node:url";
 import { HelperClient } from "../shared/repl-jupyter-helper.js";
 import {
-	JUPYTER_OWNER_ENV, JUPYTER_SEND_PATH, createSessionDir, findMarkedJupyterProcesses, personCommand, preflightLfortran, readReadyMarker,
-	readSessionIdentity, removeSessionDir, startJupyterSession, stopVerifiedJupyterSession, validSessionDir,
+	JUPYTER_OWNER_ENV, JUPYTER_SEND_PATH, LAUNCH_FILE, createSessionDir, findMarkedJupyterProcesses, personCommand, preflightLfortran, readReadyMarker,
+	readSessionIdentity, removeSessionDir, sessionDirOwnedBy, startJupyterSession, stopVerifiedJupyterSession, validSessionDir, waitForJupyterReady,
 } from "../shared/repl-jupyter-session.js";
-import { readStopProcessTable } from "../shared/repl-session-stop.js";
-import { createTestTmux } from "./helpers/repl-test-tmux.js";
+import { SessionStopProcesses, readStopProcessTable } from "../shared/repl-session-stop.js";
+import { REAL_LFORTRAN, defer, lfortranFixture, sleep, until } from "./helpers/repl-test-lfortran.js";
 
-const FAKE_LFORTRAN = fileURLToPath(new URL("./helpers/fake-lfortran.js", import.meta.url));
-const REAL_LFORTRAN = process.env.PI_REPL_LFORTRAN;
-const available = process.platform !== "win32" && spawnSync("tmux", ["-V"]).status === 0;
 const uid = process.getuid();
-const sleep = (ms) => new Promise((resolve) => setTimeout(resolve, ms));
-const quote = (text) => `'${text.replace(/'/g, `'"'"'`)}'`;
 let submissions = 0;
 
-async function until(condition, { timeoutMs = 10_000, what = "the condition" } = {}) {
-	const deadline = Date.now() + timeoutMs;
-	while (!(await condition())) {
-		if (Date.now() > deadline) throw new Error(`Timed out waiting for ${what}.`);
-		await sleep(50);
-	}
-}
-
-/** Cleanups run last first, each even if another failed (node:test's own hooks run first first, and stop at a failure). */
-function defer(t, cleanup) {
-	if (!t.cleanups) {
-		const cleanups = (t.cleanups = []);
-		t.after(async () => {
-			let failure;
-			for (const run of cleanups.reverse()) {
-				try {
-					await run();
-				} catch (error) {
-					failure ??= error instanceof AggregateError ? new Error(`${error.message}: ${error.errors.map((e) => e.message).join("; ")}`, { cause: error }) : error;
-				}
-			}
-			if (failure) throw failure;
-		});
-	}
-	t.cleanups.push(cleanup);
-}
-
-/**
- * An isolated tmux server, home and PATH, with `lfortran` on it: the fake, or
- * PI_REPL_LFORTRAN. Every lfortran process records itself in the harness's
- * ledger first, so that one left without its parent is still cleaned up.
- */
-function sessionFixture(t, { env: extra = {}, index = 0, real = false } = {}) {
-	if (!available) { t.skip("tmux is required"); return null; }
-	// Short, for the sockets under it.
-	const base = mkdtempSync("/tmp/pi-rj-st-");
-	defer(t, () => rmSync(base, { recursive: true, force: true }));
-	const [home, bin, root] = ["home", "bin", "root"].map((name) => join(base, name));
-	for (const dir of [home, bin, root]) mkdirSync(dir);
-	writeFileSync(join(home, ".profile"), `export PATH=${quote(`${bin}:${process.env.PATH}`)}\n`);
-	const config = join(base, "tmux.conf");
-	writeFileSync(config, `set -g base-index ${index}\nset -g pane-base-index ${index}\nset -g default-shell /bin/sh\n`);
-	const env = { ...process.env, HOME: home, SHELL: "/bin/sh", PATH: `${bin}:${process.env.PATH}`, ...extra };
-	delete env.TMUX;
-	delete env.TMUX_PANE;
-	const harness = createTestTmux(t, { cwd: base, env, config });
-	// Before the directory holding its config goes; its own hook then finds this done.
-	defer(t, () => harness.cleanup());
-	const target = real ? quote(REAL_LFORTRAN) : `${quote(process.execPath)} ${quote(FAKE_LFORTRAN)}`;
-	writeFileSync(join(bin, "lfortran"), `#!/bin/sh\n${harness.launcherPrologue}exec ${target} "$@"\n`, { mode: 0o700 });
-	const tmux = async (args) => {
-		try {
-			const result = await harness.run(args);
-			return { code: 0, stdout: result.stdout, stderr: result.stderr };
-		} catch (error) {
-			return { code: typeof error.code === "number" ? error.code : 1, stdout: error.stdout ?? "", stderr: error.stderr ?? error.message };
-		}
-	};
-	const run = (file, args, { timeoutMs = 15_000 } = {}) => new Promise((resolve) => execFile(file, args, { env, cwd: base, timeout: timeoutMs }, (error, stdout, stderr) => resolve({ code: error ? 1 : 0, stdout, stderr })));
-	const lfortran = join(bin, "lfortran");
+/** The isolated fixture, with the session's start and stop bound to it. */
+function sessionFixture(t, options) {
+	const f = lfortranFixture(t, options);
+	if (!f) return null;
 	return {
-		base, root, tmux, harness, lfortran, run,
-		start: (options = {}) => startJupyterSession({ tmux, cwd: base, lfortran, shell: "/bin/sh", root, timeoutMs: 20_000, ...options }),
-		stop: (options = {}) => stopVerifiedJupyterSession({ tmux, root, graceMs: 300, ...options }),
-		windows: async () => (await tmux(["list-windows", "-t", "=pi-repl-lfortran", "-F", "#{window_index}\t#{window_active}\t#{pane_id}\t#{remain-on-exit}\t#{pane_dead}"])).stdout.trim().split("\n").map((line) => line.split("\t")),
-		pane: async (paneId) => (await tmux(["capture-pane", "-p", "-t", paneId])).stdout,
+		...f,
+		start: (overrides = {}) => startJupyterSession({ tmux: f.tmux, cwd: f.base, lfortran: f.lfortran, shell: "/bin/sh", root: f.root, timeoutMs: 20_000, ...overrides }),
+		stop: (overrides = {}) => stopVerifiedJupyterSession({ tmux: f.tmux, root: f.root, graceMs: 300, ...overrides }),
 	};
 }
 
@@ -128,33 +64,42 @@ test("preflight finds lfortran through the login shell, and requires its shared 
 	await assert.rejects(preflightLfortran({ shell: "/bin/sh", run }), /wasn't found/);
 });
 
-test("a session directory is new, private and short; only its own files are removed with it", (t) => {
+test("a session directory is new, private, short and claimed; only its own launch's files are removed with it", (t) => {
 	const root = mkdtempSync("/tmp/pi-rj-dir-");
 	defer(t, () => rmSync(root, { recursive: true, force: true }));
-	const dir = createSessionDir({ root, uid });
+	const owner = "a".repeat(32);
+	const dir = createSessionDir({ root, uid, owner });
 	assert.match(dir, new RegExp(`^${root}/pi-rj-${uid}/[0-9a-f]{8}$`));
 	assert.ok(join(dir, "h.sock").length < 104);
 	for (const path of [dir, join(root, `pi-rj-${uid}`)]) assert.equal(lstatSync(path).mode & 0o777, 0o700, path);
-	assert.notEqual(createSessionDir({ root, uid }), dir);
+	assert.equal(readFileSync(join(dir, LAUNCH_FILE), "utf8"), `${owner}\n`);
+	assert.notEqual(createSessionDir({ root, uid, owner }), dir);
 	assert.equal(validSessionDir(dir, { root, uid }), true);
 	assert.equal(validSessionDir(join(root, "elsewhere"), { root, uid }), false);
 	assert.equal(validSessionDir(dir, { root, uid: uid + 1 }), false);
+	assert.ok(sessionDirOwnedBy(dir, owner, { root, uid }));
+	assert.equal(sessionDirOwnedBy(dir, "b".repeat(32), { root, uid }), null);
 
-	for (const name of ["k.json", "ready.json", "kernel.log", "helper.pid", `out-${"a".repeat(32)}.txt`, "notes.txt"]) writeFileSync(join(dir, name), "x");
+	for (const name of ["k.json", "ready.json", "kernel.log", "helper.pid", "kernel.pid", `out-${"a".repeat(32)}.txt`, "notes.txt"]) writeFileSync(join(dir, name), "x");
 	symlinkSync("/etc/hosts", join(dir, "h.sock"));
-	const warnings = removeSessionDir(dir, { root, uid });
+	// Another launch's marker, or a directory replaced since it was checked, leaves everything alone.
+	assert.match(removeSessionDir(dir, { root, uid, owner: "b".repeat(32) })[0], /isn't this session's/);
+	assert.match(removeSessionDir(dir, { root, uid, owner, expected: { dev: -1, ino: -1 } })[0], /isn't this session's/);
+	assert.ok(existsSync(join(dir, "k.json")));
+	const warnings = removeSessionDir(dir, { root, uid, owner, expected: sessionDirOwnedBy(dir, owner, { root, uid }) });
 	assert.equal(warnings.length, 3, warnings.join("\n"));
 	assert.match(warnings.join("\n"), /notes\.txt: pi-repl didn't make it/);
 	assert.match(warnings.join("\n"), /h\.sock: it isn't a file or socket/);
 	assert.ok(existsSync(join(dir, "notes.txt")) && lstatSync(join(dir, "h.sock")).isSymbolicLink());
-	assert.equal(existsSync(join(dir, "k.json")), false);
+	assert.equal(existsSync(join(dir, "k.json")) || existsSync(join(dir, "kernel.pid")) || existsSync(join(dir, LAUNCH_FILE)), false);
 
 	// A directory that isn't private any more is left alone.
-	const open = createSessionDir({ root, uid });
+	const open = createSessionDir({ root, uid, owner });
 	writeFileSync(join(open, "k.json"), "x");
 	chmodSync(open, 0o755);
-	assert.match(removeSessionDir(open, { root, uid })[0], /left alone/);
+	assert.match(removeSessionDir(open, { root, uid, owner })[0], /left alone/);
 	assert.ok(existsSync(join(open, "k.json")));
+	assert.throws(() => createSessionDir({ root, uid }), /owner marker/);
 });
 
 test("the person's window waits for the helper, then becomes LFortran's prompt, or says why not", async (t) => {
@@ -187,34 +132,82 @@ test("the person's window waits for the helper, then becomes LFortran's prompt, 
 	const ended = await wait(gone);
 	assert.equal(ended.code, 1);
 	assert.match(ended.stdout, /helper ended before the session was ready/);
+
+	// Through another login shell, the waiter and its arguments arrive unchanged: spaces, quotes and all.
+	if (existsSync("/bin/zsh")) {
+		const odd = mkdtempSync(join(root, "d it's \"odd\"-"));
+		writeFileSync(join(odd, "ready.json"), JSON.stringify({ state: "ready" }));
+		const zsh = await new Promise((resolve) => execFile("/bin/sh", ["-c", personCommand({ shell: "/bin/zsh", dir: odd, lfortran: fake })], { env: { ...env, ZDOTDIR: root }, timeout: 10_000 }, (error, stdout) => resolve({ code: error?.code ?? 0, stdout })));
+		assert.equal(zsh.code, 0, zsh.stdout);
+		assert.ok(zsh.stdout.includes(`lfortran --connect ${odd}/k.json`), zsh.stdout);
+	}
 });
 
-test("the marked processes are found among DIR's PIDs and detached lfortran processes, by their marker alone", async (t) => {
+test("the marked processes are found among DIR's PIDs, detached lfortran processes and orphans since the session began, by their marker alone", async (t) => {
 	const root = mkdtempSync("/tmp/pi-rj-mark-");
 	defer(t, () => rmSync(root, { recursive: true, force: true }));
 	const dir = join(root, "d");
 	mkdirSync(dir, { mode: 0o700 });
 	writeFileSync(join(dir, "helper.pid"), "101\n");
-	writeFileSync(join(dir, "ready.json"), JSON.stringify({ helperPid: 101, kernelPid: 102 }));
+	// Before ready.json, the kernel is named by kernel.pid alone.
+	writeFileSync(join(dir, "kernel.pid"), "102\n");
 	const owner = "e".repeat(32);
 	const proc = (pid, extra = {}) => ({ pid, ppid: 1, pgid: pid, uid, tty: "??", startedAt: "Wed Oct 28 10:00:00 2026", state: "S", ...extra });
-	const table = [proc(101), proc(102), proc(103), proc(104), proc(105, { uid: uid + 1 })];
+	const since = Date.UTC(2026, 9, 28, 9, 0, 0) / 1000;
+	const table = [proc(101, { ppid: 50 }), proc(102, { ppid: 50 }), proc(103, { ppid: 50 }), proc(104, { ppid: 50 }), proc(105, { uid: uid + 1 }),
+		// Orphans: one since the session began, one from before it, and one with a terminal.
+		proc(106), proc(107, { startedAt: "Wed Oct 28 08:00:00 2026" }), proc(108, { tty: "ttys001" })];
 	const list = async () => ({ code: 0, stdout: `  103 ${uid} /opt/bin/lfortran\n  104 ${uid} /usr/bin/python3\n  105 ${uid + 1} /opt/bin/lfortran\n` });
 	const inspected = [];
-	const markers = new Map([[101, owner], [102, owner], [103, "f".repeat(32)]]);
+	const markers = new Map([[101, owner], [102, owner], [103, "f".repeat(32)], [106, owner]]);
 	const readMarkers = async (pids, { variable }) => {
 		assert.equal(variable, JUPYTER_OWNER_ENV);
 		inspected.push(...pids);
 		return pids.map((pid) => ({ pid, owner: markers.get(pid) ?? null }));
 	};
-	const found = await findMarkedJupyterProcesses(table, { owner, dir, lfortran: "/somewhere/lfortran", uid, list, readMarkers });
-	assert.deepEqual(found.map((p) => p.pid).sort(), [101, 102]);
-	assert.deepEqual(inspected.sort(), [101, 102, 103], "only this user's candidates are inspected");
+	const found = await findMarkedJupyterProcesses(table, { owner, dir, lfortran: "/somewhere/lfortran", uid, since, list, readMarkers });
+	assert.deepEqual(found.marked.map((p) => p.pid).sort(), [101, 102, 106]);
+	assert.equal(found.incomplete, false);
+	assert.deepEqual(inspected.sort(), [101, 102, 103, 106], "only this user's candidates are inspected");
 	// A process that can't be inspected is refused while it lives; one that ended meanwhile isn't a failure.
 	const unreadable = async (pids) => pids.map((pid) => ({ pid, error: "unavailable" }));
 	await assert.rejects(findMarkedJupyterProcesses(table, { owner, dir, lfortran: null, uid, list, readMarkers: unreadable, snapshot: async () => table }), /PID 101; refusing unverified cleanup/);
 	const ended = table.filter((p) => p.pid !== 101 && p.pid !== 102).concat([proc(102, { state: "Z" })]);
-	assert.deepEqual(await findMarkedJupyterProcesses(table, { owner, dir, lfortran: null, uid, list, readMarkers: unreadable, snapshot: async () => ended }), []);
+	assert.deepEqual((await findMarkedJupyterProcesses(table, { owner, dir, lfortran: null, uid, list, readMarkers: unreadable, snapshot: async () => ended })).marked, []);
+	// Too many candidates to inspect: the search says it's incomplete rather than empty.
+	const crowd = Array.from({ length: 1100 }, (_, i) => proc(2000 + i));
+	const batches = [];
+	const crowded = await findMarkedJupyterProcesses(crowd, { owner, dir: null, lfortran: null, uid, since, list, readMarkers: async (pids) => { batches.push(pids.length); return pids.map((pid) => ({ pid, owner: null })); } });
+	assert.equal(crowded.incomplete, true);
+	assert.ok(batches.every((size) => size <= 128));
+});
+
+test("a marked process brings its descendants, which stay known once they're reparented", () => {
+	const proc = (pid, extra = {}) => ({ pid, ppid: 1, pgid: pid, uid, tty: "??", startedAt: "Wed Oct 28 10:00:00 2026", state: "S", ...extra });
+	const pane = { serverPid: 900, sessionId: "$1", sessionName: "pi-repl-lfortran", createdAt: "1", paneId: "%1", pid: 1001, tty: "/dev/ttys100", dead: "1", windowId: "@1", windowIndex: 0, paneIndex: 0, linked: "0" };
+	const table = [proc(900, { tty: "??" }), proc(500), proc(501, { ppid: 500 }), proc(502, { ppid: 501 })];
+	const tracker = new SessionStopProcesses({ table, panes: [pane], selected: [pane], currentPid: 9999, uid, retained: new Set(["%1"]), label: "LFortran" });
+	tracker.rememberMarked([table[1]], table, []);
+	// The kernel ends; its child and grandchild are adopted by PID 1.
+	const later = [proc(900, { tty: "??" }), proc(501), proc(502, { ppid: 501 })];
+	assert.deepEqual(tracker.refresh(later, []).map((p) => p.pid).sort(), [501, 502]);
+});
+
+test("readiness needs the helper and kernel ready now, and the person's pane live with its prompt", async (t) => {
+	const root = mkdtempSync("/tmp/pi-rj-ready-");
+	defer(t, () => rmSync(root, { recursive: true, force: true }));
+	const owner = "c".repeat(32);
+	writeFileSync(join(root, "ready.json"), JSON.stringify({ protocol: 1, launchId: owner, state: "ready" }));
+	const identity = { sessionId: "$1", dir: root, owner, personPane: "%1" };
+	const helperIn = (state) => async () => ({ request: async () => ({ protocol: 1, launchId: owner, state }), close() {} });
+	const tmuxWith = (dead) => async (args) => args[0] === "list-panes" ? { code: 0, stdout: `%1\t${dead}\n`, stderr: "" } : { code: 0, stdout: "banner\n>>> \n", stderr: "" };
+	const deadline = () => Date.now() + 400;
+	const exited = await waitForJupyterReady({ tmux: tmuxWith("0"), identity, deadline: deadline(), connect: helperIn("kernel-exited"), pollMs: 20 });
+	assert.deepEqual([exited.ready, exited.failure], [false, "the kernel has already exited"]);
+	const ended = await waitForJupyterReady({ tmux: tmuxWith("1"), identity, deadline: deadline(), connect: helperIn("ready"), pollMs: 20 });
+	assert.deepEqual([ended.ready, ended.prompt, ended.promptEnded], [false, false, true], "a dead pane's last text isn't a prompt");
+	const ready = await waitForJupyterReady({ tmux: tmuxWith("0"), identity, deadline: deadline(), connect: helperIn("ready"), pollMs: 20 });
+	assert.equal(ready.ready, true);
 });
 
 test("start makes the person's window and the helper's, pins them, reports ready, and reuses the session", async (t) => {
@@ -298,16 +291,36 @@ test("a helper that can't start the kernel: start says why, the person's window 
 	assert.equal(existsSync(started.dir), false);
 });
 
-test("stop refuses a session with a pane pi-repl didn't make, and one with no owner marker", async (t) => {
+test("stop refuses added, moved or missing panes and a shared marker, keeps a directory that isn't its launch's, and leaves another session alone", async (t) => {
 	const f = sessionFixture(t);
 	if (!f) return;
 	const started = await f.start();
 	assert.ok(started.ready);
 	const split = await f.tmux(["split-window", "-d", "-P", "-F", "#{pane_id}", "-t", started.personPane, "sleep 60"]);
-	await assert.rejects(f.stop(), /panes that pi-repl didn't make; nothing was stopped/);
+	await assert.rejects(f.stop(), /panes aren't the ones pi-repl made[\s\S]*Nothing was stopped/);
 	assert.equal((await runCell(started, "print:untouched")).output.text, "untouched");
 	await f.tmux(["kill-pane", "-t", split.stdout.trim()]);
-	await f.stop();
+
+	// A marker that another session also carries is ambiguous.
+	const other = (await f.tmux(["new-session", "-d", "-P", "-F", "#{session_id}", "-s", "elsewhere", "sleep 60"])).stdout.trim();
+	await f.tmux(["set-option", "-t", other, "@pi_repl_jupyter_owner", started.owner]);
+	await assert.rejects(f.stop(), /shared with another session/);
+	await f.tmux(["set-option", "-u", "-t", other, "@pi_repl_jupyter_owner"]);
+	assert.equal((await runCell(started, "print:still untouched")).output.text, "still untouched");
+
+	// A directory that no longer names this launch is neither read nor removed; the session still stops.
+	writeFileSync(join(started.dir, LAUNCH_FILE), `${"d".repeat(32)}\n`);
+	const result = await f.stop();
+	assert.match(result.warnings.join("\n"), /doesn't name this session's launch/);
+	assert.ok(existsSync(join(started.dir, "kernel.log")));
+
+	// A pinned pane moved to another session leaves the topology incomplete.
+	const moved = await f.start();
+	assert.ok(moved.ready);
+	await f.tmux(["move-pane", "-d", "-s", moved.helperPane, "-t", `${other}:`]);
+	await assert.rejects(f.stop(), /some are missing, moved or added[\s\S]*Nothing was stopped/);
+	await f.tmux(["kill-session", "-t", other]);
+	await f.tmux(["kill-session", "-t", moved.sessionId]);
 
 	// A session of that name that pi-repl didn't start.
 	await f.tmux(["new-session", "-d", "-s", "pi-repl-lfortran", "sleep 60"]);

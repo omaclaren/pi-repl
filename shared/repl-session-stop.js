@@ -128,6 +128,14 @@ export class SessionStopProcesses {
 			}
 			this.owned.set(processKey(p), p);
 		}
+		// Their descendants too, while their ancestry is still known: once a
+		// marked process ends, its children are reparented and can't be traced.
+		const ids = closure(table, processes.map((p) => p.pid));
+		for (const p of table) {
+			if (!ids.has(p.pid) || this.owned.has(processKey(p)) || !live(p)) continue;
+			if (protectedIds.has(p.pid) || p.uid !== this.uid) throw new Error(`A descendant of a marked ${this.label} process, PID ${p.pid}, overlaps a protected process; no signal was sent to it.`);
+			this.owned.set(processKey(p), p);
+		}
 	}
 
 	refresh(table, panes) {
