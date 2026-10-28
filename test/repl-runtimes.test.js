@@ -99,3 +99,27 @@ test("help and schemas advertise Ruby, Java, exports and existing echo controls"
 	assert.match(help, /\/repl echo \[off\|summary\|full\]/);
 	assert.match(help, /\/repl export \[python\|julia\|r\|ghci\|clojure\|ruby\|java\|octave\|matlab\|gnuplot\|cpp\]/);
 });
+
+test("/repl send takes its target from the first line and the code from the lines below", async () => {
+	const f = fixture();
+	const sendsTo = async (args, session) => {
+		await f.command(args);
+		const { message, level } = f.notifications.at(-1);
+		assert.equal(level, "error");
+		assert.match(message, new RegExp(session), message);
+	};
+	for (const args of ["send", "send julia", "send\n   \n"]) {
+		await f.command(args);
+		assert.match(f.notifications.at(-1).message, /^Nothing to send\. Usage: \/repl send \[runtime\], with the code on the lines below it/);
+	}
+	await f.command("send print(1)");
+	assert.match(f.notifications.at(-1).message, /^Unknown REPL for \/repl send: print\(1\)\. Usage:/);
+	await f.command("send julia println(1)");
+	assert.match(f.notifications.at(-1).message, /^Usage: \/repl send \[runtime\]/);
+	await sendsTo("send\nprint(1)", "pi-repl-python");
+	await sendsTo("send R\nprint(1)", "pi-repl-r");
+	await sendsTo("send haskell\nprint 1", "pi-repl-ghci");
+	await sendsTo("send\tgnuplot \r\nprint 1", "pi-repl-gnuplot");
+	await f.command("");
+	assert.match(f.notifications.at(-1).message, /\/repl send \[runtime\], with the code on the lines below it/);
+});

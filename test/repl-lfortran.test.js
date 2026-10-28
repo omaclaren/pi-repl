@@ -20,11 +20,12 @@ const TOKEN = /token='([0-9a-f]{32})'/;
 async function piFixture(t, options = {}) {
 	const f = lfortranFixture(t, options);
 	if (!f) return null;
-	const tools = new Map(), commands = new Map(), notifications = [];
+	const tools = new Map(), commands = new Map(), notifications = [], messages = [];
 	const pi = {
 		registerTool: (tool) => tools.set(tool.name, tool),
 		registerCommand: (name, definition) => commands.set(name, definition),
 		on() {},
+		sendMessage: (message, options) => messages.push({ message, options }),
 		async exec(command, args, execOptions = {}) {
 			if (command === "tmux") {
 				assert.equal(args[0], "-u", `tmux without -u: ${args.join(" ")}`);
@@ -54,7 +55,7 @@ async function piFixture(t, options = {}) {
 	// Whatever a test leaves running is stopped, through the verified stop.
 	defer(t, () => repl("stop lfortran"));
 	return {
-		...f, tools, notifications,
+		...f, tools, notifications, messages,
 		start: (params = {}) => tool("repl_start", { runtime: "lfortran", timeoutMs: 30_000, ...params }),
 		send: (code, params = {}, signal) => tool("repl_send", { code, target: "lfortran", ...params }, signal),
 		input: (token, text, params = {}, signal) => tool("repl_input", { token, text, ...params }, signal),
@@ -77,6 +78,26 @@ test("/repl parses lfortran and input, keeping an answer's text exactly", async 
 	await assert.rejects(f.send("print:x"), /No shared LFortran session is running/);
 });
 
+test("/repl send lfortran runs the code below it, and a READ it asks is answered with /repl input", async (t) => {
+	const f = await piFixture(t);
+	if (!f) return;
+	assert.match((await f.repl("send lfortran\nprint:x"))[0].message, /No shared LFortran session is running/);
+	await f.start();
+	assert.deepEqual(await f.repl("send lfortran\nprint:hello"), []);
+	const [{ message, options }] = f.messages;
+	assert.equal(message.customType, "pi-repl-send");
+	assert.equal(message.display, true);
+	assert.deepEqual(options, { triggerTurn: false });
+	assert.match(message.content, /^\/repl send to pi-repl-lfortran:\n\n```\nCompleted\.\nExecution: [0-9a-f]{32}\n\nSubmitted code:\nprint:hello\n\nOutput:\nhello\n```$/);
+	assert.equal(message.details.state, "completed");
+	await f.repl("send LFortran\nread");
+	const reading = f.messages.at(-1).message.content;
+	const token = TOKEN.exec(reading)[1];
+	assert.ok(reading.endsWith(`\n\nTo answer it from here: /repl input ${token} <text>\n\`\`\``), reading);
+	await f.repl(`input ${token} 7`);
+	assert.match(f.messages.at(-1).message.content, /^\/repl input answered a READ in pi-repl-lfortran:[\s\S]*Output:\ngot 7\n```$/);
+});
+
 test("repl_start, repl_send, a READ answered with repl_input and /repl input, repl_status, and /repl stop", async (t) => {
 	const f = await piFixture(t);
 	if (!f) return;
@@ -97,10 +118,10 @@ test("repl_start, repl_send, a READ answered with repl_input and /repl input, re
 	assert.match(text(answered), /^Completed\.[\s\S]*Output:\ngot 42$/);
 	await assert.rejects(f.input(TOKEN.exec(text(reading))[1], "43"), /doesn't answer a READ that is waiting/);
 
-	// /repl input passes the text on exactly, its leading spaces too.
+	// /repl input passes the text on exactly, its leading spaces too, and posts the result to the conversation.
 	const again = await f.send("read");
-	const [notice] = await f.repl(`input ${TOKEN.exec(text(again))[1]}   spaced`);
-	assert.match(notice.message, /Output:\ngot   spaced$/);
+	assert.deepEqual(await f.repl(`input ${TOKEN.exec(text(again))[1]}   spaced`), []);
+	assert.match(f.messages.at(-1).message.content, /^\/repl input answered a READ in pi-repl-lfortran:\n\n```\nCompleted\.[\s\S]*Output:\ngot   spaced\n```$/);
 
 	// A cell that outlasts the wait goes on, and can be looked up exactly; meanwhile, another is refused.
 	const slow = await f.send("sleep:1500", { timeoutMs: 1000 });

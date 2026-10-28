@@ -4,6 +4,9 @@ All notable changes to `pi-repl` are documented here.
 
 ## [Unreleased]
 
+### Added
+- `/repl send [runtime]` runs your own code, on the lines below it, in a running session, as `repl_send` runs the agent's. The result goes into the conversation as a message, which the agent sees at its next turn with any pane text it hadn't seen; it starts no turn.
+
 ## [0.10.5] — 2026-10-21
 
 ### Fixed

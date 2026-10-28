@@ -98,6 +98,8 @@ Restart pi after installing.
 | `/repl status gnuplot` | Show status for the shared gnuplot session |
 | `/repl status cpp` | Show status for the shared C++ session |
 | `/repl env` | Show which interpreter and environment the shared Python/IPython REPL is using |
+| `/repl send` | Run the code on the lines below it in the shared Python/IPython session |
+| `/repl send julia` | Run the code on the lines below it in the shared Julia session (likewise for the other runtimes) |
 | `/repl attach` | Show how to attach from a new terminal window |
 | `/repl attach julia` | Show how to attach to the shared Julia session |
 | `/repl attach r` | Show how to attach to the shared R session |
@@ -137,6 +139,17 @@ Restart pi after installing.
 For R, both `/repl R` and `/repl r` work. The same applies to `/lab`, `/repl status`, `/repl attach`, `/repl export`, and `/repl stop`.
 
 For Clojure, `/repl clojure` is canonical and `/repl clj` also works. The same applies to `/lab`, `/repl status`, `/repl attach`, `/repl export`, and `/repl stop`.
+
+`/repl send` runs your own code in a running session, as `repl_send` runs the agent's. Name the runtime on the first line, unless it is Python, and put the code on the lines below it; Shift+Enter starts a new line:
+
+```
+/repl send julia
+for i in 1:3
+    println(i)
+end
+```
+
+The result goes into the conversation as a message, so it stays in the scrollback and the agent sees it at its next turn, together with any pane text it hadn't seen yet. It doesn't start a turn, or a session.
 
 ## Tools used by pi
 

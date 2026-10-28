@@ -111,6 +111,7 @@ async function fixture(t, { index = 0, runtime = "python", controlName, startWit
 	const tools = new Map();
 	const commands = new Map();
 	const notifications = [];
+	const messages = [];
 	let afterEnter;
 	let beforePaste;
 	let beforeStop;
@@ -120,6 +121,7 @@ async function fixture(t, { index = 0, runtime = "python", controlName, startWit
 		registerTool: (tool) => tools.set(tool.name, tool),
 		registerCommand: (name, definition) => commands.set(name, definition),
 		on: (event, handler) => handlers.set(event, [...(handlers.get(event) ?? []), handler]),
+		sendMessage: (message, options) => messages.push({ message, options }),
 		async exec(command, args, options) {
 			// pi-repl passes -u to every tmux command; the harness adds its own.
 			if (command === "tmux") {
@@ -210,7 +212,7 @@ async function fixture(t, { index = 0, runtime = "python", controlName, startWit
 	} catch (error) {
 		throw new Error(`${runtime} startup failed: ${startupOutput}`, { cause: error });
 	}
-	return { cwd, calls, notifications, tmux, sessionName, target, repl, send, status, start, otherAgent, fire, onExec: (override) => { execOverride = override; }, owned: () => tmuxHarness.owned(), cleanup: () => tmuxHarness.cleanup(), onEnter: (callback) => { afterEnter = callback; }, onBeforePaste: (callback) => { beforePaste = callback; }, onBeforeStop: (callback) => { beforeStop = callback; } };
+	return { cwd, calls, notifications, messages, withoutMessages: () => { pi.sendMessage = undefined; }, tmux, sessionName, target, repl, send, status, start, otherAgent, fire, onExec: (override) => { execOverride = override; }, owned: () => tmuxHarness.owned(), cleanup: () => tmuxHarness.cleanup(), onEnter: (callback) => { afterEnter = callback; }, onBeforePaste: (callback) => { beforePaste = callback; }, onBeforeStop: (callback) => { beforeStop = callback; } };
 }
 
 async function assertCompletionGap(f, result) {
@@ -808,6 +810,41 @@ test("other agents' sends and the user's commands do not hide pane text from an 
 	// A new conversation in the same process has not seen what this one was told.
 	const conversation = await f.otherAgent({ sameFactory: true });
 	assert.match(paneReport(await conversation.send("print(2)")), /^This agent has not seen this session's pane before[\s\S]*pi_human = 73/);
+});
+
+test("/repl send runs the person's code below it and posts the result to the conversation", { timeout: 60000 }, async (t) => {
+	const f = await fixture(t, { startWithTool: true });
+	if (!f) return;
+	assert.equal(paneReport(await f.send("pi_seen = 1")), undefined);
+	await typeAtPrompt(f, "pi_typed = 5");
+	await paneSettles(f, /pi_typed = 5\n>>>$/m);
+	// The code is everything below the first line, its indentation too; Python is the default.
+	await f.repl("send\nfor i in range(3):\n    print(i)\nprint('fin')");
+	assert.equal(f.messages.length, 1, JSON.stringify(f.notifications));
+	const [{ message, options }] = f.messages;
+	assert.equal(message.customType, "pi-repl-send");
+	assert.equal(message.display, true);
+	assert.deepEqual(options, { triggerTurn: false });
+	// The agent reads it too, so what the pane showed that it hadn't seen comes with it.
+	assert.equal(message.content, `/repl send to pi-repl-python:\n\n\`\`\`\n${PANE_HEADING}\n[pane text]\n>>> pi_typed = 5\n[end of pane text]\n\nSubmitted code:\nfor i in range(3):\n    print(i)\nprint('fin')\n\nOutput:\n0\n1\n2\nfin\n\`\`\``);
+	assert.equal(paneReport(await f.send("print(pi_typed)")), undefined, "the agent has been told");
+	const entry = readReplSessionRecord((await f.status()).details.python.recordId).entries.find((e) => e.code.includes("print('fin')"));
+	assert.equal(entry.label, "/repl send");
+	assert.equal(entry.mode, "raw");
+	assert.equal(entry.output, "0\n1\n2\nfin");
+	// Code with backticks gets a longer fence; a named target is used, not Python.
+	await f.repl("send python\nprint('```')");
+	assert.match(f.messages.at(-1).message.content, /^\/repl send to pi-repl-python:\n\n````\n[\s\S]*Output:\n```\n````$/);
+	await f.repl("send julia\nprintln(1)");
+	assert.match(f.notifications.at(-1).message, /pi-repl-julia/);
+	assert.equal(f.notifications.at(-1).level, "error");
+	// Where messages aren't available it is a notice, which the agent doesn't read: the pane text stays unseen.
+	f.withoutMessages();
+	await typeAtPrompt(f, "pi_typed = 6");
+	await paneSettles(f, /pi_typed = 6\n>>>$/m);
+	await f.repl("send\nprint(pi_typed)");
+	assert.match(f.notifications.at(-1).message, /^\/repl send to pi-repl-python:[\s\S]*Output:\n6\n```$/);
+	assert.match(paneReport(await f.send("print(0)")), /\n>>> pi_typed = 6\n[\s\S]*\n6\n/);
 });
 
 test("pane text reaches the agent at the start of a prompt, once, for panes it has used", { timeout: 60000 }, async (t) => {

@@ -232,6 +232,7 @@ type ReplCommand =
 	| { action: "start"; runtime: SupportedRuntime; name?: string }
 	| { action: "lfortran"; command: "start" | "status" | "stop" | "attach" }
 	| { action: "input"; token: string; text: string }
+	| { action: "send"; target?: string; code: string }
 	| { action: "error"; message: string };
 
 type SharedReplRecordEntry = {
@@ -452,6 +453,7 @@ function formatUsage(): string {
 		"  /repl cpp",
 		"  /repl lfortran",
 		"  /repl input <token> <text>",
+		"  /repl send [runtime], with the code on the lines below it",
 		"  /repl echo [off|summary|full]",
 		"  /repl status [python|julia|r|ghci|clojure|ruby|java|octave|matlab|gnuplot|cpp]",
 		"  /repl env [python]",
@@ -478,6 +480,7 @@ function formatUsage(): string {
 		"  - /repl cpp starts an experimental Cling-based C++ REPL; send C++ prompt groups, not dot commands",
 		"  - /repl lfortran starts LFortran's shared session (experimental; needs LFortran main): LFortran's own prompt in the first window, and pi-repl's helper for the kernel in the second",
 		"  - /repl input <token> <text> answers an LFortran cell's READ with the text as given",
+		"  - /repl send [runtime] sends the code on the lines below it to that running session (Python by default), as repl_send does; its result goes into the conversation, where the agent sees it too. Shift+Enter starts a new line",
 		"  - /repl status, /repl attach, /repl export, and /repl stop can target any managed runtime",
 		"  - repl_start lets pi start or reuse a session with an explicit runtime; repl_send never auto-starts one",
 		"  - /repl echo controls the bounded submitted-code display in the raw pane; PI_REPL_ECHO_MODE sets the startup default",
@@ -515,6 +518,24 @@ function parseReplCommand(args: string): ReplCommand {
 		const match = /^\s*input\s+(\S+)(?: ([\s\S]*))?$/i.exec(args);
 		if (!match) return { action: "error", message: "Usage: /repl input <token> <text>" };
 		return { action: "input", token: match[1], text: match[2] ?? "" };
+	}
+
+	if (firstLower === "send") {
+		// The first line may name the REPL; the code is everything below it, exactly.
+		const usage = "Usage: /repl send [runtime], with the code on the lines below it (Shift+Enter starts a new line).";
+		const match = /^\s*send(?:[ \t]+(\S+))?[ \t]*(?:\r?\n([\s\S]*))?$/i.exec(args);
+		if (!match) return { action: "error", message: usage };
+		const target = match[1];
+		if (target && target.toLowerCase() !== "lfortran") {
+			try {
+				normalizeReplSendTarget(target);
+			} catch {
+				return { action: "error", message: `Unknown REPL for /repl send: ${target}. ${usage}` };
+			}
+		}
+		const code = match[2] ?? "";
+		if (!code.trim()) return { action: "error", message: `Nothing to send. ${usage}` };
+		return { action: "send", target, code };
 	}
 
 	if (firstLower === "lfortran" && rest.length === 0) return { action: "lfortran", command: "start" };
@@ -2503,6 +2524,54 @@ async function showDefaultPythonEnv(pi: ExtensionAPI, ctx: ExtensionCommandConte
 	}
 }
 
+/**
+ * /repl send: the person's own code, sent to the running session as repl_send
+ * sends the agent's (none is started). The result goes into the conversation.
+ */
+async function sendReplCommand(pi: ExtensionAPI, ctx: ExtensionCommandContext, target: string | undefined, code: string): Promise<void> {
+	try {
+		if (target?.toLowerCase() === "lfortran") {
+			const result = await sendLfortranCode({
+				tmux: lfortranTmux(pi, ctx.cwd), code, timeoutMs: clampReplSendTimeout(undefined), label: "/repl send", ownerKey: lfortranOwnerKey(ctx),
+			});
+			postReplCommandResult(pi, ctx, `/repl send to ${result.details.sessionName}`, lfortranCommandText(result), result.details);
+			return;
+		}
+		// In the conversation the agent reads this result too, so it is also told what the pane
+		// showed that it hadn't seen; as a notice it reads neither, and that pane text stays unseen.
+		const execution = await runRecordedReplCode(pi, { code, target }, ctx, undefined, {
+			requestId: `command:send:${randomUUID()}`, label: "/repl send", mode: "raw",
+		}, typeof pi.sendMessage === "function");
+		const formatted = formatReplSendResult(execution.output, execution.details);
+		postReplCommandResult(pi, ctx, `/repl send to ${execution.details.sessionName}`, formatted.text, formatted.details);
+	} catch (error) {
+		notify(ctx, error instanceof Error ? error.message : String(error), "error");
+	}
+}
+
+/** An LFortran result for the person, bounded as the tools' are, with how to answer a READ from here. */
+function lfortranCommandText(result: { text: string; details: { state?: string; input?: { token: string } | null } }): string {
+	const { text } = boundToolText(result.text);
+	const token = result.details.state === "waiting-input" ? result.details.input?.token : undefined;
+	return token ? `${text}\n\nTo answer it from here: /repl input ${token} <text>` : text;
+}
+
+/**
+ * A command's REPL result as a message in the conversation: shown to the
+ * person, kept in the scrollback, and seen by the agent at its next turn. It
+ * starts no turn. Hosts without messages show it as a notice.
+ */
+function postReplCommandResult(pi: ExtensionAPI, ctx: ExtensionCommandContext, heading: string, text: string, details: unknown): void {
+	const longest = Math.max(0, ...(text.match(/`+/g) ?? []).map((run) => run.length));
+	const fence = "`".repeat(Math.max(3, longest + 1));
+	const content = `${heading}:\n\n${fence}\n${text}\n${fence}`;
+	if (typeof pi.sendMessage !== "function") {
+		notify(ctx, content, "info");
+		return;
+	}
+	pi.sendMessage({ customType: "pi-repl-send", content, display: true, details }, { triggerTurn: false });
+}
+
 async function startDefaultReplSession(
 	pi: ExtensionAPI,
 	cwd: string,
@@ -3114,10 +3183,13 @@ async function handleRepl(pi: ExtensionAPI, args: string, ctx: ExtensionCommandC
 		case "input":
 			try {
 				const result = await answerLfortranInput({ tmux: lfortranTmux(pi, ctx.cwd), token: parsed.token, text: parsed.text });
-				notify(ctx, result.text, "info");
+				postReplCommandResult(pi, ctx, `/repl input answered a READ in ${result.details.sessionName}`, lfortranCommandText(result), result.details);
 			} catch (error) {
 				notify(ctx, error instanceof Error ? error.message : String(error), "error");
 			}
+			return;
+		case "send":
+			await sendReplCommand(pi, ctx, parsed.target, parsed.code);
 			return;
 		case "status":
 			await showReplStatus(pi, ctx, parsed.runtime ? toSessionSelector(parsed.runtime) : undefined);
