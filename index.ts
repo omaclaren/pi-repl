@@ -2537,7 +2537,7 @@ async function sendReplCommand(pi: ExtensionAPI, ctx: ExtensionCommandContext, t
 			const result = await sendLfortranCode({
 				tmux: lfortranTmux(pi, ctx.cwd), code, timeoutMs: clampReplSendTimeout(undefined), label: "/repl send", ownerKey: lfortranOwnerKey(ctx),
 			});
-			postReplCommandResult(pi, ctx, `/repl send to ${result.details.sessionName}`, lfortranCommandText(result), lfortranCommandView(`/repl send · ${result.details.sessionName}`, result, code));
+			postReplCommandResult(pi, ctx, `/repl send to ${result.details.sessionName}`, lfortranCommandText(result), lfortranCommandView(`/repl send · ${result.details.sessionName}`, result, code), lfortranCommandHint(result));
 			return;
 		}
 		// In the conversation the agent reads this result too, so it is also told what the pane
@@ -2566,10 +2566,14 @@ type LfortranCommandResult = {
 	};
 };
 
-/** An LFortran result for the agent, bounded as the tools' are, with how to answer a READ from here. */
+/** An LFortran result for the agent, bounded as the tools' are. */
 function lfortranCommandText(result: LfortranCommandResult): string {
-	const { text } = boundToolText(result.text);
-	return result.details.state === "waiting-input" && result.details.input ? `${text}\n\nTo answer it from here: /repl input <text>` : text;
+	return boundToolText(result.text).text;
+}
+
+/** How to answer a READ the result waits on from here; it goes after the result, which keeps the cell's code and output. */
+function lfortranCommandHint(result: LfortranCommandResult): string | undefined {
+	return result.details.state === "waiting-input" && result.details.input ? "To answer it from here: /repl input <text>" : undefined;
 }
 
 /** An LFortran result for the person: what came of the cell, without the IDs the agent uses. */
@@ -2648,12 +2652,13 @@ const renderReplCommandMessage: Parameters<ExtensionAPI["registerMessageRenderer
  * A command's REPL result as a message in the conversation: shown to the
  * person from its view, kept in the scrollback, and seen by the agent, as
  * `text`, at its next turn. It starts no turn. Hosts without messages show
- * the text as a notice.
+ * the text as a notice. The fence keeps the text's code and output apart
+ * from pi-repl's own words, the heading and `after`, which a host may reword.
  */
-function postReplCommandResult(pi: ExtensionAPI, ctx: ExtensionCommandContext, heading: string, text: string, view: ReplCommandView): void {
+function postReplCommandResult(pi: ExtensionAPI, ctx: ExtensionCommandContext, heading: string, text: string, view: ReplCommandView, after?: string): void {
 	const longest = Math.max(0, ...(text.match(/`+/g) ?? []).map((run) => run.length));
 	const fence = "`".repeat(Math.max(3, longest + 1));
-	const content = `${heading}:\n\n${fence}\n${text}\n${fence}`;
+	const content = `${heading}:\n\n${fence}\n${text}\n${fence}${after ? `\n\n${after}` : ""}`;
 	if (typeof pi.sendMessage !== "function") {
 		notify(ctx, content, "info");
 		return;
@@ -3226,7 +3231,12 @@ async function handleLfortranCommand(pi: ExtensionAPI, ctx: ExtensionCommandCont
 			const result = await stopLfortranSession({ tmux });
 			notify(ctx, result.text, result.details.stopped && (result.details as { verified?: boolean }).verified !== false && !result.details.warnings?.length ? "info" : "warning");
 		} else {
-			notify(ctx, [formatAttachInstructions("pi-repl-lfortran", pi), "LFortran's own prompt is the session's first window; the helper runs in the second."].join("\n"), "info");
+			// Not formatAttachInstructions: the agent isn't told what this pane shows.
+			notify(ctx, [
+				"To use the REPL directly, open a new terminal window and run:",
+				formatAttachCommand("pi-repl-lfortran"),
+				"LFortran's own prompt is the session's first window; the helper runs in the second. The agent sees only its own cells' output, not what you run there.",
+			].join("\n"), "info");
 		}
 	} catch (error) {
 		notify(ctx, `${command === "stop" ? "Could not fully stop pi-repl-lfortran: " : ""}${error instanceof Error ? error.message : String(error)}`, "error");
@@ -3274,7 +3284,7 @@ async function handleRepl(pi: ExtensionAPI, args: string, ctx: ExtensionCommandC
 				const result = await answerLfortranInput({ tmux: lfortranTmux(pi, ctx.cwd), token: parsed.token, text: parsed.text, waiting: true });
 				// The answer is shown where a send shows its code, unless the READ asked for a password.
 				const answer = (result.details as LfortranCommandResult["details"]).answeredPassword === false ? parsed.text : undefined;
-				postReplCommandResult(pi, ctx, `/repl input answered a READ in ${result.details.sessionName}`, lfortranCommandText(result), lfortranCommandView(`/repl input · ${result.details.sessionName}`, result, answer));
+				postReplCommandResult(pi, ctx, `/repl input answered a READ in ${result.details.sessionName}`, lfortranCommandText(result), lfortranCommandView(`/repl input · ${result.details.sessionName}`, result, answer), lfortranCommandHint(result));
 			} catch (error) {
 				notify(ctx, error instanceof Error ? error.message : String(error), "error");
 			}

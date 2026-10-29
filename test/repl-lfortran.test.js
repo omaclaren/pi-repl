@@ -82,6 +82,11 @@ test("/repl parses lfortran and input, keeping an answer's text exactly", async 
 	assert.match((await f.repl("input"))[0].message, /Usage: \/repl input <text>, or \/repl input <token> <text>/);
 	assert.match((await f.repl("status lfortran"))[0].message, /No shared LFortran session is running/);
 	assert.match((await f.repl("help"))[0].message, /\/repl lfortran[\s\S]*\/repl input <text>/);
+	// The agent isn't told what the person's pane shows, so the attach instructions don't say it is.
+	const [attach] = await f.repl("attach lfortran");
+	assert.match(attach.message, /^tmux attach -t pi-repl-lfortran$/m);
+	assert.match(attach.message, /not what you run there/);
+	assert.doesNotMatch(attach.message, /Pane text/);
 	assert.ok(f.tools.has("repl_input"));
 	assert.ok(f.tools.get("repl_start").parameters.properties.runtime.enum.includes("lfortran"));
 	await assert.rejects(f.send("print:x"), /No shared LFortran session is running/);
@@ -110,7 +115,8 @@ test("/repl send lfortran runs the code below it, and a READ it asks is answered
 	// A READ is answered without its token, and the answer is shown with what came of it.
 	await f.repl("send LFortran\nread");
 	const reading = f.messages.at(-1).message.content;
-	assert.ok(reading.endsWith("\n\nTo answer it from here: /repl input <text>\n```"), reading);
+	// The hint is pi-repl's, after the result's fence, so a host can reword it without touching the cell's output.
+	assert.ok(reading.endsWith("\n```\n\nTo answer it from here: /repl input <text>"), reading);
 	assert.deepEqual(f.shown(f.messages.at(-1).message), ["/repl send · pi-repl-lfortran  waiting for input: its READ asks \"? \"", "read", "(no output)", "Answer it with /repl input <text>"]);
 	assert.ok(f.shown(f.messages.at(-1).message, 24).length > 4, "it wraps within a narrow terminal");
 	await f.repl("input 7");
