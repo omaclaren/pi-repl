@@ -4,6 +4,15 @@ All notable changes to `pi-repl` are documented here.
 
 ## [Unreleased]
 
+## [0.11.2] — 2026-10-30
+
+### Added
+- `sendAndSettle`, for a host whose sender waits until its send is done, such as agent-repl's command line. It makes a person's send that is recorded or not sent at all: if the session's record can't be used, the lease isn't free in time, or the entry can't be written, nothing is sent. Once the code is sent, it settles before returning, however long the code runs. It holds the session's lease until the code has finished and its output is captured and recorded, so no other send can take the late output as its own. Only a verified end of the session, or of C++'s native pane, releases an unfinished send; a failed inspection or a missing file doesn't. Pi's `/repl send` and the agent tools are unchanged for now.
+- `formatReplCommandContent`, `buildReplEnvInspectionCode` and `formatReplEnvResult` are exported, so a host can print a send's or `/repl env`'s result as pi-repl does.
+
+### Changed
+- A send that is aborted before its code reaches the pane now sends nothing. The abort is checked just before the paste; before, a send aborted while it prepared was still pasted.
+
 ## [0.11.1] — 2026-10-29
 
 ### Fixed
