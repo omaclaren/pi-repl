@@ -151,7 +151,8 @@ async function fixture(t, { index = 0, runtime = "python", controlName, startWit
 	const ctx = { cwd, hasUI: true, ui: { notify: (message, level) => notifications.push({ message, level }) } };
 	process.env.PI_REPL_CONTROL_ROOT = join(root, controlName ?? 'controls space "quoted" #{raise} λ');
 	// Fresh module preferences/config for each independent test extension.
-	const { default: register } = await import(`../index.ts?fixture=${randomUUID()}`);
+	const module = await import(`../index.ts?fixture=${randomUUID()}`);
+	const register = module.default;
 	register(pi);
 	async function tmux(...args) {
 		return (await tmuxHarness.run(args)).stdout.trim();
@@ -215,7 +216,7 @@ async function fixture(t, { index = 0, runtime = "python", controlName, startWit
 	} catch (error) {
 		throw new Error(`${runtime} startup failed: ${startupOutput}`, { cause: error });
 	}
-	return { cwd, calls, notifications, messages, renderers, withoutMessages: () => { pi.sendMessage = undefined; }, tmux, sessionName, target, repl, send, status, start, otherAgent, fire, onExec: (override) => { execOverride = override; }, owned: () => tmuxHarness.owned(), cleanup: () => tmuxHarness.cleanup(), onEnter: (callback) => { afterEnter = callback; }, onBeforePaste: (callback) => { beforePaste = callback; }, onBeforeStop: (callback) => { beforeStop = callback; } };
+	return { pi, ctx, module, cwd, calls, notifications, messages, renderers, withoutMessages: () => { pi.sendMessage = undefined; }, tmux, sessionName, target, repl, send, status, start, otherAgent, fire, onExec: (override) => { execOverride = override; }, owned: () => tmuxHarness.owned(), cleanup: () => tmuxHarness.cleanup(), onEnter: (callback) => { afterEnter = callback; }, onBeforePaste: (callback) => { beforePaste = callback; }, onBeforeStop: (callback) => { beforeStop = callback; } };
 }
 
 async function assertCompletionGap(f, result) {
@@ -2198,4 +2199,145 @@ test("gnuplot Qt legacy stop warns and independent teardown rescues the unmarked
 	await f.cleanup(); // same independent path registered before launch
 	alive = new Set((await readProcessTable()).filter((p) => !p.state.startsWith("Z")).map(identity));
 	assert.ok(graphics.every((p) => !alive.has(identity(p))), "independent rescue must not rely on production markers");
+});
+
+// A person's send from a host that waits until it is done (agent-repl's CLI).
+const settlingSend = (f, code, options = {}) => f.module.sendAndSettle(f.pi, f.ctx, { code, requestId: `command:send:${randomUUID()}`, label: "/repl send", ...options });
+
+test("a settling send waits past its notice, records the late output, and only then lets another send in", { timeout: 60000 }, async (t) => {
+	const f = await fixture(t, { startWithTool: true });
+	if (!f) return;
+	const notices = [];
+	let dispatched = 0;
+	const settling = settlingSend(f, "import time\ntime.sleep(2.5)\nprint('A_LATE')", {
+		noticeMs: 1000, onDispatched: () => { dispatched += 1; }, onNotice: (name) => notices.push(name),
+	});
+	await eventually(() => notices.length === 1, 10000);
+	// A send made while it settles waits for the lease, and doesn't take A's late output as its own.
+	const other = f.send("print('B_ONLY')");
+	const a = await settling;
+	const b = await other;
+	assert.equal(dispatched, 1);
+	assert.deepEqual(notices, ["pi-repl-python"]);
+	assert.equal(a.output.trim(), "A_LATE");
+	assert.equal(a.details.noticed, true);
+	assert.equal(b.content[0].text.split("Output:\n")[1], "B_ONLY");
+	const entries = readReplSessionRecord(a.details.recordId).entries;
+	const entryA = entries.find((entry) => entry.id === a.details.recordEntryId);
+	assert.equal(entryA.status, "captured");
+	assert.equal(entryA.output, "A_LATE");
+	assert.equal(entryA.label, "/repl send");
+	assert.equal(entryA.mode, "raw");
+	assert.ok(entryA.completedAt >= entryA.createdAt);
+	assert.equal(entries.find((entry) => entry.code === "print('B_ONLY')").output, "B_ONLY");
+	// A send that finishes before its notice is recorded at once.
+	const quick = await settlingSend(f, "print('QUICK')", { onNotice: () => assert.fail("no notice for a quick send") });
+	assert.equal(quick.output.trim(), "QUICK");
+	assert.equal(quick.details.noticed, false);
+});
+
+test("a settling send that can't be recorded, or is cancelled before it is sent, sends nothing", { timeout: 60000 }, async (t) => {
+	const f = await fixture(t, { startWithTool: true });
+	if (!f) return;
+	const pane = () => f.tmux("capture-pane", "-p", "-t", `${f.sessionName}:^`);
+	const before = await pane();
+	await assert.rejects(settlingSend(f, "   \n"), /^Error: Nothing was sent: the code is empty\.$/);
+	const recordId = (await f.status()).details.python.recordId;
+	const held = await acquireReplSessionSendLease(recordId, { owner: "test", waitMs: 0 });
+	try {
+		await assert.rejects(settlingSend(f, "print('BUSY')", { leaseWaitMs: 0 }), /^Error: Nothing was sent: The shared REPL session is busy/);
+		const controller = new AbortController();
+		setTimeout(() => controller.abort(), 300);
+		await assert.rejects(settlingSend(f, "print('CANCELLED')", { leaseWaitMs: 10000, signal: controller.signal }), /^Error: Nothing was sent: .*aborted/);
+	} finally {
+		await held.release();
+	}
+	// A record it can't write to: it refuses rather than send unrecorded.
+	await f.tmux("set-option", "-t", f.sessionName, "@pi_repl_record_version", "999");
+	await assert.rejects(settlingSend(f, "print('UNRECORDED')"), /^Error: Nothing was sent: the session's shared record isn't usable \(Shared REPL record version 999 is not supported/);
+	assert.equal(await pane(), before);
+	assert.equal(readReplSessionRecord(recordId).entries.length, 0);
+});
+
+test("a settling send waits through failed inspections, and only a verified end of its session releases it", { timeout: 60000 }, async (t) => {
+	const f = await fixture(t, { startWithTool: true });
+	if (!f) return;
+	// Inspections that fail while the code runs prove nothing: it goes on and captures.
+	let failing = 0;
+	f.onExec(async (command, args) => {
+		if (failing > 0 && command === "tmux" && args[0] === "has-session") {
+			failing -= 1;
+			return { stdout: "", stderr: "server busy", code: 1, killed: false };
+		}
+	});
+	const captured = await settlingSend(f, "import time\ntime.sleep(2)\nprint('AFTER_FAILURES')", { noticeMs: 1000, onNotice: () => { failing = 4; } });
+	assert.equal(failing, 0, "settle inspected the session while the code ran");
+	assert.equal(captured.output.trim(), "AFTER_FAILURES");
+	// The session ending is a verified end: the outcome is unknown, said so, and the lease is released.
+	const recordId = (await f.status()).details.python.recordId;
+	const notices = [];
+	const ending = settlingSend(f, "import time\ntime.sleep(60)", { noticeMs: 1000, onNotice: (name) => notices.push(name) });
+	await eventually(() => notices.length === 1, 10000);
+	await f.tmux("kill-session", "-t", f.sessionName);
+	await assert.rejects(ending, /^Error: The code was sent and may have run, but the session ended before completion could be confirmed, so its outcome is unknown\. Nothing was retried\.$/);
+	const entry = readReplSessionRecord(recordId).entries.find((e) => e.code.includes("sleep(60)"));
+	assert.equal(entry.status, "error");
+	assert.equal(entry.output, "the session ended before completion could be confirmed");
+	const lease = await acquireReplSessionSendLease(recordId, { owner: "test", waitMs: 0 });
+	await lease.release();
+});
+
+test("a settling send cancelled while it prepares, before the paste, sends nothing", { timeout: 30000 }, async (t) => {
+	const f = await fixture(t, { startWithTool: true });
+	if (!f) return;
+	const controller = new AbortController();
+	let dispatched = false;
+	// Cancelled during the capture made just before the paste.
+	f.onExec(async (command, args) => {
+		if (command === "tmux" && args[0] === "capture-pane" && args.includes("-J") && !dispatched) controller.abort();
+	});
+	await assert.rejects(settlingSend(f, "print('CANCELLED_BUT_RAN')", { signal: controller.signal, onDispatched: () => { dispatched = true; } }), /^Error: Nothing was sent: repl_send was aborted before the code was sent\.$/);
+	assert.equal(dispatched, false);
+	f.onExec(undefined);
+	assert.doesNotMatch(await f.tmux("capture-pane", "-p", "-t", `${f.sessionName}:^`), /CANCELLED_BUT_RAN/);
+});
+
+test("a settling send captures its own pane, whatever panes are added while it runs", { timeout: 30000 }, async (t) => {
+	const f = await fixture(t, { startWithTool: true });
+	if (!f) return;
+	let noticed = false;
+	const pending = settlingSend(f, "import time\ntime.sleep(3)\nprint('ORIGINAL_ONLY')", { noticeMs: 1000, onNotice: () => { noticed = true; } });
+	await eventually(() => noticed);
+	// A new pane before it in the window: the session's first pane is now another one.
+	await f.tmux("split-window", "-d", "-b", "-t", `${f.sessionName}:^`, "printf 'OTHER_PANE_ONLY\\n'; sleep 20");
+	const result = await pending;
+	assert.equal(result.output.trim(), "ORIGINAL_ONLY");
+	const entry = readReplSessionRecord(result.details.recordId).entries.find((e) => e.id === result.details.recordEntryId);
+	assert.equal(entry.status, "captured");
+	assert.equal(entry.output, "ORIGINAL_ONLY");
+});
+
+test("a settling send that finishes just as its notice is due is still captured before it releases", { timeout: 30000 }, async (t) => {
+	const f = await fixture(t, { startWithTool: true });
+	if (!f) return;
+	let entered = false;
+	let delayed = false;
+	f.onEnter(() => { entered = true; });
+	// A slow capture while it waits: the code finishes, then the wait times out.
+	f.onExec(async (command, args) => {
+		if (entered && !delayed && command === "tmux" && args[0] === "capture-pane") {
+			delayed = true;
+			const stale = await f.tmux(...args);
+			await new Promise((resolve) => setTimeout(resolve, 1300));
+			return { stdout: stale, stderr: "", code: 0, killed: false };
+		}
+	});
+	const result = await settlingSend(f, "import time\ntime.sleep(.5)\nprint('BOUNDARY_RESULT')", { noticeMs: 1000 });
+	assert.ok(delayed);
+	assert.equal(result.output.trim(), "BOUNDARY_RESULT");
+	const entry = readReplSessionRecord(result.details.recordId).entries.find((e) => e.id === result.details.recordEntryId);
+	assert.equal(entry.status, "captured");
+	assert.equal(entry.output, "BOUNDARY_RESULT");
+	const lease = await acquireReplSessionSendLease(result.details.recordId, { owner: "test", waitMs: 0 });
+	await lease.release();
 });

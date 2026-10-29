@@ -1010,6 +1010,9 @@ async function enableSessionHistoryLogging(
 	return { historyPath };
 }
 
+// tmux's explicit answer that a session (or its whole server) is gone; other failures prove nothing.
+const TMUX_SESSION_ABSENT = /no server running|can't find session:|(?:error connecting|failed to connect).*?(?:No such file|Connection refused)/i;
+
 async function readSessionInfo(pi: ExtensionAPI, sessionName: string, cwd: string, inspectPrompt = false): Promise<SessionInfo | null> {
 	if (!(await tmuxSessionExists(pi, sessionName, cwd))) return null;
 
@@ -1021,7 +1024,7 @@ async function readSessionInfo(pi: ExtensionAPI, sessionName: string, cwd: strin
 		// Only a fresh, explicit absence result settles this observation; do not
 		// turn permissions, timeouts or an uninspectable live pane into "stopped".
 		const check = await execTmux(pi, ["has-session", "-t", getSessionTarget(sessionName)], cwd, 3_000);
-		if (check.code === 1 && /no server running|can't find session:|(?:error connecting|failed to connect).*?(?:No such file|Connection refused)/i.test(check.stderr)) return null;
+		if (check.code === 1 && TMUX_SESSION_ABSENT.test(check.stderr)) return null;
 		throw error;
 	}
 	const summaryResult = await execTmux(
@@ -1254,6 +1257,8 @@ type ReplSubmissionState = {
 	recordId?: string;
 	sessionName: string;
 	sessionTarget: string;
+	// The pane the code was pasted into, and whose output is its own.
+	paneTarget: string;
 	tmuxSessionId: string;
 	tmuxSessionCreatedAt: number;
 	cwd: string;
@@ -1825,6 +1830,7 @@ async function pasteTextToTmuxPane(
 	text: string,
 	onPasted?: () => void,
 	bracketed = false,
+	signal?: AbortSignal,
 ): Promise<void> {
 	const bufferName = `pi-repl-${randomUUID()}`;
 	const target = await getPaneTarget(pi, sessionTarget, cwd);
@@ -1838,6 +1844,9 @@ async function pasteTextToTmuxPane(
 			const reason = loadResult.stderr.trim() || loadResult.stdout.trim() || `exit code ${loadResult.code}`;
 			throw new Error(`Failed to load tmux buffer: ${reason}`);
 		}
+
+		// Up to here nothing has reached the pane, so an abort still means nothing was sent.
+		if (signal?.aborted) throw new Error("repl_send was aborted before the code was sent.");
 
 		// -p brackets the paste only if the REPL asked for bracketed pastes.
 		// Julia then draws a line that wraps in the pane once, not once per
@@ -2069,6 +2078,44 @@ function normalizeReplSendTarget(target?: string): SessionSelector | undefined {
 	throw new Error(`Unknown repl_send target: ${target}`);
 }
 
+/** Why a send can't run: its runtime's default session isn't running. */
+function missingSessionError(target: SessionSelector, sessionName: string): Error {
+	if (target === "octave" || target === "matlab" || target === "gnuplot" || target === "cpp") return new Error(`No default ${getSessionDisplayName(target)} REPL session is running (${sessionName}). Start one with /repl ${target} first.`);
+	if (target === "julia") {
+		return new Error(
+			`No default Julia REPL session is running (${DEFAULT_JULIA_SESSION}). Start one with /repl julia first.`,
+		);
+	}
+	if (target === "r") {
+		return new Error(
+			`No default R REPL session is running (${DEFAULT_R_SESSION}). Start one with /repl R or /repl r first.`,
+		);
+	}
+	if (target === "ghci") {
+		return new Error(
+			`No default Haskell (GHCi) REPL session is running (${DEFAULT_GHCI_SESSION}). Start one with /repl ghci first.`,
+		);
+	}
+	if (target === "clojure") {
+		return new Error(
+			`No default Clojure REPL session is running (${DEFAULT_CLOJURE_SESSION}). Start one with /repl clojure or /repl clj first.`,
+		);
+	}
+	if (target === "ruby") {
+		return new Error(
+			`No default Ruby REPL session is running (${DEFAULT_RUBY_SESSION}). Start one with /repl ruby first.`,
+		);
+	}
+	if (target === "java") {
+		return new Error(
+			`No default Java REPL session is running (${DEFAULT_JAVA_SESSION}). Start one with /repl java first.`,
+		);
+	}
+	return new Error(
+		`No default Python/IPython REPL session is running (${DEFAULT_PYTHON_SESSION}). Start one with /repl python or /repl ipython first.`,
+	);
+}
+
 async function runReplCode(
 	pi: ExtensionAPI,
 	params: ReplSendParams,
@@ -2081,6 +2128,10 @@ async function runReplCode(
 		submissionId?: string;
 		// The result goes to the agent, which is told what it has not seen yet.
 		forAgent?: boolean;
+		// How long to wait before giving up, unclamped; a settling send waits on afterwards.
+		waitMs?: number;
+		// The caller settles a send that has been pasted, so its control files are left for it.
+		settledByCaller?: boolean;
 	} = {},
 ): Promise<{ output: string; details: ReplSendDetails }> {
 	const code = params.code ?? "";
@@ -2091,42 +2142,7 @@ async function runReplCode(
 	const target = normalizeReplSendTarget(params.target) ?? "python";
 	const sessionName = getSessionNameForSelector(target);
 
-	if (!(await tmuxSessionExists(pi, sessionName, ctx.cwd))) {
-		if (target === "octave" || target === "matlab" || target === "gnuplot" || target === "cpp") throw new Error(`No default ${getSessionDisplayName(target)} REPL session is running (${sessionName}). Start one with /repl ${target} first.`);
-		if (target === "julia") {
-			throw new Error(
-				`No default Julia REPL session is running (${DEFAULT_JULIA_SESSION}). Start one with /repl julia first.`,
-			);
-		}
-		if (target === "r") {
-			throw new Error(
-				`No default R REPL session is running (${DEFAULT_R_SESSION}). Start one with /repl R or /repl r first.`,
-			);
-		}
-		if (target === "ghci") {
-			throw new Error(
-				`No default Haskell (GHCi) REPL session is running (${DEFAULT_GHCI_SESSION}). Start one with /repl ghci first.`,
-			);
-		}
-		if (target === "clojure") {
-			throw new Error(
-				`No default Clojure REPL session is running (${DEFAULT_CLOJURE_SESSION}). Start one with /repl clojure or /repl clj first.`,
-			);
-		}
-		if (target === "ruby") {
-			throw new Error(
-				`No default Ruby REPL session is running (${DEFAULT_RUBY_SESSION}). Start one with /repl ruby first.`,
-			);
-		}
-		if (target === "java") {
-			throw new Error(
-				`No default Java REPL session is running (${DEFAULT_JAVA_SESSION}). Start one with /repl java first.`,
-			);
-		}
-		throw new Error(
-			`No default Python/IPython REPL session is running (${DEFAULT_PYTHON_SESSION}). Start one with /repl python or /repl ipython first.`,
-		);
-	}
+	if (!(await tmuxSessionExists(pi, sessionName, ctx.cwd))) throw missingSessionError(target, sessionName);
 
 	const sessionInfo = await readSessionInfo(pi, sessionName, ctx.cwd);
 	if (!sessionInfo) {
@@ -2179,7 +2195,7 @@ async function runReplCode(
 	}
 
 	const runtime: ImplementedRuntime = target === "python" ? normalizePythonRuntime(sessionInfo) : target;
-	const timeoutMs = clampReplSendTimeout(params.timeoutMs);
+	const timeoutMs = options.waitMs ?? clampReplSendTimeout(params.timeoutMs);
 	const sessionTarget = sessionInfo.tmuxSessionId || sessionName;
 	const paneTarget = await getPaneTarget(pi, sessionTarget, ctx.cwd);
 	const beforeCapture = await capturePaneOutput(pi, paneTarget, ctx.cwd);
@@ -2198,6 +2214,7 @@ async function runReplCode(
 		recordId: sessionInfo.recordId,
 		sessionName,
 		sessionTarget,
+		paneTarget,
 		tmuxSessionId: sessionInfo.tmuxSessionId,
 		tmuxSessionCreatedAt: sessionInfo.tmuxSessionCreatedAt,
 		cwd: ctx.cwd,
@@ -2213,7 +2230,7 @@ async function runReplCode(
 		await pasteTextToTmuxPane(pi, paneTarget, ctx.cwd, prepared.submissionText, () => {
 			submissionStarted = true;
 			options.onSubmissionStarted?.(submissionState);
-		}, runtime === "julia");
+		}, runtime === "julia", signal);
 		await waitForReplDoneFile(
 			pi,
 			sessionName,
@@ -2261,7 +2278,9 @@ async function runReplCode(
 		};
 	} catch (error) {
 		if (submissionComplete(prepared)) submissionState.completionObserved = true;
-		if (!submissionStarted || submissionState.completionObserved || submissionState.runtimeEnded) {
+		if (options.settledByCaller && submissionStarted && !submissionState.runtimeEnded) {
+			// Completed or not, the caller captures and records it before anything is removed.
+		} else if (!submissionStarted || submissionState.completionObserved || submissionState.runtimeEnded) {
 			cleanupPreparedReplControlFiles(prepared);
 		} else if (!options.onSubmissionStarted) {
 			retainReplSubmissionUntilSettled(pi, submissionState, null);
@@ -2436,6 +2455,194 @@ async function runRecordedReplCode(
 	}
 }
 
+const SETTLE_POLL_MS = 250;
+
+type SettleOutcome =
+	| { outcome: "captured"; output: string; cppResult?: number; recordWarning?: string }
+	| { outcome: "ended"; reason: string; recordWarning?: string };
+
+/** Whether a send's own session has verifiably ended: tmux says it is gone, or its ID now names a newer session. */
+async function originalSessionEnded(pi: ExtensionAPI, state: ReplSubmissionState): Promise<boolean> {
+	const target = getSessionTarget(state.sessionTarget);
+	const check = await execTmux(pi, ["has-session", "-t", target], state.cwd, 3_000);
+	if (check.code === 1 && TMUX_SESSION_ABSENT.test(check.stderr)) return true;
+	if (check.code !== 0) return false;
+	const current = await execTmux(pi, ["display-message", "-p", "-t", target, "#{session_id}\t#{session_created}"], state.cwd, 3_000);
+	const [id = "", created = ""] = current.stdout.trim().split("\t");
+	if (current.code !== 0 || !/^\$\d+$/.test(id) || !/^\d+$/.test(created)) return false;
+	return id !== state.tmuxSessionId || Number(created) !== state.tmuxSessionCreatedAt;
+}
+
+/** Sleeps, keeping the process alive: a settling send's sender waits for it. */
+function sleepKeepingProcessAlive(ms: number): Promise<void> {
+	return new Promise((resolveSleep) => setTimeout(resolveSleep, ms));
+}
+
+/**
+ * Settle: waits, keeping the process alive, until code a send dispatched has
+ * finished or its session's lifetime has ended. On completion it captures the
+ * output from the original pane and updates the entry, and only then releases
+ * the lease, so no other send can take this code's late output as its own.
+ */
+async function settleReplSubmission(
+	pi: ExtensionAPI,
+	state: ReplSubmissionState,
+	lease: Awaited<ReturnType<typeof acquireReplSessionSendLease>>,
+	record: { recordId: string; identity: ReplSessionIdentity; entry: SharedReplRecordEntry },
+): Promise<SettleOutcome> {
+	const updateEntry = (fields: Partial<SharedReplRecordEntry>): string | undefined => {
+		try {
+			upsertReplSessionRecordEntry(record.recordId, record.identity, { ...record.entry, ...fields, completedAt: Date.now() }, { origin: "pi-repl" });
+			return undefined;
+		} catch (error) {
+			return error instanceof Error ? error.message : String(error);
+		}
+	};
+	try {
+		// Only a verified end releases an unfinished send: anything else, such as a
+		// missing file or a failed inspection, leaves it unresolved, and settle waits on.
+		while (!submissionComplete(state.prepared)) {
+			try {
+				const cppEnded = await cppPaneEnded(pi, state);
+				if (cppEnded || await originalSessionEnded(pi, state)) {
+					if (cppEnded) state.runtimeEnded = true;
+					const reason = "the session ended before completion could be confirmed";
+					return { outcome: "ended", reason, recordWarning: updateEntry({ status: "error", output: reason }) };
+				}
+			} catch {
+				// A failed check is not evidence that the code has stopped.
+			}
+			await sleepKeepingProcessAlive(SETTLE_POLL_MS);
+		}
+		state.completionObserved = true;
+		const cppResult = state.prepared.cppCompletion ? readCppCompletion(state.prepared.cppCompletion) : undefined;
+		let output: string;
+		try {
+			// The original pane, still in the original session: never whichever pane is first now.
+			const pane = await execTmux(pi, ["display-message", "-p", "-t", state.paneTarget, "#{pane_id}\t#{session_id}\t#{session_created}"], state.cwd, 3_000);
+			const [paneId, sessionId, created] = pane.stdout.trim().split("\t");
+			if (pane.code !== 0 || paneId !== state.paneTarget || sessionId !== state.tmuxSessionId || Number(created) !== state.tmuxSessionCreatedAt) {
+				throw new Error(`its pane ${state.paneTarget} is no longer in the session`);
+			}
+			const afterCapture = await capturePaneOutput(pi, state.paneTarget, state.cwd);
+			output = cleanupReplDelta(extractPaneDelta(state.beforeCapture, afterCapture), state.prepared.submissionLine, state.prepared.previewComment, state.prepared.completionLine, state.prepared.display);
+		} catch (error) {
+			const reason = `it ran, but its output couldn't be captured (${error instanceof Error ? error.message : String(error)})`;
+			const failed = updateEntry({ status: "error", output: reason });
+			return { outcome: "captured", output: "", cppResult, recordWarning: failed ? `${reason}, and the record couldn't be updated (${failed})` : reason };
+		}
+		const failed = updateEntry({ status: "captured", output });
+		return { outcome: "captured", output, cppResult, recordWarning: failed ? `it ran, but the record couldn't be updated (${failed})` : undefined };
+	} finally {
+		cleanupPreparedReplControlFiles(state.prepared);
+		await lease.release().catch(() => undefined);
+	}
+}
+
+export type SettledSendOptions = {
+	target?: string;
+	code: string;
+	requestId: string;
+	label: string;
+	// When the sender is told the code is still running; it goes on waiting.
+	noticeMs?: number;
+	// How long to wait for another send to finish with the session first.
+	leaseWaitMs?: number;
+	// Cancels before the code is sent; once it is sent, the wait can't be cancelled.
+	signal?: AbortSignal;
+	onDispatched?: () => void;
+	onNotice?: (sessionName: string) => void;
+};
+
+/**
+ * A person's send for a host that waits until it is done: recorded, or not
+ * sent at all, and settled before it returns, however long the code runs.
+ * Errors before the code is sent start "Nothing was sent".
+ */
+export async function sendAndSettle(pi: ExtensionAPI, ctx: ExtensionContext, options: SettledSendOptions): Promise<{ output: string; details: ReplSendDetails & { noticed: boolean } }> {
+	const notSent = (why: string) => new Error(`Nothing was sent: ${why}`);
+	const target = normalizeReplSendTarget(options.target) ?? "python";
+	const sessionName = getSessionNameForSelector(target);
+	if (!options.code.trim()) throw notSent("the code is empty.");
+	if (!(await tmuxSessionExists(pi, sessionName, ctx.cwd))) throw notSent(missingSessionError(target, sessionName).message);
+	const sessionInfo = await readSessionInfo(pi, sessionName, ctx.cwd);
+	if (!sessionInfo?.recordId || !sessionInfo.recordPath || sessionInfo.recordWarning) {
+		throw notSent(`the session's shared record isn't usable${sessionInfo?.recordWarning ? ` (${sessionInfo.recordWarning})` : ""}, so the send couldn't be recorded.`);
+	}
+	const runtime: ImplementedRuntime = target === "python" ? normalizePythonRuntime(sessionInfo) : target;
+	const identity: ReplSessionIdentity = { sessionName, tmuxSessionId: sessionInfo.tmuxSessionId, tmuxSessionCreatedAt: sessionInfo.tmuxSessionCreatedAt, runtime };
+	const submissionId = `pi-repl:${options.requestId}`;
+	let lease: Awaited<ReturnType<typeof acquireReplSessionSendLease>>;
+	try {
+		lease = await acquireReplSessionSendLease(sessionInfo.recordId, { owner: `pi-repl:${options.requestId}`, waitMs: options.leaseWaitMs ?? 60_000, signal: options.signal });
+	} catch (error) {
+		throw notSent(error instanceof Error ? error.message : String(error));
+	}
+	let entry: SharedReplRecordEntry;
+	try {
+		entry = upsertReplSessionRecordEntry(sessionInfo.recordId, identity, {
+			id: submissionId, requestId: options.requestId, origin: "pi-repl", label: options.label, mode: "raw", code: options.code, status: "sending",
+		}, { origin: "pi-repl" }).entry as SharedReplRecordEntry;
+	} catch (error) {
+		await lease.release().catch(() => undefined);
+		throw notSent(`the shared record couldn't be written (${error instanceof Error ? error.message : String(error)}).`);
+	}
+	if (options.signal?.aborted) {
+		const reason = "Cancelled before it was sent.";
+		try { upsertReplSessionRecordEntry(sessionInfo.recordId, identity, { ...entry, status: "error", output: reason, completedAt: Date.now() }, { origin: "pi-repl" }); } catch {}
+		await lease.release().catch(() => undefined);
+		throw notSent("cancelled.");
+	}
+
+	const record = { recordId: sessionInfo.recordId, identity, entry };
+	const stateRef: { current: ReplSubmissionState | null } = { current: null };
+	// Cancelling counts until the code is pasted; after that the wait can't be cancelled.
+	const beforeDispatch = new AbortController();
+	const cancel = () => beforeDispatch.abort();
+	options.signal?.addEventListener("abort", cancel, { once: true });
+	const noticeMs = options.noticeMs ?? DEFAULT_REPL_SEND_TIMEOUT_MS;
+	const details = (extra: Partial<ReplSendDetails> & { noticed: boolean }) => ({
+		sessionName, runtime, target, timeoutMs: noticeMs, submittedCode: options.code, echoMode: resolveReplSubmissionEchoMode(undefined),
+		recordId: sessionInfo.recordId, recordPath: sessionInfo.recordPath, recordEntryId: entry.id, ...extra,
+	});
+	try {
+		const execution = await runReplCode(pi, { code: options.code, target: options.target }, ctx, beforeDispatch.signal, {
+			expectedSession: identity, expectedRecordId: sessionInfo.recordId, submissionId, waitMs: noticeMs, settledByCaller: true,
+			onSubmissionStarted: (state) => {
+				options.signal?.removeEventListener("abort", cancel);
+				stateRef.current = state;
+				options.onDispatched?.();
+			},
+		});
+		let recordWarning: string | undefined;
+		try {
+			upsertReplSessionRecordEntry(sessionInfo.recordId, identity, { ...entry, output: execution.output, status: "captured", completedAt: Date.now() }, { origin: "pi-repl" });
+		} catch (error) {
+			recordWarning = `it ran, but the record couldn't be updated (${error instanceof Error ? error.message : String(error)})`;
+		}
+		await lease.release().catch(() => undefined);
+		return { output: execution.output, details: { ...execution.details, recordId: sessionInfo.recordId, recordPath: sessionInfo.recordPath, recordEntryId: entry.id, recordWarning, noticed: false } };
+	} catch (error) {
+		options.signal?.removeEventListener("abort", cancel);
+		const state = stateRef.current;
+		if (!state || state.runtimeEnded) {
+			// Not sent, or it ended with its native pane: nothing is left for this send to wait on.
+			const message = error instanceof Error ? error.message : String(error);
+			try { upsertReplSessionRecordEntry(sessionInfo.recordId, identity, { ...entry, status: "error", output: message, completedAt: Date.now() }, { origin: "pi-repl" }); } catch {}
+			cleanupPreparedReplControlFiles(state?.prepared);
+			await lease.release().catch(() => undefined);
+			throw state ? error : notSent(message);
+		}
+		// The code was sent: wait on, holding the lease, until it settles; finished or not, settle captures it.
+		if (!submissionComplete(state.prepared)) options.onNotice?.(sessionName);
+		const settled = await settleReplSubmission(pi, state, lease, record);
+		if (settled.outcome === "ended") {
+			throw new Error(`The code was sent and may have run, but ${settled.reason}, so its outcome is unknown. Nothing was retried.${settled.recordWarning ? ` The record couldn't be updated either (${settled.recordWarning}).` : ""}`);
+		}
+		return { output: settled.output, details: details({ cppResult: settled.cppResult, recordWarning: settled.recordWarning, noticed: true }) };
+	}
+}
+
 export function formatReplSendResult(output: string, details: ReplSendDetails): { text: string; details: ReplSendDetails } {
 	const fullText = [
 		...(details.paneActivity ? [details.paneActivity, ""] : []),
@@ -2485,7 +2692,7 @@ async function executeReplSend(
 	};
 }
 
-function buildReplEnvInspectionCode(): string {
+export function buildReplEnvInspectionCode(): string {
 	return [
 		"import os, sys",
 		"print(f'sys.executable={sys.executable}')",
@@ -2511,20 +2718,21 @@ async function showDefaultPythonEnv(pi: ExtensionAPI, ctx: ExtensionCommandConte
 			{ requestId: `command:env:${Date.now().toString(36)}`, label: "/repl env", mode: "raw" },
 		);
 
-		notify(
-			ctx,
-			[
-				"Python/IPython REPL environment:",
-				`Runtime: ${execution.details.runtime}`,
-				`Session: ${execution.details.sessionName}`,
-				"",
-				execution.output.trim() || "(no output)",
-			].join("\n"),
-			"info",
-		);
+		notify(ctx, formatReplEnvResult(execution), "info");
 	} catch (error) {
 		notify(ctx, error instanceof Error ? error.message : String(error), "error");
 	}
+}
+
+/** What /repl env reports from its inspection code's result. */
+export function formatReplEnvResult(execution: { output: string; details: Pick<ReplSendDetails, "runtime" | "sessionName"> }): string {
+	return [
+		"Python/IPython REPL environment:",
+		`Runtime: ${execution.details.runtime}`,
+		`Session: ${execution.details.sessionName}`,
+		"",
+		execution.output.trim() || "(no output)",
+	].join("\n");
 }
 
 /**
@@ -2648,6 +2856,13 @@ const renderReplCommandMessage: Parameters<ExtensionAPI["registerMessageRenderer
 	return box;
 };
 
+/** A command's result as text: the heading, the result in a fence longer than any backtick run in it, then `after`. */
+export function formatReplCommandContent(heading: string, text: string, after?: string): string {
+	const longest = Math.max(0, ...(text.match(/`+/g) ?? []).map((run) => run.length));
+	const fence = "`".repeat(Math.max(3, longest + 1));
+	return `${heading}:\n\n${fence}\n${text}\n${fence}${after ? `\n\n${after}` : ""}`;
+}
+
 /**
  * A command's REPL result as a message in the conversation: shown to the
  * person from its view, kept in the scrollback, and seen by the agent, as
@@ -2656,9 +2871,7 @@ const renderReplCommandMessage: Parameters<ExtensionAPI["registerMessageRenderer
  * from pi-repl's own words, the heading and `after`, which a host may reword.
  */
 function postReplCommandResult(pi: ExtensionAPI, ctx: ExtensionCommandContext, heading: string, text: string, view: ReplCommandView, after?: string): void {
-	const longest = Math.max(0, ...(text.match(/`+/g) ?? []).map((run) => run.length));
-	const fence = "`".repeat(Math.max(3, longest + 1));
-	const content = `${heading}:\n\n${fence}\n${text}\n${fence}${after ? `\n\n${after}` : ""}`;
+	const content = formatReplCommandContent(heading, text, after);
 	if (typeof pi.sendMessage !== "function") {
 		notify(ctx, content, "info");
 		return;
