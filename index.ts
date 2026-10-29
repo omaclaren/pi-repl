@@ -2975,7 +2975,8 @@ async function sendReplCommand(pi: ExtensionAPI, ctx: ExtensionCommandContext, t
  * against what it has seen of the pane since: when a prompt's pane text
  * showed part of the send while it ran, only the pane text after that is
  * new; when the agent was told a later capture of the pane while this result
- * waited, it has had all of it, and that newer view stays. Nothing is posted
+ * waited, that newer view stays, and the output is told with a note that it
+ * may have been shown already (that text is bounded). Nothing is posted
  * once its conversation has been replaced
  * (Pi's API is then stale): the result is in the record.
  */
@@ -3002,13 +3003,14 @@ function postLateReplSend(pi: ExtensionAPI, ctx: ExtensionCommandContext, code: 
 	const view = agentView ? views.get(agentView.key) : undefined;
 	const capture = settled.capture;
 	// The agent was told a later capture (a later send's or prompt's pane text, while this result waited).
+	// That text is bounded, so it may have left this output out: the output is kept, with a note.
 	const newer = Boolean(view && capture && view.capturedAt > capture.capturedAt);
 	const idle = (line: string) => isIdleReplPrompt(state.runtime, line);
 	let output = settled.output;
 	let paneActivity: string | undefined;
 	if (agentView && paneActivityEnabled()) {
 		if (newer) {
-			output = "[Pane text reported after it finished already showed this send's output.]";
+			output = `[Pane text reported after it finished may already have shown some or all of this.]\n${settled.output}`;
 		} else if (view && view !== agentView.atStart && capture) {
 			const rest = describePaneActivity(paneActivitySince(capture.pane, view.seen, idle), { when: "late" });
 			output = rest

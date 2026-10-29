@@ -2499,18 +2499,21 @@ test("a late /repl send result waits for a prompt start's run, and a result that
 	// The run's start doesn't put back the view the result advanced, so the agent isn't told it again.
 	assert.equal(paneReport(await f.send("print(3)")), undefined);
 
-	// Another send that finishes while the result waits tells the agent its output first; the
-	// result then says so, and leaves that send's newer view.
+	// Another send that finishes while the result waits reports the pane first, bounded, so here
+	// without this output; the result keeps that send's newer view, and still tells the output.
 	waits.next();
 	await f.repl("send\nimport time\ntime.sleep(1)\nprint('A_LATE')");
 	assert.ok((await f.fire("before_agent_start", { prompt: "next" })).find(Boolean)?.message);
 	await waits.settle();
+	await typeAtPrompt(f, "print('\\n'.join('NOISE %d' % i for i in range(80)))");
+	await paneSettles(f, /^NOISE 79$/m);
 	await f.repl("send\nprint('B_ON_TIME')");
 	assert.equal(f.messages.length, 2);
-	assert.match(f.messages[1].message.content, /\nA_LATE\n[\s\S]*\nOutput:\nB_ON_TIME\n```$/);
+	assert.match(f.messages[1].message.content, /\nNOISE 79\n[\s\S]*\nOutput:\nB_ON_TIME\n```$/);
+	assert.doesNotMatch(f.messages[1].message.content, /^A_LATE$/m);
 	await f.fire("agent_start");
 	await eventually(() => f.messages.length === 3);
-	assert.equal(f.messages[2].message.content.split("\n\nOutput:\n")[1], "[Pane text reported after it finished already showed this send's output.]\n```");
+	assert.equal(f.messages[2].message.content.split("\n\nOutput:\n")[1], "[Pane text reported after it finished may already have shown some or all of this.]\nA_LATE\n```");
 	assert.equal(paneReport(await f.send("print(4)")), undefined);
 
 	// A prompt start dropped by a reset doesn't hold the result up.
