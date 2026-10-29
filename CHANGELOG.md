@@ -4,6 +4,19 @@ All notable changes to `pi-repl` are documented here.
 
 ## [Unreleased]
 
+## [0.11.3] — 2026-10-30
+
+### Changed
+- An agent's send that outlasts its wait, and Pi's `/repl send` and `/repl env`, are now settled by an owner as `sendAndSettle`'s sends are. When the wait runs out, or the call is aborted after the code was pasted, the send still returns an error. The error now says not to send the code again, whether it has finished or may still be running, and whether its output will be recorded, with its record and entry IDs; for an agent, it adds that the output will appear with its next send's pane text. The entry stays `sending` until the code finishes, when the owner captures the output from the original pane, records it and releases the session. Before, the entry became `timeout` at once and the late output was never recorded. A send whose first record write failed is still settled, with no entry to update. Agent sends still run without a lease when the session has no usable record: "recorded or not sent" applies to `sendAndSettle`.
+- Session status (`repl_status`, `/repl status`, and so `agent-repl status`) says which send holds a session's lease, since when, and whether the next send will treat it as abandoned.
+
+### Added
+- `drainSettlingSends()` and `settlingSendCount()`, so a host can wait before it exits for the sends it is settling, and for those still inside their callers' waits, which may yet hand over.
+
+### Fixed
+- A cell that finishes just as an agent's send stops waiting is captured and recorded; before, its output was lost and the lease released.
+- A settling send's session counts as ended when a new tmux server has reused its session ID, which happens after the old server exits.
+
 ## [0.11.2] — 2026-10-30
 
 ### Added
