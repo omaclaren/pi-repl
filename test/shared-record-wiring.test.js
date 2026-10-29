@@ -26,8 +26,10 @@ test("repl_send holds the shared lease across execution and records its result",
 	assert.match(source, /status: "captured"/);
 	assert.match(source, /label: getToolSubmissionLabel\(\)/);
 	assert.match(source, /process\.env\.PI_REPL_AGENT_LABEL\?\.trim\(\) \|\| "Pi"/);
-	assert.match(source, /retainReplSubmissionUntilSettled/);
-	assert.match(source, /!submissionState\.completionObserved/);
+	// A pasted send that the caller stops waiting for is settled by an owner that holds the lease.
+	assert.match(source, /settledByCaller: true,\s*onSubmissionStarted:/);
+	assert.match(source, /startSettling\(pi, state, lease, recordEntry \?/);
+	assert.match(source, /retainReplSubmissionUntilSettled\(pi, submissionState, null\)/);
 	assert.match(source, /await lease\.release\(\)\.catch/);
 });
 
@@ -36,7 +38,7 @@ test("repl_send uses compact private request-unique control files and cleans the
 	assert.match(source, /getReplControlExtension\(runtime\)/);
 	assert.match(source, /cleanupPreparedReplControlFiles\(state\.prepared\)/);
 	assert.match(source, /cleanupPrivateReplControlFiles\(prepared\?\.controlPaths\)/);
-	assert.match(source, /retainReplSubmissionUntilSettled\(pi, submissionState, lease\)/);
+	assert.match(source, /if \(!settling\) \{\s*cleanupPreparedReplControlFiles\(submissionStateRef\.current\?\.prepared\)/);
 	assert.doesNotMatch(source, /sourceFile: join\(REPL_CONTROL_ROOT, "pr\.py"\)/);
 });
 

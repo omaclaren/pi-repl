@@ -19,6 +19,7 @@ import {
 	REPL_SESSION_RECORD_VERSION,
 	REPL_SESSION_RECORD_VERSION_OPTION,
 	acquireReplSessionSendLease,
+	readReplSessionSendLease,
 	createReplSessionRecordId,
 	ensureReplSessionRecord,
 	getReplSessionRecordPath,
@@ -1113,6 +1114,7 @@ function formatSessionInfo(info: SessionInfo, pi?: ExtensionAPI): string {
 		...(latestRecordEntry ? [`Latest clean entry: ${latestRecordEntry.origin} · ${latestRecordEntry.label} · ${latestRecordEntry.status}`] : []),
 		...(info.recordWarning ? [`Shared record warning: ${info.recordWarning}`] : []),
 		...(info.historyPath ? [`Raw history log: ${info.historyPath}`] : []),
+		...[formatSendLease(info)].filter((line): line is string => Boolean(line)),
 		"",
 		formatAttachInstructions(info.sessionName, pi),
 	];
@@ -1128,6 +1130,22 @@ function formatSessionInfo(info: SessionInfo, pi?: ExtensionAPI): string {
 async function formatSessionStatus(pi: ExtensionAPI, info: SessionInfo, cwd: string): Promise<string> {
 	const preview = await previewPaneActivity(pi, info, cwd);
 	return preview ? `${formatSessionInfo(info, pi)}\n\n${preview}` : formatSessionInfo(info, pi);
+}
+
+/** Which send holds the session, if one does: a send still settling holds it until its code finishes. */
+function formatSendLease(info: SessionInfo): string | undefined {
+	if (!info.recordId) return undefined;
+	let lease: ReturnType<typeof readReplSessionSendLease>;
+	try {
+		lease = readReplSessionSendLease(info.recordId);
+	} catch {
+		return undefined;
+	}
+	if (!lease) return undefined;
+	const holder = `${lease.owner}${lease.pid ? ` (process ${lease.pid})` : ""}`;
+	const since = lease.createdAt ? ` since ${new Date(lease.createdAt).toISOString()}` : "";
+	if (lease.stale) return `Send lease: taken by ${holder}${since}, not renewed for ${Math.round((Date.now() - lease.renewedAt) / 1000)} s; the next send will treat it as abandoned.`;
+	return `Send lease: held by ${holder}${since}. Other sends wait until it is released; a send whose code is still running holds it until the code finishes.`;
 }
 
 function getSessionDisplayName(selector: SessionSelector, info?: SessionInfo | null): string {
@@ -1259,6 +1277,8 @@ type ReplSubmissionState = {
 	sessionTarget: string;
 	// The pane the code was pasted into, and whose output is its own.
 	paneTarget: string;
+	// The tmux server's process: after a server restart, session IDs and creation seconds can repeat.
+	tmuxServerPid?: string;
 	tmuxSessionId: string;
 	tmuxSessionCreatedAt: number;
 	cwd: string;
@@ -2198,6 +2218,8 @@ async function runReplCode(
 	const timeoutMs = options.waitMs ?? clampReplSendTimeout(params.timeoutMs);
 	const sessionTarget = sessionInfo.tmuxSessionId || sessionName;
 	const paneTarget = await getPaneTarget(pi, sessionTarget, ctx.cwd);
+	const server = await execTmux(pi, ["display-message", "-p", "-t", paneTarget, "#{pid}"], ctx.cwd, 3_000).catch(() => undefined);
+	const tmuxServerPid = server?.code === 0 && /^\d+$/.test(server.stdout.trim()) ? server.stdout.trim() : undefined;
 	const beforeCapture = await capturePaneOutput(pi, paneTarget, ctx.cwd);
 	const viewKey = options.forAgent ? paneViewKey(sessionInfo.tmuxSessionId, sessionInfo.tmuxSessionCreatedAt, paneTarget) : undefined;
 	const paneActivity = viewKey && paneActivityEnabled()
@@ -2215,6 +2237,7 @@ async function runReplCode(
 		sessionName,
 		sessionTarget,
 		paneTarget,
+		tmuxServerPid,
 		tmuxSessionId: sessionInfo.tmuxSessionId,
 		tmuxSessionCreatedAt: sessionInfo.tmuxSessionCreatedAt,
 		cwd: ctx.cwd,
@@ -2336,7 +2359,11 @@ function retainReplSubmissionUntilSettled(
 	})();
 }
 
-async function runRecordedReplCode(
+function runRecordedReplCode(...args: Parameters<typeof runTrackedReplCode>): ReturnType<typeof runTrackedReplCode> {
+	return trackActiveSend(runTrackedReplCode(...args));
+}
+
+async function runTrackedReplCode(
 	pi: ExtensionAPI,
 	params: ReplSendParams,
 	ctx: ExtensionContext,
@@ -2375,6 +2402,8 @@ async function runRecordedReplCode(
 	const submissionStateRef: { current: ReplSubmissionState | null } = { current: null };
 	let recordEntry: SharedReplRecordEntry | null = null;
 	let recordWarning = sessionInfo.recordWarning;
+	// Once the code is pasted and still unsettled, the lease and control files are its owner's.
+	let settling = false;
 	try {
 		try {
 			const recorded = upsertReplSessionRecordEntry(sessionInfo.recordId, identity, {
@@ -2396,6 +2425,7 @@ async function runRecordedReplCode(
 				expectedSession: identity,
 				expectedRecordId: sessionInfo.recordId,
 				submissionId,
+				settledByCaller: true,
 				onSubmissionStarted: (state) => {
 					submissionStateRef.current = state;
 				},
@@ -2425,12 +2455,22 @@ async function runRecordedReplCode(
 				},
 			};
 		} catch (error) {
+			const message = error instanceof Error ? error.message : String(error);
+			const state = submissionStateRef.current;
+			if (state && !state.runtimeEnded) {
+				// Pasted: the caller stops waiting, but the code goes on. Its owner holds the lease,
+				// and records the output when the code settles; the entry stays pending until then.
+				settling = true;
+				const completed = submissionComplete(state.prepared);
+				startSettling(pi, state, lease, recordEntry ? { recordId: sessionInfo.recordId, identity, entry: recordEntry } : undefined);
+				throw new Error(`${message}\n\n${pendingSendNotice(sessionName, { completed, recordId: sessionInfo.recordId, entryId: recordEntry?.id, recordWarning, forAgent })}`);
+			}
 			if (recordEntry) {
 				try {
 					upsertReplSessionRecordEntry(sessionInfo.recordId, identity, {
 						...recordEntry,
-						output: error instanceof Error ? error.message : String(error),
-						status: error instanceof Error && /timed out/i.test(error.message) ? "timeout" : "error",
+						output: message,
+						status: "error",
 						completedAt: Date.now(),
 					}, { origin: "pi-repl" });
 				} catch {
@@ -2440,16 +2480,8 @@ async function runRecordedReplCode(
 			throw error;
 		}
 	} finally {
-		const submissionState = submissionStateRef.current;
-		if (
-			submissionState
-			&& !submissionState.completionObserved
-			&& !submissionState.runtimeEnded
-			&& !submissionComplete(submissionState.prepared)
-		) {
-			retainReplSubmissionUntilSettled(pi, submissionState, lease);
-		} else {
-			cleanupPreparedReplControlFiles(submissionState?.prepared);
+		if (!settling) {
+			cleanupPreparedReplControlFiles(submissionStateRef.current?.prepared);
 			await lease.release().catch(() => undefined);
 		}
 	}
@@ -2461,16 +2493,19 @@ type SettleOutcome =
 	| { outcome: "captured"; output: string; cppResult?: number; recordWarning?: string }
 	| { outcome: "ended"; reason: string; recordWarning?: string };
 
-/** Whether a send's own session has verifiably ended: tmux says it is gone, or its ID now names a newer session. */
+/**
+ * Whether a send's own session has verifiably ended: tmux says it is gone, or
+ * its ID now names a newer session, or a newer tmux server, whose IDs start again.
+ */
 async function originalSessionEnded(pi: ExtensionAPI, state: ReplSubmissionState): Promise<boolean> {
 	const target = getSessionTarget(state.sessionTarget);
 	const check = await execTmux(pi, ["has-session", "-t", target], state.cwd, 3_000);
 	if (check.code === 1 && TMUX_SESSION_ABSENT.test(check.stderr)) return true;
 	if (check.code !== 0) return false;
-	const current = await execTmux(pi, ["display-message", "-p", "-t", target, "#{session_id}\t#{session_created}"], state.cwd, 3_000);
-	const [id = "", created = ""] = current.stdout.trim().split("\t");
-	if (current.code !== 0 || !/^\$\d+$/.test(id) || !/^\d+$/.test(created)) return false;
-	return id !== state.tmuxSessionId || Number(created) !== state.tmuxSessionCreatedAt;
+	const current = await execTmux(pi, ["display-message", "-p", "-t", target, "#{session_id}\t#{session_created}\t#{pid}"], state.cwd, 3_000);
+	const [id = "", created = "", serverPid = ""] = current.stdout.trim().split("\t");
+	if (current.code !== 0 || !/^\$\d+$/.test(id) || !/^\d+$/.test(created) || !/^\d+$/.test(serverPid)) return false;
+	return id !== state.tmuxSessionId || Number(created) !== state.tmuxSessionCreatedAt || (state.tmuxServerPid !== undefined && serverPid !== state.tmuxServerPid);
 }
 
 /** Sleeps, keeping the process alive: a settling send's sender waits for it. */
@@ -2488,9 +2523,11 @@ async function settleReplSubmission(
 	pi: ExtensionAPI,
 	state: ReplSubmissionState,
 	lease: Awaited<ReturnType<typeof acquireReplSessionSendLease>>,
-	record: { recordId: string; identity: ReplSessionIdentity; entry: SharedReplRecordEntry },
+	// The send's entry; without one (its first write failed) settle still holds the lease and captures.
+	record: { recordId: string; identity: ReplSessionIdentity; entry: SharedReplRecordEntry } | undefined,
 ): Promise<SettleOutcome> {
 	const updateEntry = (fields: Partial<SharedReplRecordEntry>): string | undefined => {
+		if (!record) return undefined;
 		try {
 			upsertReplSessionRecordEntry(record.recordId, record.identity, { ...record.entry, ...fields, completedAt: Date.now() }, { origin: "pi-repl" });
 			return undefined;
@@ -2506,7 +2543,7 @@ async function settleReplSubmission(
 				const cppEnded = await cppPaneEnded(pi, state);
 				if (cppEnded || await originalSessionEnded(pi, state)) {
 					if (cppEnded) state.runtimeEnded = true;
-					const reason = "the session ended before completion could be confirmed";
+					const reason = "the runtime ended before completion could be confirmed";
 					return { outcome: "ended", reason, recordWarning: updateEntry({ status: "error", output: reason }) };
 				}
 			} catch {
@@ -2519,9 +2556,9 @@ async function settleReplSubmission(
 		let output: string;
 		try {
 			// The original pane, still in the original session: never whichever pane is first now.
-			const pane = await execTmux(pi, ["display-message", "-p", "-t", state.paneTarget, "#{pane_id}\t#{session_id}\t#{session_created}"], state.cwd, 3_000);
-			const [paneId, sessionId, created] = pane.stdout.trim().split("\t");
-			if (pane.code !== 0 || paneId !== state.paneTarget || sessionId !== state.tmuxSessionId || Number(created) !== state.tmuxSessionCreatedAt) {
+			const pane = await execTmux(pi, ["display-message", "-p", "-t", state.paneTarget, "#{pane_id}\t#{session_id}\t#{session_created}\t#{pid}"], state.cwd, 3_000);
+			const [paneId, sessionId, created, serverPid] = pane.stdout.trim().split("\t");
+			if (pane.code !== 0 || paneId !== state.paneTarget || sessionId !== state.tmuxSessionId || Number(created) !== state.tmuxSessionCreatedAt || (state.tmuxServerPid !== undefined && serverPid !== state.tmuxServerPid)) {
 				throw new Error(`its pane ${state.paneTarget} is no longer in the session`);
 			}
 			const afterCapture = await capturePaneOutput(pi, state.paneTarget, state.cwd);
@@ -2537,6 +2574,58 @@ async function settleReplSubmission(
 		cleanupPreparedReplControlFiles(state.prepared);
 		await lease.release().catch(() => undefined);
 	}
+}
+
+// The sends this process is settling, so a host can wait for them before it exits, and the
+// recorded sends still inside their caller's wait, which may yet hand over to an owner.
+const settlingOwners = new Set<Promise<SettleOutcome>>();
+const activeSends = new Set<Promise<unknown>>();
+
+/** Runs a recorded send counted as active until it returns, so a drain waits for it too. */
+function trackActiveSend<T>(send: Promise<T>): Promise<T> {
+	activeSends.add(send);
+	void send.catch(() => undefined).finally(() => activeSends.delete(send));
+	return send;
+}
+
+/** Settles a send in the background, as an owner the process waits for: its timers keep the process alive. */
+function startSettling(...args: Parameters<typeof settleReplSubmission>): Promise<SettleOutcome> {
+	const owner = settleReplSubmission(...args);
+	settlingOwners.add(owner);
+	void owner.catch(() => undefined).finally(() => settlingOwners.delete(owner));
+	return owner;
+}
+
+/** How many sends this process is still waiting for or settling. */
+export function settlingSendCount(): number {
+	return settlingOwners.size + activeSends.size;
+}
+
+/**
+ * Resolves once every send this process is waiting for or settling has
+ * settled, for a host's orderly shutdown. A host should first end its callers'
+ * waits (abort them), so that their sends hand over to owners promptly.
+ */
+export async function drainSettlingSends(): Promise<void> {
+	while (settlingOwners.size || activeSends.size) await Promise.allSettled([...activeSends, ...settlingOwners]);
+}
+
+/**
+ * What a sender that stopped waiting is told: only what is known of the code,
+ * that sending it again would run it twice, and whether its output will be recorded.
+ */
+export function pendingSendNotice(sessionName: string, options: { completed: boolean; recordId: string; entryId?: string; recordWarning?: string; forAgent: boolean }): string {
+	const unrecorded = `Its output won't be recorded: this send's entry couldn't be written${options.recordWarning ? ` (${options.recordWarning})` : ""}.`;
+	const where = `(record ${options.recordId}, entry ${options.entryId})`;
+	const parts = options.completed
+		? options.entryId
+			? [`The code has finished in ${sessionName}. Don't send it again: pi-repl records its output ${where}, then releases the session.`]
+			: [`The code has finished in ${sessionName}. Don't send it again.`, unrecorded]
+		: options.entryId
+			? [`The code may still be running in ${sessionName}. Don't send it again: pi-repl keeps the session for it until it finishes or its runtime ends, then records its output ${where}; other sends wait until then.`]
+			: [`The code may still be running in ${sessionName}. Don't send it again: pi-repl keeps the session for it until it finishes or its runtime ends, and other sends wait until then.`, unrecorded];
+	if (options.forAgent && paneActivityEnabled()) parts.push("Its output will appear in the pane text reported with your next send to this session.");
+	return parts.join(" ");
 }
 
 export type SettledSendOptions = {
@@ -2635,7 +2724,7 @@ export async function sendAndSettle(pi: ExtensionAPI, ctx: ExtensionContext, opt
 		}
 		// The code was sent: wait on, holding the lease, until it settles; finished or not, settle captures it.
 		if (!submissionComplete(state.prepared)) options.onNotice?.(sessionName);
-		const settled = await settleReplSubmission(pi, state, lease, record);
+		const settled = await startSettling(pi, state, lease, record);
 		if (settled.outcome === "ended") {
 			throw new Error(`The code was sent and may have run, but ${settled.reason}, so its outcome is unknown. Nothing was retried.${settled.recordWarning ? ` The record couldn't be updated either (${settled.recordWarning}).` : ""}`);
 		}

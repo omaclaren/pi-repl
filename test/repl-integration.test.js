@@ -2279,10 +2279,10 @@ test("a settling send waits through failed inspections, and only a verified end 
 	const ending = settlingSend(f, "import time\ntime.sleep(60)", { noticeMs: 1000, onNotice: (name) => notices.push(name) });
 	await eventually(() => notices.length === 1, 10000);
 	await f.tmux("kill-session", "-t", f.sessionName);
-	await assert.rejects(ending, /^Error: The code was sent and may have run, but the session ended before completion could be confirmed, so its outcome is unknown\. Nothing was retried\.$/);
+	await assert.rejects(ending, /^Error: The code was sent and may have run, but the runtime ended before completion could be confirmed, so its outcome is unknown\. Nothing was retried\.$/);
 	const entry = readReplSessionRecord(recordId).entries.find((e) => e.code.includes("sleep(60)"));
 	assert.equal(entry.status, "error");
-	assert.equal(entry.output, "the session ended before completion could be confirmed");
+	assert.equal(entry.output, "the runtime ended before completion could be confirmed");
 	const lease = await acquireReplSessionSendLease(recordId, { owner: "test", waitMs: 0 });
 	await lease.release();
 });
@@ -2340,4 +2340,58 @@ test("a settling send that finishes just as its notice is due is still captured 
 	assert.equal(entry.output, "BOUNDARY_RESULT");
 	const lease = await acquireReplSessionSendLease(result.details.recordId, { owner: "test", waitMs: 0 });
 	await lease.release();
+});
+
+test("a tool send that outlasts its wait is settled by its owner: pending until captured, with the lease held and shown", { timeout: 60000 }, async (t) => {
+	const f = await fixture(t);
+	if (!f) return;
+	const recordId = (await f.status()).details.python.recordId;
+	await assert.rejects(f.send("import time\ntime.sleep(2.5)\nprint('TOOL_LATE')", { timeoutMs: 1000 }), (error) => {
+		assert.match(error.message, /^Timed out waiting for REPL output after 1000ms\./);
+		// Sending it again would run it twice, so the agent is told not to, and where the output will be.
+		assert.match(error.message, /\n\nThe code may still be running in pi-repl-python\. Don't send it again: pi-repl keeps the session for it until it finishes or its runtime ends, then records its output \(record \S+, entry pi-repl:tool:[^)]+\); other sends wait until then\. Its output will appear in the pane text reported with your next send to this session\.$/);
+		return true;
+	});
+	const pending = readReplSessionRecord(recordId).entries.at(-1);
+	assert.equal(pending.status, "sending");
+	assert.equal(pending.completedAt, null);
+	assert.equal(f.module.settlingSendCount(), 1);
+	assert.match((await f.status()).content[0].text, new RegExp(`^Send lease: held by ${pending.id} \\(process ${process.pid}\\) since \\S+\\. Other sends wait until it is released`, "m"));
+	await f.module.drainSettlingSends();
+	assert.equal(f.module.settlingSendCount(), 0);
+	const settled = readReplSessionRecord(recordId).entries.find((entry) => entry.id === pending.id);
+	assert.equal(settled.status, "captured");
+	assert.equal(settled.output, "TOOL_LATE");
+	assert.doesNotMatch((await f.status()).content[0].text, /^Send lease:/m);
+	const next = await f.send("print('NEXT')");
+	assert.equal(next.content[0].text.split("Output:\n")[1], "NEXT");
+	assert.match(next.content[0].text.split("Submitted code:")[0], /TOOL_LATE/);
+});
+
+test("a tool send told only what is known: finished as its wait ran out, or ended with its runtime", { timeout: 60000 }, async (t) => {
+	const f = await fixture(t);
+	if (!f) return;
+	const recordId = (await f.status()).details.python.recordId;
+	let entered = false;
+	let delayed = false;
+	f.onEnter(() => { entered = true; });
+	f.onExec(async (command, args) => {
+		if (entered && !delayed && command === "tmux" && args[0] === "capture-pane") {
+			delayed = true;
+			const stale = await f.tmux(...args);
+			await new Promise((resolve) => setTimeout(resolve, 1300));
+			return { stdout: stale, stderr: "", code: 0, killed: false };
+		}
+	});
+	await assert.rejects(f.send("import time\ntime.sleep(.5)\nprint('FINISHED_AT_TIMEOUT')", { timeoutMs: 1000 }), /\n\nThe code has finished in pi-repl-python\. Don't send it again: pi-repl records its output \(record \S+, entry pi-repl:tool:[^)]+\), then releases the session\./);
+	await f.module.drainSettlingSends();
+	f.onExec(undefined);
+	f.onEnter(undefined);
+	assert.equal(readReplSessionRecord(recordId).entries.at(-1).output, "FINISHED_AT_TIMEOUT");
+	// The runtime exits while the send is pending: the entry ends as an error, and nothing claims it ran to completion.
+	await assert.rejects(f.send("import os, time\ntime.sleep(1.5)\nos._exit(0)", { timeoutMs: 1000 }), /\n\nThe code may still be running in pi-repl-python\. Don't send it again: pi-repl keeps the session for it until it finishes or its runtime ends/);
+	await f.module.drainSettlingSends();
+	const ended = readReplSessionRecord(recordId).entries.at(-1);
+	assert.equal(ended.status, "error");
+	assert.equal(ended.output, "the runtime ended before completion could be confirmed");
 });

@@ -39,3 +39,18 @@ for (const [name, code, output] of [
 		}
 	});
 }
+
+test("a send that stopped waiting is told only what is known, not to send it again, and whether its output will be recorded", async () => {
+	const { pendingSendNotice } = await import("../index.ts");
+	const base = { recordId: "rec", entryId: "pi-repl:tool:1", forAgent: false };
+	assert.equal(pendingSendNotice("pi-repl-julia", { ...base, completed: false }),
+		"The code may still be running in pi-repl-julia. Don't send it again: pi-repl keeps the session for it until it finishes or its runtime ends, then records its output (record rec, entry pi-repl:tool:1); other sends wait until then.");
+	assert.equal(pendingSendNotice("pi-repl-julia", { ...base, completed: true }),
+		"The code has finished in pi-repl-julia. Don't send it again: pi-repl records its output (record rec, entry pi-repl:tool:1), then releases the session.");
+	// Without an entry, nothing promises a record.
+	const unrecorded = pendingSendNotice("pi-repl-julia", { ...base, entryId: undefined, recordWarning: "disk full", completed: false });
+	assert.equal(unrecorded, "The code may still be running in pi-repl-julia. Don't send it again: pi-repl keeps the session for it until it finishes or its runtime ends, and other sends wait until then. Its output won't be recorded: this send's entry couldn't be written (disk full).");
+	assert.doesNotMatch(unrecorded, /records its output/);
+	assert.equal(pendingSendNotice("pi-repl-julia", { ...base, entryId: undefined, completed: true }),
+		"The code has finished in pi-repl-julia. Don't send it again. Its output won't be recorded: this send's entry couldn't be written.");
+});

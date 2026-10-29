@@ -581,6 +581,36 @@ export async function acquireReplSessionSendLease(recordId, options = {}) {
 	};
 }
 
+/**
+ * Who holds the session's send lease, read only: the owner it was taken for,
+ * its process, when it was taken and last renewed, and whether the next send
+ * would treat it as abandoned. Null when no send holds it.
+ */
+export function readReplSessionSendLease(recordId, options = {}) {
+	assertRecordId(recordId);
+	const lockPath = getSendLeasePath(recordId, options);
+	let info;
+	try {
+		info = lstatSync(lockPath);
+	} catch (error) {
+		if (error && typeof error === "object" && error.code === "ENOENT") return null;
+		throw error;
+	}
+	let owner = {};
+	try {
+		owner = JSON.parse(readFileSync(join(lockPath, "owner.json"), "utf8"));
+	} catch {
+		// Taken a moment ago, or left unreadable: its holder is unknown.
+	}
+	return {
+		owner: typeof owner.owner === "string" ? owner.owner : "unknown",
+		pid: Number.isSafeInteger(owner.pid) ? owner.pid : undefined,
+		createdAt: Number.isFinite(owner.createdAt) ? owner.createdAt : undefined,
+		renewedAt: info.mtimeMs,
+		stale: Date.now() - info.mtimeMs > SEND_LEASE_STALE_MS,
+	};
+}
+
 function markdownFence(text, language = "") {
 	const value = String(text || "").replace(/\s+$/, "");
 	let fence = "```";
