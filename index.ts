@@ -1288,6 +1288,8 @@ type ReplSubmissionState = {
 	completionObserved: boolean;
 	runtimeEnded?: boolean;
 	cppPane?: { id: string; pid: string };
+	// A send whose result the agent reads: its view of the pane as the send began, none if unseen.
+	agentView?: { key: string; atStart: PaneView | undefined };
 };
 
 function getReplControlExtension(runtime: ImplementedRuntime): string {
@@ -2222,8 +2224,9 @@ async function runReplCode(
 	const tmuxServerPid = server?.code === 0 && /^\d+$/.test(server.stdout.trim()) ? server.stdout.trim() : undefined;
 	const beforeCapture = await capturePaneOutput(pi, paneTarget, ctx.cwd);
 	const viewKey = options.forAgent ? paneViewKey(sessionInfo.tmuxSessionId, sessionInfo.tmuxSessionCreatedAt, paneTarget) : undefined;
+	const startView = viewKey ? paneViewsFor(pi).get(viewKey) : undefined;
 	const paneActivity = viewKey && paneActivityEnabled()
-		? describePaneActivity(paneActivitySince(beforeCapture, paneViewsFor(pi).get(viewKey)?.seen, (line: string) => isIdleReplPrompt(runtime, line)))
+		? describePaneActivity(paneActivitySince(beforeCapture, startView?.seen, (line: string) => isIdleReplPrompt(runtime, line)))
 		: undefined;
 	const cppPane = runtime === "cpp" ? await inspectCppPane(pi, paneTarget, ctx.cwd) : undefined;
 	if (runtime === "cpp" && (!cppPane || cppPane.dead)) throw new Error("The C++ pane is ended or cannot be inspected; no code was sent and no replacement was started.");
@@ -2246,6 +2249,7 @@ async function runReplCode(
 		prepared,
 		completionObserved: false,
 		cppPane,
+		agentView: viewKey ? { key: viewKey, atStart: startView } : undefined,
 	};
 
 	let submissionStarted = false;
@@ -2462,8 +2466,11 @@ async function runTrackedReplCode(
 				// and records the output when the code settles; the entry stays pending until then.
 				settling = true;
 				const completed = submissionComplete(state.prepared);
-				startSettling(pi, state, lease, recordEntry ? { recordId: sessionInfo.recordId, identity, entry: recordEntry } : undefined);
-				throw new Error(`${message}\n\n${pendingSendNotice(sessionName, { completed, recordId: sessionInfo.recordId, entryId: recordEntry?.id, recordWarning, forAgent })}`);
+				const settled = startSettling(pi, state, lease, recordEntry ? { recordId: sessionInfo.recordId, identity, entry: recordEntry } : undefined);
+				throw new PendingReplSendError(message, { completed, recordId: sessionInfo.recordId, entryId: recordEntry?.id, recordWarning, forAgent }, {
+					sessionName, runtime, target, timeoutMs, submittedCode: params.code, echoMode: resolveReplSubmissionEchoMode(params.echoMode),
+					recordId: sessionInfo.recordId, recordPath: sessionInfo.recordPath, recordEntryId: recordEntry?.id, recordWarning,
+				}, state, settled);
 			}
 			if (recordEntry) {
 				try {
@@ -2490,7 +2497,8 @@ async function runTrackedReplCode(
 const SETTLE_POLL_MS = 250;
 
 type SettleOutcome =
-	| { outcome: "captured"; output: string; cppResult?: number; recordWarning?: string }
+	// `capture` is the pane once the code finished, when it could be captured.
+	| { outcome: "captured"; output: string; capture?: string; cppResult?: number; recordWarning?: string }
 	| { outcome: "ended"; reason: string; recordWarning?: string };
 
 /**
@@ -2554,6 +2562,7 @@ async function settleReplSubmission(
 		state.completionObserved = true;
 		const cppResult = state.prepared.cppCompletion ? readCppCompletion(state.prepared.cppCompletion) : undefined;
 		let output: string;
+		let afterCapture: string;
 		try {
 			// The original pane, still in the original session: never whichever pane is first now.
 			const pane = await execTmux(pi, ["display-message", "-p", "-t", state.paneTarget, "#{pane_id}\t#{session_id}\t#{session_created}\t#{pid}"], state.cwd, 3_000);
@@ -2561,7 +2570,7 @@ async function settleReplSubmission(
 			if (pane.code !== 0 || paneId !== state.paneTarget || sessionId !== state.tmuxSessionId || Number(created) !== state.tmuxSessionCreatedAt || (state.tmuxServerPid !== undefined && serverPid !== state.tmuxServerPid)) {
 				throw new Error(`its pane ${state.paneTarget} is no longer in the session`);
 			}
-			const afterCapture = await capturePaneOutput(pi, state.paneTarget, state.cwd);
+			afterCapture = await capturePaneOutput(pi, state.paneTarget, state.cwd);
 			output = cleanupReplDelta(extractPaneDelta(state.beforeCapture, afterCapture), state.prepared.submissionLine, state.prepared.previewComment, state.prepared.completionLine, state.prepared.display);
 		} catch (error) {
 			const reason = `it ran, but its output couldn't be captured (${error instanceof Error ? error.message : String(error)})`;
@@ -2569,7 +2578,7 @@ async function settleReplSubmission(
 			return { outcome: "captured", output: "", cppResult, recordWarning: failed ? `${reason}, and the record couldn't be updated (${failed})` : reason };
 		}
 		const failed = updateEntry({ status: "captured", output });
-		return { outcome: "captured", output, cppResult, recordWarning: failed ? `it ran, but the record couldn't be updated (${failed})` : undefined };
+		return { outcome: "captured", output, capture: afterCapture, cppResult, recordWarning: failed ? `it ran, but the record couldn't be updated (${failed})` : undefined };
 	} finally {
 		cleanupPreparedReplControlFiles(state.prepared);
 		await lease.release().catch(() => undefined);
@@ -2614,7 +2623,7 @@ export async function drainSettlingSends(): Promise<void> {
  * What a sender that stopped waiting is told: only what is known of the code,
  * that sending it again would run it twice, and whether its output will be recorded.
  */
-export function pendingSendNotice(sessionName: string, options: { completed: boolean; recordId: string; entryId?: string; recordWarning?: string; forAgent: boolean }): string {
+export function pendingSendNotice(sessionName: string, options: PendingSendNoticeOptions): string {
 	const unrecorded = `Its output won't be recorded: this send's entry couldn't be written${options.recordWarning ? ` (${options.recordWarning})` : ""}.`;
 	const where = `(record ${options.recordId}, entry ${options.entryId})`;
 	const parts = options.completed
@@ -2626,6 +2635,40 @@ export function pendingSendNotice(sessionName: string, options: { completed: boo
 			: [`The code may still be running in ${sessionName}. Don't send it again: pi-repl keeps the session for it until it finishes or its runtime ends, and other sends wait until then.`, unrecorded];
 	if (options.forAgent && paneActivityEnabled()) parts.push("Its output will appear in the pane text reported with your next send to this session.");
 	return parts.join(" ");
+}
+
+type PendingSendNoticeOptions = { completed: boolean; recordId: string; entryId?: string; recordWarning?: string; forAgent: boolean };
+
+/**
+ * What a recorded send throws once its caller stops waiting for code it has
+ * sent: the message is what the caller is told now, and `settled` is the
+ * outcome its owner reports when the code settles, for a caller that shows it.
+ */
+class PendingReplSendError extends Error {
+	readonly reason: string;
+	readonly notice: PendingSendNoticeOptions;
+	readonly details: ReplSendDetails;
+	readonly state: ReplSubmissionState;
+	readonly settled: Promise<SettleOutcome>;
+
+	constructor(reason: string, notice: PendingSendNoticeOptions, details: ReplSendDetails, state: ReplSubmissionState, settled: Promise<SettleOutcome>) {
+		super(`${reason}\n\n${pendingSendNotice(details.sessionName, notice)}`);
+		this.reason = reason;
+		this.notice = notice;
+		this.details = details;
+		this.state = state;
+		this.settled = settled;
+	}
+
+	/** The message for a person whose command shows the result when it settles, as `then` says. */
+	toldPerson(then: string): string {
+		return `${this.reason}\n\n${pendingSendNotice(this.details.sessionName, { ...this.notice, forAgent: false })} ${then}`;
+	}
+}
+
+/** What is known of code whose runtime ended before it could be seen to finish. */
+function unknownOutcome(settled: Extract<SettleOutcome, { outcome: "ended" }>): string {
+	return `The code was sent and may have run, but ${settled.reason}, so its outcome is unknown. Nothing was retried.${settled.recordWarning ? ` The record couldn't be updated either (${settled.recordWarning}).` : ""}`;
 }
 
 export type SettledSendOptions = {
@@ -2725,9 +2768,7 @@ export async function sendAndSettle(pi: ExtensionAPI, ctx: ExtensionContext, opt
 		// The code was sent: wait on, holding the lease, until it settles; finished or not, settle captures it.
 		if (!submissionComplete(state.prepared)) options.onNotice?.(sessionName);
 		const settled = await startSettling(pi, state, lease, record);
-		if (settled.outcome === "ended") {
-			throw new Error(`The code was sent and may have run, but ${settled.reason}, so its outcome is unknown. Nothing was retried.${settled.recordWarning ? ` The record couldn't be updated either (${settled.recordWarning}).` : ""}`);
-		}
+		if (settled.outcome === "ended") throw new Error(unknownOutcome(settled));
 		return { output: settled.output, details: details({ cppResult: settled.cppResult, recordWarning: settled.recordWarning, noticed: true }) };
 	}
 }
@@ -2809,7 +2850,29 @@ async function showDefaultPythonEnv(pi: ExtensionAPI, ctx: ExtensionCommandConte
 
 		notify(ctx, formatReplEnvResult(execution), "info");
 	} catch (error) {
+		if (error instanceof PendingReplSendError) {
+			notify(ctx, error.toldPerson("Its result will be shown here when it's done."), "warning");
+			void error.settled.then((settled) => showLateReplEnv(ctx, error, settled), () => undefined);
+			return;
+		}
 		notify(ctx, error instanceof Error ? error.message : String(error), "error");
+	}
+}
+
+/**
+ * /repl env's result once its code settles, after the command stopped
+ * waiting. Nothing is shown once its conversation has been replaced (Pi's
+ * context is then stale): the result is in the record.
+ */
+function showLateReplEnv(ctx: ExtensionCommandContext, pending: PendingReplSendError, settled: SettleOutcome): void {
+	const recordWarning = settled.recordWarning ?? pending.details.recordWarning;
+	const text = settled.outcome === "captured"
+		? [formatReplEnvResult({ output: settled.output, details: pending.details }), ...(recordWarning ? ["", `Shared record warning: ${recordWarning}`] : [])].join("\n")
+		: `/repl env: ${unknownOutcome(settled)}`;
+	try {
+		notify(ctx, text, settled.outcome === "captured" ? "info" : "warning");
+	} catch {
+		// Replaced conversation.
 	}
 }
 
@@ -2850,7 +2913,75 @@ async function sendReplCommand(pi: ExtensionAPI, ctx: ExtensionCommandContext, t
 		postReplCommandResult(pi, ctx, `/repl send to ${execution.details.sessionName}`, formatted.text,
 			replCommandView({ title: `/repl send · ${execution.details.sessionName}`, status: "done", tone: "muted", code, notes }, execution.output));
 	} catch (error) {
+		// Where results are messages, one for code that outlasts the wait is posted when the code settles.
+		if (error instanceof PendingReplSendError && typeof pi.sendMessage === "function") {
+			notify(ctx, error.toldPerson("Its result will be posted here when it's done."), "warning");
+			void error.settled.then((settled) => postLateReplSend(pi, ctx, code, error, settled), () => undefined);
+			return;
+		}
 		notify(ctx, error instanceof Error ? error.message : String(error), "error");
+	}
+}
+
+/**
+ * Posts a /repl send's result once its code settles, after the command
+ * stopped waiting, as the command would have. The agent's text is measured
+ * against what it has seen of the pane since: when a prompt's pane text
+ * showed part of the send while it ran, only the pane text after that is
+ * new. Nothing is posted once its conversation has been replaced
+ * (Pi's API is then stale): the result is in the record.
+ */
+function postLateReplSend(pi: ExtensionAPI, ctx: ExtensionCommandContext, code: string, pending: PendingReplSendError, settled: SettleOutcome): void {
+	const { details, state } = pending;
+	const heading = `/repl send to ${details.sessionName}, after the command stopped waiting`;
+	const title = `/repl send · ${details.sessionName}`;
+	const post = (text: string, view: ReplCommandView): boolean => {
+		try {
+			postReplCommandResult(pi, ctx, heading, text, view);
+			return true;
+		} catch {
+			return false;
+		}
+	};
+	if (settled.outcome === "ended") {
+		const what = unknownOutcome(settled);
+		post(`Submitted code:\n${code.trimEnd()}\n\n${what}`, replCommandView({ title, status: "outcome unknown", tone: "warning", code, notes: [what] }, ""));
+		return;
+	}
+	const recordWarning = settled.recordWarning ?? details.recordWarning;
+	const views = paneViewsFor(pi);
+	const agentView = state.agentView;
+	const view = agentView ? views.get(agentView.key) : undefined;
+	const idle = (line: string) => isIdleReplPrompt(state.runtime, line);
+	let output = settled.output;
+	let paneActivity: string | undefined;
+	if (agentView && paneActivityEnabled()) {
+		if (view && view !== agentView.atStart && settled.capture !== undefined) {
+			const rest = describePaneActivity(paneActivitySince(settled.capture, view.seen, idle), { when: "late" });
+			output = rest
+				? `[Pane text reported at the start of a prompt while it ran showed part of this send, so here is the pane text since.]\n${rest}`
+				: "[Pane text reported at the start of a prompt while it ran already showed all of this send.]";
+		} else {
+			paneActivity = describePaneActivity(paneActivitySince(state.beforeCapture, view?.seen, idle));
+		}
+	}
+	const formatted = formatReplSendResult(output, { ...details, paneActivity, cppResult: settled.cppResult, recordWarning });
+	const notes = [
+		...(formatted.details.fullOutputPath ? [`The full output is in ${formatted.details.fullOutputPath}.`] : []),
+		...(recordWarning ? [`Shared record warning: ${recordWarning}`] : []),
+	];
+	if (!post(formatted.text, replCommandView({ title, status: "done, after the wait", tone: "muted", code, notes }, settled.output))) return;
+	// The agent is told this send's result, so the pane up to its end is seen.
+	if (agentView && settled.capture !== undefined) {
+		views.set(agentView.key, {
+			seen: observePane(settled.capture, state.prepared.submissionLine),
+			sessionName: details.sessionName,
+			runtime: state.runtime,
+			tmuxSessionId: state.tmuxSessionId,
+			tmuxSessionCreatedAt: state.tmuxSessionCreatedAt,
+			paneId: state.paneTarget,
+			usedAt: Date.now(),
+		});
 	}
 }
 

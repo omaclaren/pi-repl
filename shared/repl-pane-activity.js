@@ -112,12 +112,14 @@ const WHEN = {
 	send: ", before this submission",
 	prompt: ", before this prompt",
 	preview: " (a preview; it is still reported later)",
+	late: ", up to the end of this submission",
 };
 
 /**
  * The report, or undefined if there is nothing new. when says where it
- * appears: in a send's result, at the start of a prompt, or as a preview in
- * repl_status, which does not mark it seen.
+ * appears: in a send's result, at the start of a prompt, as a preview in
+ * repl_status, which does not mark it seen, or in a send's late result, as
+ * the pane text since a prompt reported part of that send.
  */
 export function describePaneActivity(activity, { when = "send" } = {}) {
 	if (activity.lines.length === 0) return EMPTY_NOTES[activity.status];
