@@ -5,10 +5,10 @@ All notable changes to `pi-repl` are documented here.
 ## [Unreleased]
 
 ### Changed
-- When Pi's `/repl send` outlasts its wait, its result is posted into the conversation when the code finishes, as an on-time result is (it starts no turn), and `/repl env` shows its result as a notice then. The notice when the command stops waiting is now a warning, worded for the person, and says the result will follow. The agent's text leaves out pane text that the start of a prompt already showed it while the code ran. A result that arrives while a prompt's pane text is prepared waits, up to 10 seconds, for that run to start, so the two don't overlap. Nothing is posted into a conversation that has been replaced; the result is in the record. Hosts without messages keep the error notice.
+- When Pi's `/repl send` outlasts its wait, its result is posted into the conversation when the code finishes, as an on-time result is (it starts no turn), and `/repl env` shows its result as a notice then. The notice when the command stops waiting is now a warning, worded for the person, and says the result will follow. The agent's text leaves out pane text that the start of a prompt already showed it while the code ran. A result that arrives while a prompt's pane text is prepared waits, up to 10 seconds, for that run to start, so the two don't overlap. If a later send or prompt told the agent the pane text meanwhile, the result says the output was already shown, and keeps that newer view. Nothing is posted into a conversation that has been replaced; the result is in the record. Hosts without messages keep the error notice.
 
 ### Fixed
-- The start of an agent's run no longer puts back its older view of a pane when a send advanced that view while the prompt was prepared; that send's output was then reported again.
+- The start of an agent's run no longer puts back its older view of a pane when a send advanced that view while the prompt was prepared; that send's output was then reported again. Each view now records when its capture began, and only a later capture replaces it.
 
 ## [0.11.3] — 2026-10-30
 

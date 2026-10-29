@@ -783,6 +783,8 @@ type PaneView = {
 	tmuxSessionCreatedAt: number;
 	paneId: string;
 	usedAt: number;
+	// When the capture it comes from began (performance.now()): a view from a later capture is newer.
+	capturedAt: number;
 };
 const paneViewsByHost = new WeakMap<object, Map<string, PaneView>>();
 
@@ -835,9 +837,9 @@ const PROMPT_START_NOTES_CHARS = 600;
  * first, within one size budget and one deadline. A pane that can't be
  * checked is named, not forgotten; only one tmux says is gone, or that now
  * belongs to another session, is dropped. Returns the views to adopt once the
- * message is part of the run, each with the view it advances.
+ * message is part of the run.
  */
-async function preparePromptStartPaneActivity(pi: ExtensionAPI, cwd: string): Promise<{ message?: { customType: string; content: string; display: boolean }; views: Array<[string, PaneView, PaneView]> } | undefined> {
+async function preparePromptStartPaneActivity(pi: ExtensionAPI, cwd: string): Promise<{ message?: { customType: string; content: string; display: boolean }; views: Array<[string, PaneView]> } | undefined> {
 	if (paneActivityMode() !== "on") return undefined;
 	const views = paneViewsFor(pi);
 	if (views.size === 0) return undefined;
@@ -846,7 +848,7 @@ async function preparePromptStartPaneActivity(pi: ExtensionAPI, cwd: string): Pr
 	const sections: string[] = [];
 	const tooLong: string[] = [];
 	const unchecked: string[] = [];
-	const advanced: Array<[string, PaneView, PaneView]> = [];
+	const advanced: Array<[string, PaneView]> = [];
 	let budget = PROMPT_START_MAX_CHARS - PROMPT_START_INTRO.length - PROMPT_START_NOTES_CHARS;
 	for (const [key, view] of [...views.entries()].sort((a, b) => b[1].usedAt - a[1].usedAt)) {
 		if (budget < 200) {
@@ -872,6 +874,7 @@ async function preparePromptStartPaneActivity(pi: ExtensionAPI, cwd: string): Pr
 			continue;
 		}
 		let capture: string;
+		const capturedAt = performance.now();
 		try {
 			capture = await capturePaneOutput(pi, view.paneId, cwd, Math.max(1, timeLeft()));
 		} catch {
@@ -887,7 +890,7 @@ async function preparePromptStartPaneActivity(pi: ExtensionAPI, cwd: string): Pr
 		}
 		budget -= section.length + 2;
 		sections.push(section);
-		advanced.push([key, { ...view, seen: advancePaneView(capture, view.seen) }, view]);
+		advanced.push([key, { ...view, seen: advancePaneView(capture, view.seen), capturedAt }]);
 	}
 	if (sections.length === 0 && tooLong.length === 0 && unchecked.length === 0) return undefined;
 	const later = "The next send to each, or repl_status, shows its text.";
@@ -2296,6 +2299,7 @@ async function runReplCode(
 			{ beforeCapture, prepared, state: submissionState },
 		);
 		submissionState.completionObserved = true;
+		const capturedAt = performance.now();
 		const afterCapture = await capturePaneOutput(pi, paneTarget, ctx.cwd);
 		// The agent sees this send's result, so the pane up to here is seen.
 		if (viewKey) {
@@ -2307,6 +2311,7 @@ async function runReplCode(
 				tmuxSessionCreatedAt: sessionInfo.tmuxSessionCreatedAt,
 				paneId: paneTarget,
 				usedAt: Date.now(),
+				capturedAt,
 			});
 		}
 		const cppResult = prepared.cppCompletion ? readCppCompletion(prepared.cppCompletion) : undefined;
@@ -2523,8 +2528,8 @@ async function runTrackedReplCode(
 const SETTLE_POLL_MS = 250;
 
 type SettleOutcome =
-	// `capture` is the pane once the code finished, when it could be captured.
-	| { outcome: "captured"; output: string; capture?: string; cppResult?: number; recordWarning?: string }
+	// `capture` is the pane once the code finished, and when that capture began, when it could be captured.
+	| { outcome: "captured"; output: string; capture?: { pane: string; capturedAt: number }; cppResult?: number; recordWarning?: string }
 	| { outcome: "ended"; reason: string; recordWarning?: string };
 
 /**
@@ -2589,6 +2594,7 @@ async function settleReplSubmission(
 		const cppResult = state.prepared.cppCompletion ? readCppCompletion(state.prepared.cppCompletion) : undefined;
 		let output: string;
 		let afterCapture: string;
+		let capturedAt: number;
 		try {
 			// The original pane, still in the original session: never whichever pane is first now.
 			const pane = await execTmux(pi, ["display-message", "-p", "-t", state.paneTarget, "#{pane_id}\t#{session_id}\t#{session_created}\t#{pid}"], state.cwd, 3_000);
@@ -2596,6 +2602,7 @@ async function settleReplSubmission(
 			if (pane.code !== 0 || paneId !== state.paneTarget || sessionId !== state.tmuxSessionId || Number(created) !== state.tmuxSessionCreatedAt || (state.tmuxServerPid !== undefined && serverPid !== state.tmuxServerPid)) {
 				throw new Error(`its pane ${state.paneTarget} is no longer in the session`);
 			}
+			capturedAt = performance.now();
 			afterCapture = await capturePaneOutput(pi, state.paneTarget, state.cwd);
 			output = cleanupReplDelta(extractPaneDelta(state.beforeCapture, afterCapture), state.prepared.submissionLine, state.prepared.previewComment, state.prepared.completionLine, state.prepared.display);
 		} catch (error) {
@@ -2604,7 +2611,7 @@ async function settleReplSubmission(
 			return { outcome: "captured", output: "", cppResult, recordWarning: failed ? `${reason}, and the record couldn't be updated (${failed})` : reason };
 		}
 		const failed = updateEntry({ status: "captured", output });
-		return { outcome: "captured", output, capture: afterCapture, cppResult, recordWarning: failed ? `it ran, but the record couldn't be updated (${failed})` : undefined };
+		return { outcome: "captured", output, capture: { pane: afterCapture, capturedAt }, cppResult, recordWarning: failed ? `it ran, but the record couldn't be updated (${failed})` : undefined };
 	} finally {
 		cleanupPreparedReplControlFiles(state.prepared);
 		await lease.release().catch(() => undefined);
@@ -2967,7 +2974,9 @@ async function sendReplCommand(pi: ExtensionAPI, ctx: ExtensionCommandContext, t
  * stopped waiting, as the command would have. The agent's text is measured
  * against what it has seen of the pane since: when a prompt's pane text
  * showed part of the send while it ran, only the pane text after that is
- * new. Nothing is posted once its conversation has been replaced
+ * new; when the agent was told a later capture of the pane while this result
+ * waited, it has had all of it, and that newer view stays. Nothing is posted
+ * once its conversation has been replaced
  * (Pi's API is then stale): the result is in the record.
  */
 function postLateReplSend(pi: ExtensionAPI, ctx: ExtensionCommandContext, code: string, pending: PendingReplSendError, settled: SettleOutcome): void {
@@ -2991,12 +3000,17 @@ function postLateReplSend(pi: ExtensionAPI, ctx: ExtensionCommandContext, code: 
 	const views = paneViewsFor(pi);
 	const agentView = state.agentView;
 	const view = agentView ? views.get(agentView.key) : undefined;
+	const capture = settled.capture;
+	// The agent was told a later capture (a later send's or prompt's pane text, while this result waited).
+	const newer = Boolean(view && capture && view.capturedAt > capture.capturedAt);
 	const idle = (line: string) => isIdleReplPrompt(state.runtime, line);
 	let output = settled.output;
 	let paneActivity: string | undefined;
 	if (agentView && paneActivityEnabled()) {
-		if (view && view !== agentView.atStart && settled.capture !== undefined) {
-			const rest = describePaneActivity(paneActivitySince(settled.capture, view.seen, idle), { when: "late" });
+		if (newer) {
+			output = "[Pane text reported after it finished already showed this send's output.]";
+		} else if (view && view !== agentView.atStart && capture) {
+			const rest = describePaneActivity(paneActivitySince(capture.pane, view.seen, idle), { when: "late" });
 			output = rest
 				? `[Pane text reported at the start of a prompt while it ran showed part of this send, so here is the pane text since.]\n${rest}`
 				: "[Pane text reported at the start of a prompt while it ran already showed all of this send.]";
@@ -3010,16 +3024,17 @@ function postLateReplSend(pi: ExtensionAPI, ctx: ExtensionCommandContext, code: 
 		...(recordWarning ? [`Shared record warning: ${recordWarning}`] : []),
 	];
 	if (!post(formatted.text, replCommandView({ title, status: "done, after the wait", tone: "muted", code, notes }, settled.output))) return;
-	// The agent is told this send's result, so the pane up to its end is seen.
-	if (agentView && settled.capture !== undefined) {
+	// The agent is told this send's result, so the pane up to its end is seen; a newer view stays.
+	if (agentView && capture && !newer) {
 		views.set(agentView.key, {
-			seen: observePane(settled.capture, state.prepared.submissionLine),
+			seen: observePane(capture.pane, state.prepared.submissionLine),
 			sessionName: details.sessionName,
 			runtime: state.runtime,
 			tmuxSessionId: state.tmuxSessionId,
 			tmuxSessionCreatedAt: state.tmuxSessionCreatedAt,
 			paneId: state.paneTarget,
 			usedAt: Date.now(),
+			capturedAt: capture.capturedAt,
 		});
 	}
 }
@@ -3194,14 +3209,17 @@ async function startDefaultReplSession(
 		// without the startup banner. Nothing is changed in tmux.
 		try {
 			const paneId = await getPaneTarget(pi, info.tmuxSessionId || sessionTarget, cwd);
+			const capturedAt = performance.now();
+			const capture = await capturePaneOutput(pi, paneId, cwd);
 			paneViewsFor(pi).set(paneViewKey(info.tmuxSessionId, info.tmuxSessionCreatedAt, paneId), {
-				seen: observePane(await capturePaneOutput(pi, paneId, cwd)),
+				seen: observePane(capture),
 				sessionName: info.sessionName,
 				runtime: info.runtime || runtime,
 				tmuxSessionId: info.tmuxSessionId,
 				tmuxSessionCreatedAt: info.tmuxSessionCreatedAt,
 				paneId,
 				usedAt: Date.now(),
+				capturedAt,
 			});
 		} catch {
 			// The first send then reports the pane's recent text instead.
@@ -3892,7 +3910,7 @@ export default function (pi: ExtensionAPI) {
 	// A new, resumed, branched or compacted conversation no longer holds what
 	// earlier sends showed the agent, so its views of the panes start again.
 	// Hosts without these events (agent-repl, tests) keep one conversation.
-	let pendingViews: Array<[string, PaneView, PaneView]> = [];
+	let pendingViews: Array<[string, PaneView]> = [];
 	const forgetPaneViews = () => {
 		paneViewsFor(pi).clear();
 		pendingViews = [];
@@ -3919,8 +3937,11 @@ export default function (pi: ExtensionAPI) {
 		});
 		pi.on("agent_start", () => {
 			const views = paneViewsFor(pi);
-			// A view something else advanced meanwhile is newer, and stays.
-			for (const [key, view, from] of pendingViews) if (views.get(key) === from) views.set(key, view);
+			for (const [key, view] of pendingViews) {
+				// A view from a later capture, told meanwhile, stays.
+				const current = views.get(key);
+				if (current && current.capturedAt < view.capturedAt) views.set(key, view);
+			}
 			pendingViews = [];
 			endPromptStart(pi);
 		});

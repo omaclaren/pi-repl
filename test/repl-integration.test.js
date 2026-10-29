@@ -2499,15 +2499,29 @@ test("a late /repl send result waits for a prompt start's run, and a result that
 	// The run's start doesn't put back the view the result advanced, so the agent isn't told it again.
 	assert.equal(paneReport(await f.send("print(3)")), undefined);
 
+	// Another send that finishes while the result waits tells the agent its output first; the
+	// result then says so, and leaves that send's newer view.
+	waits.next();
+	await f.repl("send\nimport time\ntime.sleep(1)\nprint('A_LATE')");
+	assert.ok((await f.fire("before_agent_start", { prompt: "next" })).find(Boolean)?.message);
+	await waits.settle();
+	await f.repl("send\nprint('B_ON_TIME')");
+	assert.equal(f.messages.length, 2);
+	assert.match(f.messages[1].message.content, /\nA_LATE\n[\s\S]*\nOutput:\nB_ON_TIME\n```$/);
+	await f.fire("agent_start");
+	await eventually(() => f.messages.length === 3);
+	assert.equal(f.messages[2].message.content.split("\n\nOutput:\n")[1], "[Pane text reported after it finished already showed this send's output.]\n```");
+	assert.equal(paneReport(await f.send("print(4)")), undefined);
+
 	// A prompt start dropped by a reset doesn't hold the result up.
 	waits.next();
 	await f.repl("send\nimport time\ntime.sleep(1)\nprint('AFTER_RESET')");
 	assert.ok((await f.fire("before_agent_start", { prompt: "next" })).find(Boolean)?.message);
 	await waits.settle();
-	assert.equal(f.messages.length, 1);
+	assert.equal(f.messages.length, 3);
 	await f.fire("session_compact");
-	await eventually(() => f.messages.length === 2);
-	assert.match(f.messages[1].message.content, /\nOutput:\nAFTER_RESET\n```$/);
+	await eventually(() => f.messages.length === 4);
+	assert.match(f.messages[3].message.content, /\nOutput:\nAFTER_RESET\n```$/);
 
 	// If its result can't be shown, the person is told so, and nothing is left unhandled.
 	const { default: fs } = await import("node:fs");
@@ -2523,7 +2537,7 @@ test("a late /repl send result waits for a prompt start's run, and a result that
 	await waits.settle();
 	failing.mock.restore();
 	syncBuiltinESMExports();
-	assert.equal(f.messages.length, 2);
+	assert.equal(f.messages.length, 4);
 	assert.deepEqual(f.notifications.at(-1), { level: "warning", message: "/repl send to pi-repl-python: its late result couldn't be shown (ENOSPC: no space left on device, mkdtemp)." });
 	assert.equal(readReplSessionRecord(recordId).entries.at(-1).status, "captured");
 });
