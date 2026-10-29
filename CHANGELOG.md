@@ -4,6 +4,12 @@ All notable changes to `pi-repl` are documented here.
 
 ## [Unreleased]
 
+### Changed
+- When Pi's `/repl send` outlasts its wait, its result is posted into the conversation when the code finishes, as an on-time result is (it starts no turn), and `/repl env` shows its result as a notice then. The notice when the command stops waiting is now a warning, worded for the person, and says the result will follow. The agent's text leaves out pane text that the start of a prompt already showed it while the code ran. A result that arrives while a prompt's pane text is prepared waits, up to 10 seconds, for that run to start, so the two don't overlap. Nothing is posted into a conversation that has been replaced; the result is in the record. Hosts without messages keep the error notice.
+
+### Fixed
+- The start of an agent's run no longer puts back its older view of a pane when a send advanced that view while the prompt was prepared; that send's output was then reported again.
+
 ## [0.11.3] — 2026-10-30
 
 ### Changed

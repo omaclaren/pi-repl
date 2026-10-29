@@ -2475,6 +2475,59 @@ test("/repl send that outlasts its wait posts its result when the code finishes,
 	assert.equal(renderPosted(f, ended, 80)[1].trim(), "/repl send · pi-repl-python  outcome unknown");
 });
 
+test("a late /repl send result waits for a prompt start's run, and a result that can't be shown is reported", { timeout: 60000 }, async (t) => {
+	const f = await fixture(t, { startWithTool: true });
+	if (!f) return;
+	const recordId = (await f.status()).details.python.recordId;
+	const waits = outlastingWaits(t, f);
+	assert.equal(paneReport(await f.send("pi_seen = 1")), undefined);
+	// The code finishes after a prompt's pane text is prepared, before its run starts.
+	waits.next();
+	await f.repl("send\nimport time\nprint('RACE_FIRST', flush=True)\ntime.sleep(1.5)\nprint('RACE_LAST')");
+	await paneSettles(f, /^RACE_FIRST$/m);
+	const reported = (await f.fire("before_agent_start", { prompt: "next" })).find(Boolean)?.message;
+	assert.match(reported.content, /\nRACE_FIRST\n/);
+	assert.doesNotMatch(reported.content, /^RACE_LAST$/m);
+	await waits.settle();
+	// The result waits for the run to start with that text, then tells only what followed it.
+	assert.equal(f.messages.length, 0);
+	await f.fire("agent_start");
+	await eventually(() => f.messages.length === 1);
+	const told = f.messages[0].message.content.split("\n\nOutput:\n")[1];
+	assert.match(told, /\nRACE_LAST\n/);
+	assert.doesNotMatch(told, /RACE_FIRST/);
+	// The run's start doesn't put back the view the result advanced, so the agent isn't told it again.
+	assert.equal(paneReport(await f.send("print(3)")), undefined);
+
+	// A prompt start dropped by a reset doesn't hold the result up.
+	waits.next();
+	await f.repl("send\nimport time\ntime.sleep(1)\nprint('AFTER_RESET')");
+	assert.ok((await f.fire("before_agent_start", { prompt: "next" })).find(Boolean)?.message);
+	await waits.settle();
+	assert.equal(f.messages.length, 1);
+	await f.fire("session_compact");
+	await eventually(() => f.messages.length === 2);
+	assert.match(f.messages[1].message.content, /\nOutput:\nAFTER_RESET\n```$/);
+
+	// If its result can't be shown, the person is told so, and nothing is left unhandled.
+	const { default: fs } = await import("node:fs");
+	const { syncBuiltinESMExports } = await import("node:module");
+	const mkdtemp = fs.mkdtempSync;
+	const failing = t.mock.method(fs, "mkdtempSync", (prefix, ...rest) => {
+		if (String(prefix).includes("pi-repl-output-")) throw new Error("ENOSPC: no space left on device, mkdtemp");
+		return mkdtemp(prefix, ...rest);
+	});
+	syncBuiltinESMExports();
+	waits.next();
+	await f.repl("send\nimport time\ntime.sleep(1)\nprint('\\n'.join(str(i) for i in range(2500)))");
+	await waits.settle();
+	failing.mock.restore();
+	syncBuiltinESMExports();
+	assert.equal(f.messages.length, 2);
+	assert.deepEqual(f.notifications.at(-1), { level: "warning", message: "/repl send to pi-repl-python: its late result couldn't be shown (ENOSPC: no space left on device, mkdtemp)." });
+	assert.equal(readReplSessionRecord(recordId).entries.at(-1).status, "captured");
+});
+
 test("/repl env that outlasts its wait shows its result later; a late /repl send result isn't posted into a replaced conversation, or where there are no messages", { timeout: 60000 }, async (t) => {
 	const f = await fixture(t, { startWithTool: true });
 	if (!f) return;

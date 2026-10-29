@@ -795,6 +795,32 @@ function paneViewsFor(pi: ExtensionAPI): Map<string, PaneView> {
 	return views;
 }
 
+// A prompt start whose pane text is being prepared, or is prepared, and whose
+// run hasn't started: a late send result waits for it (afterPromptStart), so
+// the two don't tell the agent the same pane text.
+const promptStartsByHost = new WeakMap<object, { started: Promise<void>; end: () => void }>();
+// A run that never starts doesn't hold a late result up for longer than this.
+const LATE_RESULT_PROMPT_WAIT_MS = 10_000;
+
+function beginPromptStart(pi: ExtensionAPI): void {
+	endPromptStart(pi);
+	let end = () => {};
+	const started = new Promise<void>((resolveStarted) => { end = resolveStarted; });
+	promptStartsByHost.set(pi, { started, end });
+}
+
+function endPromptStart(pi: ExtensionAPI): void {
+	promptStartsByHost.get(pi)?.end();
+	promptStartsByHost.delete(pi);
+}
+
+/** Runs `deliver` now or, while a prompt start is pending, once its run starts or it is dropped, waiting no longer than the limit. */
+function afterPromptStart(pi: ExtensionAPI, deliver: () => void, deadline = Date.now() + LATE_RESULT_PROMPT_WAIT_MS): void | Promise<void> {
+	const pending = promptStartsByHost.get(pi);
+	if (!pending || Date.now() >= deadline) return deliver();
+	return Promise.race([pending.started, sleepWithoutKeepingProcessAlive(deadline - Date.now())]).then(() => afterPromptStart(pi, deliver, deadline));
+}
+
 // The message at the start of a run holds at most this many characters, and
 // its checks get this long in all, so an unrelated prompt is not held up.
 const PROMPT_START_MAX_CHARS = 6_000;
@@ -809,9 +835,9 @@ const PROMPT_START_NOTES_CHARS = 600;
  * first, within one size budget and one deadline. A pane that can't be
  * checked is named, not forgotten; only one tmux says is gone, or that now
  * belongs to another session, is dropped. Returns the views to adopt once the
- * message is part of the run.
+ * message is part of the run, each with the view it advances.
  */
-async function preparePromptStartPaneActivity(pi: ExtensionAPI, cwd: string): Promise<{ message?: { customType: string; content: string; display: boolean }; views: Array<[string, PaneView]> } | undefined> {
+async function preparePromptStartPaneActivity(pi: ExtensionAPI, cwd: string): Promise<{ message?: { customType: string; content: string; display: boolean }; views: Array<[string, PaneView, PaneView]> } | undefined> {
 	if (paneActivityMode() !== "on") return undefined;
 	const views = paneViewsFor(pi);
 	if (views.size === 0) return undefined;
@@ -820,7 +846,7 @@ async function preparePromptStartPaneActivity(pi: ExtensionAPI, cwd: string): Pr
 	const sections: string[] = [];
 	const tooLong: string[] = [];
 	const unchecked: string[] = [];
-	const advanced: Array<[string, PaneView]> = [];
+	const advanced: Array<[string, PaneView, PaneView]> = [];
 	let budget = PROMPT_START_MAX_CHARS - PROMPT_START_INTRO.length - PROMPT_START_NOTES_CHARS;
 	for (const [key, view] of [...views.entries()].sort((a, b) => b[1].usedAt - a[1].usedAt)) {
 		if (budget < 200) {
@@ -861,7 +887,7 @@ async function preparePromptStartPaneActivity(pi: ExtensionAPI, cwd: string): Pr
 		}
 		budget -= section.length + 2;
 		sections.push(section);
-		advanced.push([key, { ...view, seen: advancePaneView(capture, view.seen) }]);
+		advanced.push([key, { ...view, seen: advancePaneView(capture, view.seen) }, view]);
 	}
 	if (sections.length === 0 && tooLong.length === 0 && unchecked.length === 0) return undefined;
 	const later = "The next send to each, or repl_status, shows its text.";
@@ -2852,10 +2878,21 @@ async function showDefaultPythonEnv(pi: ExtensionAPI, ctx: ExtensionCommandConte
 	} catch (error) {
 		if (error instanceof PendingReplSendError) {
 			notify(ctx, error.toldPerson("Its result will be shown here when it's done."), "warning");
-			void error.settled.then((settled) => showLateReplEnv(ctx, error, settled), () => undefined);
+			void error.settled
+				.then((settled) => showLateReplEnv(ctx, error, settled))
+				.catch((failure) => lateResultFailed(ctx, "/repl env", failure));
 			return;
 		}
 		notify(ctx, error instanceof Error ? error.message : String(error), "error");
+	}
+}
+
+/** Tells the person, where their conversation is still there, that a late result couldn't be shown. */
+function lateResultFailed(ctx: ExtensionCommandContext, what: string, failure: unknown): void {
+	try {
+		notify(ctx, `${what}: its late result couldn't be shown (${failure instanceof Error ? failure.message : String(failure)}).`, "warning");
+	} catch {
+		// Replaced conversation.
 	}
 }
 
@@ -2916,7 +2953,9 @@ async function sendReplCommand(pi: ExtensionAPI, ctx: ExtensionCommandContext, t
 		// Where results are messages, one for code that outlasts the wait is posted when the code settles.
 		if (error instanceof PendingReplSendError && typeof pi.sendMessage === "function") {
 			notify(ctx, error.toldPerson("Its result will be posted here when it's done."), "warning");
-			void error.settled.then((settled) => postLateReplSend(pi, ctx, code, error, settled), () => undefined);
+			void error.settled
+				.then((settled) => afterPromptStart(pi, () => postLateReplSend(pi, ctx, code, error, settled)))
+				.catch((failure) => lateResultFailed(ctx, `/repl send to ${error.details.sessionName}`, failure));
 			return;
 		}
 		notify(ctx, error instanceof Error ? error.message : String(error), "error");
@@ -3853,10 +3892,11 @@ export default function (pi: ExtensionAPI) {
 	// A new, resumed, branched or compacted conversation no longer holds what
 	// earlier sends showed the agent, so its views of the panes start again.
 	// Hosts without these events (agent-repl, tests) keep one conversation.
-	let pendingViews: Array<[string, PaneView]> = [];
+	let pendingViews: Array<[string, PaneView, PaneView]> = [];
 	const forgetPaneViews = () => {
 		paneViewsFor(pi).clear();
 		pendingViews = [];
+		endPromptStart(pi);
 	};
 	pi.on?.("session_start", forgetPaneViews);
 	pi.on?.("session_tree", forgetPaneViews);
@@ -3866,15 +3906,23 @@ export default function (pi: ExtensionAPI) {
 		// Before the model plans, tell it what its panes showed since it last saw
 		// them. The views advance only once the run starts with the message, so
 		// a run that never starts reports the text again rather than losing it.
+		// Until then, a late send result waits, so it doesn't repeat this text.
 		pi.on("before_agent_start", async (_event, ctx) => {
-			const prepared = await preparePromptStartPaneActivity(pi, ctx.cwd);
+			beginPromptStart(pi);
+			const prepared = await preparePromptStartPaneActivity(pi, ctx.cwd).catch((error) => {
+				endPromptStart(pi);
+				throw error;
+			});
 			pendingViews = prepared?.views ?? [];
+			if (!prepared?.message) endPromptStart(pi);
 			return prepared?.message ? { message: prepared.message } : undefined;
 		});
 		pi.on("agent_start", () => {
 			const views = paneViewsFor(pi);
-			for (const [key, view] of pendingViews) if (views.has(key)) views.set(key, view);
+			// A view something else advanced meanwhile is newer, and stays.
+			for (const [key, view, from] of pendingViews) if (views.get(key) === from) views.set(key, view);
 			pendingViews = [];
+			endPromptStart(pi);
 		});
 	}
 	pi.registerMessageRenderer?.("pi-repl-send", renderReplCommandMessage);

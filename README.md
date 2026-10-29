@@ -158,6 +158,8 @@ end
 
 The result goes into the conversation as a message, so it stays in the scrollback and the agent sees it at its next turn, together with any pane text it hadn't seen yet. It doesn't start a turn, or a session. Pi shows you the code and the end of its output; Ctrl+O shows the rest.
 
+If the code is still running after 20 seconds, the command stops waiting and tells you so. The code goes on, and its result is posted when it finishes, marked "done, after the wait". If you start, resume or fork another conversation first, it isn't posted there; the session's record keeps it. `/repl env` likewise shows its result as a notice when its code finishes.
+
 ## Tools used by pi
 
 `pi-repl` also exposes tools that pi can use internally. In normal use, you can ask pi to start a shared REPL or run code there, or use the `/repl` commands directly.
