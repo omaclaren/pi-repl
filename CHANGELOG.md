@@ -4,6 +4,14 @@ All notable changes to `pi-repl` are documented here.
 
 ## [Unreleased]
 
+## [0.11.1] — 2026-10-29
+
+### Fixed
+- `/repl attach lfortran` no longer says that what's typed in the pane goes to the agent. Unlike the other runtimes' panes, LFortran's isn't read: the agent sees only its own cells' output.
+
+### Changed
+- `/repl send lfortran` and `/repl input`: the hint for answering a READ from Pi now comes after the result's code block, so a host such as agent-repl can reword it without changing the cell's code and output.
+
 ## [0.11.0] — 2026-10-29
 
 ### Added
