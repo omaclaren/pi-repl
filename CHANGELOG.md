@@ -4,8 +4,11 @@ All notable changes to `pi-repl` are documented here.
 
 ## [Unreleased]
 
+## [0.11.0] — 2026-10-29
+
 ### Added
-- `/repl send [runtime]` runs your own code, on the lines below it, in a running session, as `repl_send` runs the agent's. The result goes into the conversation as a message, which the agent sees at its next turn with any pane text it hadn't seen; it starts no turn.
+- Experimental LFortran (Fortran) sessions, which need LFortran's `main` branch. `/repl lfortran`, or `repl_start` with `runtime: "lfortran"`, starts `pi-repl-lfortran`: you work at LFortran's own prompt (`lfortran --connect`), and pi's cells go to the same kernel through a helper that holds pi-repl's Jupyter connection, so both share one set of variables. `repl_send`, `repl_status`, `/repl send`, `/repl status`, `/repl attach` and `/repl stop` take `lfortran`. A READ in one of pi's cells is answered with the new `repl_input` tool, or with `/repl input <text>`. There's no clean record or export for it yet; the README lists what else it doesn't do yet.
+- `/repl send [runtime]` runs your own code, on the lines below it, in a running session, as `repl_send` runs the agent's. The result goes into the conversation as a message, which the agent sees at its next turn with any pane text it hadn't seen; it starts no turn. Pi shows the code and the end of the output, and Ctrl+O shows the rest.
 
 ## [0.10.5] — 2026-10-21
 

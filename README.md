@@ -2,7 +2,7 @@
 
 Minimal [pi](https://github.com/badlogic/pi-mono) extension for collaborative REPL sessions using tmux.
 
-`pi-repl` starts a shared Python, IPython, Julia, R, Haskell (GHCi), Clojure, Ruby (irb), Java (JShell), Octave, MATLAB, gnuplot, or C++ REPL in tmux that you can attach to from another terminal window. You can work in the REPL directly, or ask pi to send and execute code there.
+`pi-repl` starts a shared Python, IPython, Julia, R, Haskell (GHCi), Clojure, Ruby (irb), Java (JShell), Octave, MATLAB, gnuplot, C++ or Fortran (LFortran) REPL in tmux that you can attach to from another terminal window. You can work in the REPL directly, or ask pi to send and execute code there.
 
 <picture>
   <source media="(prefers-color-scheme: dark)" srcset="./shared-julia-repl-dark.png">
@@ -13,7 +13,7 @@ Minimal [pi](https://github.com/badlogic/pi-mono) extension for collaborative RE
 
 ## Current scope
 
-Currently, `pi-repl` supports **Python/IPython**, **Julia**, **R**, **Haskell (GHCi)**, **Clojure**, **Ruby (irb)**, **Java (JShell)**, **Octave**, **MATLAB**, **gnuplot**, and experimental **C++ (Cling)**.
+Currently, `pi-repl` supports **Python/IPython**, **Julia**, **R**, **Haskell (GHCi)**, **Clojure**, **Ruby (irb)**, **Java (JShell)**, **Octave**, **MATLAB**, **gnuplot**, and experimental **C++ (Cling)** and **Fortran (LFortran)**.
 
 With `pi-repl` you can:
 
@@ -24,6 +24,7 @@ With `pi-repl` you can:
 - start, attach to, inspect, and stop a shared R REPL
 - start, attach to, inspect, and stop a shared Haskell (GHCi) REPL
 - start, attach to, inspect, and stop a shared Clojure, Ruby, Java, Octave, MATLAB, gnuplot, or C++ REPL
+- share an LFortran session with pi, with you at LFortran's own prompt (experimental; needs LFortran `main`)
 - let pi read the raw shared REPL transcript for extra context when needed
 - tell pi what was typed in the shared REPL since it last saw it, when a run starts and with its next send
 - keep a bounded clean record of compatible-client submissions and captured output, synchronized automatically with a compatible `pi-studio` using the same tmux session
@@ -69,6 +70,7 @@ Restart pi after installing.
 | `/repl matlab` | Start the shared MATLAB terminal session |
 | `/repl gnuplot` | Start the independent shared gnuplot session |
 | `/repl cpp` | Start a Cling-based C++ REPL (experimental) |
+| `/repl lfortran` | Start the shared LFortran session (experimental; needs LFortran `main`) |
 | `/lab python` | Same as `/repl python` |
 | `/lab ipython` | Same as `/repl ipython` |
 | `/lab julia` | Same as `/repl julia` |
@@ -81,6 +83,7 @@ Restart pi after installing.
 | `/lab matlab` | Same as `/repl matlab` |
 | `/lab gnuplot` | Same as `/repl gnuplot` |
 | `/lab cpp` | Same as `/repl cpp` |
+| `/lab lfortran` | Same as `/repl lfortran` |
 | `/repl echo` | Show the current submitted-code pane-echo mode |
 | `/repl echo off` | Disable submitted-code displays and raw-history anchors for new sends |
 | `/repl echo summary` | Show short submissions in full, truncating after 20 lines or 2,000 source characters, with compact anchors (default) |
@@ -97,9 +100,11 @@ Restart pi after installing.
 | `/repl status matlab` | Show status for the shared MATLAB session |
 | `/repl status gnuplot` | Show status for the shared gnuplot session |
 | `/repl status cpp` | Show status for the shared C++ session |
+| `/repl status lfortran` | Show status for the shared LFortran session and the latest cell pi-repl sent |
 | `/repl env` | Show which interpreter and environment the shared Python/IPython REPL is using |
 | `/repl send` | Run the code on the lines below it in the shared Python/IPython session |
 | `/repl send julia` | Run the code on the lines below it in the shared Julia session (likewise for the other runtimes) |
+| `/repl input <text>` | Answer the READ that an LFortran cell from pi-repl is waiting on |
 | `/repl attach` | Show how to attach from a new terminal window |
 | `/repl attach julia` | Show how to attach to the shared Julia session |
 | `/repl attach r` | Show how to attach to the shared R session |
@@ -111,6 +116,7 @@ Restart pi after installing.
 | `/repl attach matlab` | Show how to attach to the shared MATLAB session |
 | `/repl attach gnuplot` | Show how to attach to the shared gnuplot session |
 | `/repl attach cpp` | Show how to attach to the shared C++ session |
+| `/repl attach lfortran` | Show how to attach to the shared LFortran session |
 | `/repl export` | Export the clean record when exactly one shared session is running |
 | `/repl export python` | Export the shared Python/IPython clean record as canonical Markdown |
 | `/repl export julia` | Export the shared Julia clean record as canonical Markdown |
@@ -135,6 +141,7 @@ Restart pi after installing.
 | `/repl stop matlab` | Stop the shared MATLAB session |
 | `/repl stop gnuplot` | Stop the shared gnuplot session |
 | `/repl stop cpp` | Stop the shared C++ session |
+| `/repl stop lfortran` | Stop the shared LFortran session |
 
 For R, both `/repl R` and `/repl r` work. The same applies to `/lab`, `/repl status`, `/repl attach`, `/repl export`, and `/repl stop`.
 
@@ -160,6 +167,7 @@ The result goes into the conversation as a message, so it stays in the scrollbac
 | `repl_start` | Start or reuse a shared session with an explicit runtime; wait for a normal prompt and return status/attach details |
 | `repl_status` | Inspect the state of supported shared REPL sessions |
 | `repl_send` | Execute code in a running supported shared REPL session |
+| `repl_input` | Answer the READ that an LFortran cell sent by `repl_send` is waiting on |
 
 Notes:
 
@@ -167,8 +175,8 @@ Notes:
 - while a shared REPL is running, `repl_status` exposes the versioned clean-record ID/path/count/tail and the separate raw session history path
 - pi can use the clean entries when it needs compatible-client code/output boundaries, or read the raw history for context about direct pane interaction
 - the relevant shared session must already be running and at a normal prompt before `repl_send`; it never auto-starts a missing session
-- you can ask pi naturally to run code in Python, IPython, Julia, R, Haskell, Clojure, Ruby, Java, Octave, MATLAB, gnuplot, or C++; pi chooses the tool parameters internally
-- use `target: octave`, `target: matlab`, `target: gnuplot`, or `target: cpp` for their separate sessions; they never substitute for one another
+- you can ask pi naturally to run code in Python, IPython, Julia, R, Haskell, Clojure, Ruby, Java, Octave, MATLAB, gnuplot, C++, or Fortran (LFortran); pi chooses the tool parameters internally
+- use `target: octave`, `target: matlab`, `target: gnuplot`, `target: cpp`, or `target: lfortran` for their separate sessions; they never substitute for one another
 - `repl_status` and `repl_send` accept `target: ruby` or `target: irb`, and `target: java` or `target: jshell`; use the canonical `ruby` and `java` names in `/repl` commands and `repl_start`
 - for plain Python, `print(...)` is the safest way to get values back reliably
 - in Haskell (GHCi), use normal interactive syntax such as `let` bindings or `:{ ... :}` blocks for multiline declarations
@@ -185,7 +193,7 @@ Ask, for example, “Start a shared Ruby REPL.” Pi can call:
 { "runtime": "ruby", "timeoutMs": 20000 }
 ```
 
-`repl_start` requires `runtime`: `python`, `ipython`, `julia`, `r`, `ghci`, `clojure`, `ruby`, `java`, `octave`, `matlab`, `gnuplot`, or `cpp`. It shares the `/repl` and `/lab` startup implementation: a detached tmux session, launched from Pi's working directory through your normal interactive login shell. It returns `created`/`reused`, `ready`, the requested and recorded runtimes, session status (including record/history paths), and an `attachCommand`. It does not open a terminal or attach a client automatically.
+`repl_start` requires `runtime`: `python`, `ipython`, `julia`, `r`, `ghci`, `clojure`, `ruby`, `java`, `octave`, `matlab`, `gnuplot`, `cpp`, or `lfortran`. Apart from `lfortran`, which is described [below](#lfortran-sessions-experimental), it shares the `/repl` and `/lab` startup implementation: a detached tmux session, launched from Pi's working directory through your normal interactive login shell. It returns `created`/`reused`, `ready`, the requested and recorded runtimes, session status (including record/history paths), and an `attachCommand`. It does not open a terminal or attach a client automatically.
 
 An existing session is reused without resetting variables, changing its working directory, replacing its history logger, or sending input. Python and IPython share `pi-repl-python`: requesting the other interpreter preserves the one already running and reports the difference. As with status inspection, legacy sessions can lazily acquire clean-record metadata; existing metadata is preserved.
 
@@ -218,6 +226,36 @@ Timeout and cancellation stop waiting, **not execution**. Controls and the send 
 Summary/Full previews do not truncate execution; Off suppresses optional displays. Source is limited to 16 MiB per send (oversized input is rejected, never truncated). Control/include paths support Unicode, spaces and quotes, but not control characters/line breaks/NUL, or a path containing both `"` and `>`. The existing Node executable supplies a bounded cursor query for output spacing, including Off mode; streams and destinations are not replaced.
 
 PETSc is optional, not a package dependency. The optional regression uses a matching real-double/int32 PETSc/MPI installation in one process/rank, retaining the same `Mat`, `Vec` and `KSP` objects through direct edits, compilation errors and library errors, then destroying/finalizing explicitly. Match architecture, MPI and scalar/integer configuration; multi-rank submission and collectives are untested. Do not reinitialize MPI after finalization.
+
+### LFortran sessions (experimental)
+
+`lfortran` shares one LFortran session between you and pi. It needs a build of LFortran's `main` branch with the shared session (`lfortran --connect` and `lfortran kernel --managed`), found as `lfortran` by your interactive login shell; no LFortran release has it yet. It has been tested with `main` at `edf73189fc` on ARM64 macOS.
+
+`/repl lfortran`, or `repl_start` with `runtime: "lfortran"`, starts the `pi-repl-lfortran` tmux session. Its first window is LFortran's own prompt, `lfortran --connect`, where you work. The second runs pi-repl's helper, which starts LFortran's Jupyter kernel and sends pi's cells to it over its own connection, so nothing is pasted into your prompt. Your cells and pi's run in the same kernel and share variables and procedures:
+
+```fortran
+integer :: n = 41
+print *, n + 1
+```
+
+Send complete Fortran: declarations, statements, or whole program units. The kernel runs one cell at a time, and pi-repl refuses to send a cell while one it sent is unresolved. Each result gives the cell's status from the kernel and its output. A send's timeout stops waiting, not the cell; `repl_status` with `target: "lfortran"` and the result's execution ID follows it. Your prompt shows pi's cells, marked `[other client]`, when you next press Enter there ([lfortran/lfortran#16303](https://github.com/lfortran/lfortran/issues/16303)).
+
+When one of pi's cells reaches a READ, the result says so. Pi answers it with `repl_input`, and you can answer it from Pi with `/repl input <text>`; the text is sent as given, spaces included. pi-repl doesn't write answers to its files, but they go through Pi's conversation, so don't use them for secrets.
+
+Some limits come from LFortran as it is now:
+
+- A runtime error in any cell, such as an out-of-bounds index or `error stop`, ends the session for everyone.
+- A cell's output arrives when the cell ends, not while it runs ([lfortran/lfortran#16182](https://github.com/lfortran/lfortran/issues/16182)).
+- Nothing can interrupt a running cell ([lfortran/lfortran#16183](https://github.com/lfortran/lfortran/issues/16183)). Ctrl-C at your prompt during a cell ends your prompt but not the session; `/repl status lfortran` gives the command to rejoin.
+
+And some features of the other runtimes aren't there yet:
+
+- There is no clean record, so no `/repl export lfortran`, and pi isn't told what you run at your prompt.
+- Echo modes don't apply: your prompt shows each of pi's cells in full.
+- pi-studio lists the session but doesn't send to it. Its Interrupt sends Ctrl-C to your prompt.
+- agent-repl doesn't include it yet.
+
+`/repl stop lfortran` ends your prompt, the helper and the kernel, and checks that they have exited, which discards the session's state for everyone. On macOS the check needs an existing `python3`, as gnuplot's stop does.
 
 ### Ruby and Java submissions
 
