@@ -4,6 +4,8 @@ All notable changes to `pi-repl` are documented here.
 
 ## [Unreleased]
 
+## [0.11.7] — 2026-10-30
+
 ### Added
 - Each session records which directory holds its clean record, as the tmux option `@pi_repl_record_root_key`: a hash of the directory's device and inode, not a path. A send from a terminal whose record directory is a different one, such as one with another `TMPDIR`, or has been replaced, is refused before anything is sent, rather than kept in a second record under a second lease. The key is set before a new session's record ID. For a session an older client made, it's set only by a terminal whose directory already holds that session's record. Sends check it again after waiting for the lease. A malformed key is refused and left as it is. The key applies even when the session's other record metadata can't be used, and a failed read of that metadata refuses rather than counting as none.
 - LFortran's session sets the key when its record is set up, before its record ID.
