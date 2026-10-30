@@ -260,7 +260,6 @@ And some features of the other runtimes aren't there yet:
 - Cells you run at your prompt aren't in the clean record, as typing into the other runtimes' panes isn't, and pi isn't told about them yet.
 - Echo modes don't apply: your prompt shows each of pi's cells in full.
 - pi-studio lists the session but doesn't send to it. Its Interrupt sends Ctrl-C to your prompt.
-- agent-repl doesn't include it yet.
 
 The cells sent through pi-repl, the agent's and `/repl send lfortran`'s, are in the session's clean record, as the other runtimes' sends are. Each entry is `sent` until the cell finishes, then `captured`, or `error` if its outcome couldn't be confirmed. A cell that failed keeps its output, with a last line saying so. `/repl status lfortran` shows where the record is, and `/repl export lfortran` writes it as Markdown.
 

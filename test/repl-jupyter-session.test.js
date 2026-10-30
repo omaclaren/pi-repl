@@ -8,6 +8,7 @@ import {
 	JUPYTER_OWNER_ENV, JUPYTER_SEND_PATH, LAUNCH_FILE, createSessionDir, findMarkedJupyterProcesses, personCommand, preflightLfortran, readReadyMarker,
 	readSessionIdentity, removeSessionDir, sessionDirOwnedBy, startJupyterSession, stopVerifiedJupyterSession, validSessionDir, waitForJupyterReady,
 } from "../shared/repl-jupyter-session.js";
+import { readReplSessionRecordRootKey } from "../shared/repl-session-record.js";
 import { SessionStopProcesses, readStopProcessTable } from "../shared/repl-session-stop.js";
 import { REAL_LFORTRAN, defer, lfortranFixture, sleep, until } from "./helpers/repl-test-lfortran.js";
 
@@ -494,6 +495,7 @@ test("start sets up the session's shared record last: options, then record.json 
 	const option = async (session, name) => (await f.tmux(["show-options", "-qv", "-t", session, name])).stdout.trim();
 	assert.equal(await option(started.sessionId, "@pi_repl_record_id"), named.recordId);
 	assert.equal(await option(started.sessionId, "@pi_repl_record_version"), "1");
+	assert.equal(await option(started.sessionId, "@pi_repl_record_root_key"), readReplSessionRecordRootKey({ root: named.root }), "the record-directory key names the record's directory");
 	await f.stop();
 
 	// The record's tmux option can't be set: no record.json, nothing left naming the record, and the warning is true.
@@ -505,6 +507,23 @@ test("start sets up the session's shared record last: options, then record.json 
 	assert.equal(failed.ready, true);
 	assert.deepEqual(failed.warnings, ["The session's shared record couldn't be set up (its tmux options couldn't be set), so its cells won't be recorded."]);
 	assert.equal(existsSync(join(failed.dir, "record.json")), false);
-	assert.deepEqual([await option(failed.sessionId, "@pi_repl_record_id"), await option(failed.sessionId, "@pi_repl_record_version")], ["", ""]);
+	assert.deepEqual([await option(failed.sessionId, "@pi_repl_record_id"), await option(failed.sessionId, "@pi_repl_record_version"), await option(failed.sessionId, "@pi_repl_record_root_key")], ["", "", ""]);
 	assert.equal((await runCell(failed, "print:unrecorded")).output.text, "unrecorded");
+	await f.stop();
+
+	// Another directory's key, set first: no record here, and that key is left as it is.
+	const elsewhere = "v1:ac72368a586a18c19088393573ce0307";
+	const keyedElsewhere = async (args) => {
+		if (args[0] === "set-option" && args.includes("-qo") && args.includes("@pi_repl_record_root_key")) {
+			await f.tmux(["set-option", "-t", args[args.indexOf("-t") + 1], "@pi_repl_record_root_key", elsewhere]);
+		}
+		return f.tmux(args);
+	};
+	const refused = await f.start({ tmux: keyedElsewhere });
+	defer(t, () => f.stop().catch(() => {}));
+	assert.equal(refused.ready, true);
+	assert.equal(refused.warnings.length, 1);
+	assert.match(refused.warnings[0], /^The session's shared record couldn't be set up \(pi-repl-lfortran's shared record is in a different or replaced record directory/);
+	assert.equal(existsSync(join(refused.dir, "record.json")), false);
+	assert.deepEqual([await option(refused.sessionId, "@pi_repl_record_id"), await option(refused.sessionId, "@pi_repl_record_root_key")], ["", elsewhere]);
 });

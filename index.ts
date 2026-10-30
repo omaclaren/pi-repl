@@ -16,7 +16,6 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import {
 	REPL_SESSION_RECORD_ID_OPTION,
-	REPL_SESSION_RECORD_ROOT_KEY_OPTION,
 	REPL_SESSION_RECORD_VERSION,
 	REPL_SESSION_RECORD_VERSION_OPTION,
 	acquireReplSessionSendLease,
@@ -25,6 +24,7 @@ import {
 	describeReplSessionRecordRoot,
 	readReplSessionSendLease,
 	recordEntryKey,
+	replSessionRecordRootKeyTmux,
 	createReplSessionRecordId,
 	ensureReplSessionRecord,
 	getReplSessionRecordPath,
@@ -981,26 +981,9 @@ type SessionRecordState = {
 	unverified?: boolean;
 };
 
-/**
- * tmux access to one session lifetime's record-directory key: unset is
- * undefined, and a read that fails, or finds another lifetime, rejects.
- */
+/** tmux access to one session lifetime's record-directory key. */
 function recordRootKeyTmux(pi: ExtensionAPI, identity: ReplSessionIdentity, cwd: string) {
-	return {
-		async readKey(): Promise<string | undefined> {
-			const result = await execTmux(pi, ["show-options", "-v", "-t", identity.tmuxSessionId, REPL_SESSION_RECORD_ROOT_KEY_OPTION], cwd, 3_000);
-			const lifetime = await execTmux(pi, ["display-message", "-p", "-t", identity.tmuxSessionId, "#{session_id}\t#{session_created}"], cwd, 3_000);
-			if (lifetime.code !== 0 || lifetime.stdout.trim() !== `${identity.tmuxSessionId}\t${identity.tmuxSessionCreatedAt}`) {
-				throw new Error(`${identity.sessionName} changed while its record-directory key was read.`);
-			}
-			if (result.code === 0) return result.stdout.replace(/\r?\n$/, "");
-			if (/invalid option|unknown option/i.test(result.stderr)) return undefined;
-			throw new Error(`Could not read ${identity.sessionName}'s record-directory key: ${result.stderr.trim() || `tmux exited with ${result.code}`}.`);
-		},
-		async setKeyIfAbsent(key: string): Promise<void> {
-			await execTmux(pi, ["set-option", "-qo", "-t", identity.tmuxSessionId, REPL_SESSION_RECORD_ROOT_KEY_OPTION, key], cwd, 3_000);
-		},
-	};
+	return replSessionRecordRootKeyTmux((args: string[]) => execTmux(pi, args, cwd, 3_000), identity);
 }
 
 /**

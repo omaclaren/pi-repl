@@ -713,6 +713,31 @@ export async function verifyReplSessionRecordRoot(tmux, sessionName, options = {
 	return checkStoredRootKey(await tmux.readKey(), own, sessionName, options, false);
 }
 
+/**
+ * The `tmux` that bindReplSessionRecordRoot and verifyReplSessionRecordRoot
+ * take, for one session lifetime. `run(args)` runs tmux with those arguments
+ * and resolves to { code, stdout, stderr }. An unset key is undefined; a read
+ * that fails, or finds another session lifetime, rejects.
+ */
+export function replSessionRecordRootKeyTmux(run, identity) {
+	return {
+		async readKey() {
+			const result = await run(["show-options", "-v", "-t", identity.tmuxSessionId, REPL_SESSION_RECORD_ROOT_KEY_OPTION]);
+			// A space, not a tab: tmux prints a tab as `_` without -u or a UTF-8 locale.
+			const lifetime = await run(["display-message", "-p", "-t", identity.tmuxSessionId, "#{session_id} #{session_created}"]);
+			if (lifetime.code !== 0 || lifetime.stdout.trim() !== `${identity.tmuxSessionId} ${identity.tmuxSessionCreatedAt}`) {
+				throw new Error(`${identity.sessionName} changed while its record-directory key was read.`);
+			}
+			if (result.code === 0) return result.stdout.replace(/\r?\n$/, "");
+			if (/invalid option|unknown option/i.test(result.stderr)) return undefined;
+			throw new Error(`Could not read ${identity.sessionName}'s record-directory key: ${result.stderr.trim() || `tmux exited with ${result.code}`}.`);
+		},
+		async setKeyIfAbsent(key) {
+			await run(["set-option", "-qo", "-t", identity.tmuxSessionId, REPL_SESSION_RECORD_ROOT_KEY_OPTION, key]);
+		},
+	};
+}
+
 function checkStoredRootKey(stored, own, sessionName, options, adopted) {
 	if (stored === undefined) return { ok: false, reason: describeReplSessionRecordRoot("missing", sessionName, options) };
 	if (!isValidReplSessionRecordRootKey(stored)) return { ok: false, reason: describeReplSessionRecordRoot("malformed", sessionName, options) };
