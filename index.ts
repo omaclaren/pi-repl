@@ -47,6 +47,10 @@ import { buildGnuplotSubmissionLine, buildGnuplotGuardSource, buildGnuplotDriver
 import { cppInclude, buildCppDriverSource, buildCppRequest, createCppControlCleanup, prepareCppSubmission, readCppCompletion } from "./shared/repl-cpp.js";
 import { GNUPLOT_OWNER_ENV, GNUPLOT_OWNER_OPTION } from "./shared/repl-gnuplot-processes.js";
 import { LFORTRAN_GUIDELINES, answerLfortranInput, lfortranStatus, sendLfortranCode, startLfortranRuntime, stopLfortranSession } from "./shared/repl-lfortran.js";
+import { clearPersonName, formatPersonNameStatus, personRequestId, resolvePersonName, savePersonName } from "./shared/repl-person.js";
+
+// For a host's own person commands, such as agent-repl's `name`, `send` and `env`.
+export { clearPersonName, formatPersonNameStatus, personRequestId, resolvePersonName, savePersonName };
 
 const SUPPORTED_RUNTIMES = ["julia", "python", "ipython", "r", "ghci", "clojure", "clj", "ruby", "java", "octave", "matlab", "gnuplot", "cpp", "bun"] as const;
 const DEFAULT_PYTHON_SESSION = "pi-repl-python";
@@ -226,6 +230,7 @@ type ReplSendParams = { code: string; target?: string; timeoutMs?: number; echoM
 type ReplCommand =
 	| { action: "help" }
 	| { action: "echo"; mode?: ReplSubmissionEchoMode }
+	| { action: "name"; name?: string; clear?: boolean }
 	| { action: "status"; runtime?: ManagedRuntime }
 	| { action: "env"; runtime?: ManagedRuntime }
 	| { action: "stop"; runtime?: ManagedRuntime }
@@ -457,6 +462,7 @@ function formatUsage(): string {
 		"  /repl input <text>",
 		"  /repl send [runtime], with the code on the lines below it",
 		"  /repl echo [off|summary|full]",
+		"  /repl name [your name|--clear]",
 		"  /repl status [python|julia|r|ghci|clojure|ruby|java|octave|matlab|gnuplot|cpp]",
 		"  /repl env [python]",
 		"  /repl attach [python|julia|r|ghci|clojure|ruby|java|octave|matlab|gnuplot|cpp]",
@@ -488,6 +494,7 @@ function formatUsage(): string {
 		"  - /repl echo controls the bounded submitted-code display in the raw pane; PI_REPL_ECHO_MODE sets the startup default",
 		"  - /repl export writes the selected session's canonical clean record as Markdown",
 		"  - /repl env inspects the shared Python/IPython session",
+		"  - /repl name shows or sets the name your /repl send and /repl env are recorded under, shared by everyone on this account; PI_REPL_USER_NAME overrides it",
 		"  - the repl_send tool can execute code in any supported shared session",
 		"",
 		"Examples:",
@@ -545,6 +552,14 @@ function parseReplCommand(args: string): ReplCommand {
 	if (firstLower === "lfortran" && rest.length === 0) return { action: "lfortran", command: "start" };
 	if ((firstLower === "status" || firstLower === "stop" || firstLower === "attach") && rest.length === 1 && rest[0].toLowerCase() === "lfortran") {
 		return { action: "lfortran", command: firstLower };
+	}
+
+	if (firstLower === "name") {
+		// Everything after "name" is the name, spaces included.
+		const value = /^\s*name(?:\s+([\s\S]*))?$/i.exec(args)?.[1]?.trim() ?? "";
+		if (!value) return { action: "name" };
+		if (value === "--clear") return { action: "name", clear: true };
+		return { action: "name", name: value };
 	}
 
 	if (firstLower === "echo") {
@@ -2870,6 +2885,7 @@ export function buildReplEnvInspectionCode(): string {
 
 async function showDefaultPythonEnv(pi: ExtensionAPI, ctx: ExtensionCommandContext): Promise<void> {
 	try {
+		const person = personSending(ctx);
 		const execution = await runRecordedReplCode(
 			pi,
 			{
@@ -2878,7 +2894,7 @@ async function showDefaultPythonEnv(pi: ExtensionAPI, ctx: ExtensionCommandConte
 			},
 			ctx,
 			undefined,
-			{ requestId: `command:env:${Date.now().toString(36)}`, label: "/repl env", mode: "raw" },
+			{ requestId: personRequestId("pi", "env"), label: person.name, mode: "raw" },
 		);
 
 		notify(ctx, formatReplEnvResult(execution), "info");
@@ -2920,6 +2936,36 @@ function showLateReplEnv(ctx: ExtensionCommandContext, pending: PendingReplSendE
 	}
 }
 
+/** The person a /repl send or /repl env is recorded as; a setting that can't be used is warned about. */
+function personSending(ctx: ExtensionCommandContext): ReturnType<typeof resolvePersonName> {
+	const person = resolvePersonName();
+	if (person.warning) notify(ctx, `${person.warning} This send is recorded as ${JSON.stringify(person.name)}.`, "warning");
+	return person;
+}
+
+/** /repl name: shows the name sends are recorded under, or saves or clears the account's shared one. */
+function showOrSetPersonName(ctx: ExtensionCommandContext, command: { name?: string; clear?: boolean }): void {
+	try {
+		if (command.clear) {
+			const { path, removed } = clearPersonName();
+			notify(ctx, `${removed ? `Removed the saved name from ${path}.` : `No name was saved in ${path}.`}\n${formatPersonNameStatus(resolvePersonName(), "/repl name")}`, "info");
+			return;
+		}
+		if (command.name !== undefined) {
+			const saved = savePersonName(command.name);
+			const now = resolvePersonName();
+			const hidden = now.source === "environment" && now.name !== saved.name
+				? `\nHere, PI_REPL_USER_NAME (${JSON.stringify(now.name)}) still takes precedence.`
+				: "";
+			notify(ctx, `Saved ${JSON.stringify(saved.name)} in ${saved.path}, for everyone on this account without PI_REPL_USER_NAME. Earlier entries keep the name they were recorded with.${hidden}`, "info");
+			return;
+		}
+		notify(ctx, formatPersonNameStatus(resolvePersonName(), "/repl name"), "info");
+	} catch (error) {
+		notify(ctx, error instanceof Error ? error.message : String(error), "error");
+	}
+}
+
 /** What /repl env reports from its inspection code's result. */
 export function formatReplEnvResult(execution: { output: string; details: Pick<ReplSendDetails, "runtime" | "sessionName"> }): string {
 	return [
@@ -2944,10 +2990,11 @@ async function sendReplCommand(pi: ExtensionAPI, ctx: ExtensionCommandContext, t
 			postReplCommandResult(pi, ctx, `/repl send to ${result.details.sessionName}`, lfortranCommandText(result), lfortranCommandView(`/repl send · ${result.details.sessionName}`, result, code), lfortranCommandHint(result));
 			return;
 		}
+		const person = personSending(ctx);
 		// In the conversation the agent reads this result too, so it is also told what the pane
 		// showed that it hadn't seen; as a notice it reads neither, and that pane text stays unseen.
 		const execution = await runRecordedReplCode(pi, { code, target }, ctx, undefined, {
-			requestId: `command:send:${randomUUID()}`, label: "/repl send", mode: "raw",
+			requestId: personRequestId("pi", "send"), label: person.name, mode: "raw",
 		}, typeof pi.sendMessage === "function");
 		const formatted = formatReplSendResult(execution.output, execution.details);
 		const notes = [
@@ -3758,6 +3805,11 @@ async function handleRepl(pi: ExtensionAPI, args: string, ctx: ExtensionCommandC
 			`REPL submission echo: ${replSubmissionEchoMode}. Use /repl echo off|summary|full to change it for this Pi process; set PI_REPL_ECHO_MODE to choose the startup default.${privacyNote}`,
 			replSubmissionEchoMode === "full" ? "warning" : "info",
 		);
+		return;
+	}
+
+	if (parsed.action === "name") {
+		showOrSetPersonName(ctx, parsed);
 		return;
 	}
 

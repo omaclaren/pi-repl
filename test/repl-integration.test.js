@@ -13,12 +13,15 @@ import { createTestTmux, readProcessTable } from "./helpers/repl-test-tmux.js";
 import { visibleWidth } from "@earendil-works/pi-tui";
 
 const exec = promisify(execFile);
-const originalEnv = { TMPDIR: process.env.TMPDIR, PI_REPL_CONTROL_ROOT: process.env.PI_REPL_CONTROL_ROOT, SHELL: process.env.SHELL, PI_REPL_ECHO_MODE: process.env.PI_REPL_ECHO_MODE };
+const originalEnv = { TMPDIR: process.env.TMPDIR, PI_REPL_CONTROL_ROOT: process.env.PI_REPL_CONTROL_ROOT, SHELL: process.env.SHELL, PI_REPL_ECHO_MODE: process.env.PI_REPL_ECHO_MODE, XDG_CONFIG_HOME: process.env.XDG_CONFIG_HOME, PI_REPL_USER_NAME: process.env.PI_REPL_USER_NAME };
 const root = mkdtempSync(join(tmpdir(), "pi-repl-integration-"));
 process.env.TMPDIR = root;
 process.env.PI_REPL_CONTROL_ROOT = join(root, "controls");
 process.env.SHELL = "/bin/sh";
 delete process.env.PI_REPL_ECHO_MODE;
+// The person setting is this run's own, never the account's.
+process.env.XDG_CONFIG_HOME = join(root, "config");
+delete process.env.PI_REPL_USER_NAME;
 const available = process.platform !== "win32" && spawnSync("tmux", ["-V"]).status === 0;
 const optionalRuntimes = new Set((process.env.PI_REPL_TEST_RUNTIMES || "").split(","));
 
@@ -841,7 +844,8 @@ test("/repl send runs the person's code below it and posts the result to the con
 	assert.equal(message.content, `/repl send to pi-repl-python:\n\n\`\`\`\n${PANE_HEADING}\n[pane text]\n>>> pi_typed = 5\n[end of pane text]\n\nSubmitted code:\nfor i in range(3):\n    print(i)\nprint('fin')\n\nOutput:\n0\n1\n2\nfin\n\`\`\``);
 	assert.equal(paneReport(await f.send("print(pi_typed)")), undefined, "the agent has been told");
 	const entry = readReplSessionRecord((await f.status()).details.python.recordId).entries.find((e) => e.code.includes("print('fin')"));
-	assert.equal(entry.label, "/repl send");
+	assert.equal(entry.label, "User");
+	assert.match(entry.requestId, /^pi:send:[0-9a-f-]{36}$/);
 	assert.equal(entry.mode, "raw");
 	assert.equal(entry.output, "0\n1\n2\nfin");
 	// The person sees the code and its output, as wide as the terminal at most, without the agent's text.
@@ -870,6 +874,61 @@ test("/repl send runs the person's code below it and posts the result to the con
 	await f.repl("send\nprint(pi_typed)");
 	assert.match(f.notifications.at(-1).message, /^\/repl send to pi-repl-python:[\s\S]*Output:\n6\n```$/);
 	assert.match(paneReport(await f.send("print(0)")), /\n>>> pi_typed = 6\n[\s\S]*\n6\n/);
+});
+
+test("a person's /repl send and /repl env are recorded under their name, via Pi; agent sends keep theirs", { timeout: 60000 }, async (t) => {
+	const f = await fixture(t, { startWithTool: true });
+	if (!f) return;
+	const setting = join(process.env.XDG_CONFIG_HOME, "pi-repl", "person.json");
+	t.after(() => {
+		rmSync(setting, { force: true });
+		delete process.env.PI_REPL_USER_NAME;
+	});
+	const recordId = (await f.status()).details.python.recordId;
+	const latest = () => readReplSessionRecord(recordId).entries.at(-1);
+	const said = () => f.notifications.at(-1);
+
+	await f.repl("name");
+	assert.deepEqual(said(), { level: "info", message: `Your sends are recorded as "User": no name is set.\nSet one with /repl name <name>. It's saved in ${setting}, for everyone on this account without PI_REPL_USER_NAME.` });
+	assert.equal(existsSync(setting), false, "showing the name writes nothing");
+	await f.repl("name   Sam Smith ");
+	assert.deepEqual(said(), { level: "info", message: `Saved "Sam Smith" in ${setting}, for everyone on this account without PI_REPL_USER_NAME. Earlier entries keep the name they were recorded with.` });
+	assert.equal(statSync(setting).mode & 0o777, 0o600);
+
+	await f.repl("send\nprint('NAMED')");
+	assert.deepEqual([latest().label, latest().mode, latest().origin], ["Sam Smith", "raw", "pi-repl"]);
+	assert.match(latest().requestId, /^pi:send:[0-9a-f-]{36}$/);
+	await f.repl("env");
+	assert.deepEqual([latest().label, latest().mode], ["Sam Smith", "raw"]);
+	assert.match(latest().requestId, /^pi:env:[0-9a-f-]{36}$/);
+	// An agent's send keeps the agent's label and route.
+	await f.send("print('AGENT')");
+	assert.deepEqual([latest().label, latest().mode], ["Pi", "agent"]);
+	assert.match(latest().requestId, /^tool:/);
+
+	// PI_REPL_USER_NAME overrides the saved name, which `name` still reports.
+	process.env.PI_REPL_USER_NAME = "Alex";
+	await f.repl("send\nprint('OVERRIDDEN')");
+	assert.equal(latest().label, "Alex");
+	await f.repl("name");
+	assert.equal(said().message, `Your sends are recorded as "Alex", from PI_REPL_USER_NAME.\nThe saved name, "Sam Smith" (${setting}), applies where PI_REPL_USER_NAME isn't set.`);
+	await f.repl("name Robin");
+	assert.match(said().message, /\nHere, PI_REPL_USER_NAME \("Alex"\) still takes precedence\.$/);
+	delete process.env.PI_REPL_USER_NAME;
+
+	// An invalid name is refused; a setting that can't be used is warned about, and the send is recorded as User.
+	await f.repl("name \u0007");
+	assert.deepEqual(said(), { level: "error", message: "Not saved: the name has control characters." });
+	writeFileSync(setting, "{");
+	await f.repl("send\nprint('MALFORMED')");
+	assert.equal(latest().label, "User");
+	const warning = f.notifications.filter((n) => n.level === "warning").at(-1);
+	assert.equal(warning.message, `${setting} isn't valid JSON, so it was ignored. This send is recorded as "User".`);
+	assert.equal(readFileSync(setting, "utf8"), "{", "a send never rewrites the setting");
+
+	await f.repl("name --clear");
+	assert.match(said().message, new RegExp(`^Removed the saved name from ${setting.replace(/[.*+?^${}()|[\]\\]/g, "\\$&")}\\.\\nYour sends are recorded as "User": no name is set\\.`));
+	assert.equal(existsSync(setting), false);
 });
 
 test("pane text reaches the agent at the start of a prompt, once, for panes it has used", { timeout: 60000 }, async (t) => {
@@ -2436,7 +2495,7 @@ test("/repl send that outlasts its wait posts its result when the code finishes,
 	const notice = f.notifications.at(-1);
 	assert.equal(notice.level, "warning");
 	assert.match(notice.message, /^Timed out waiting for REPL output after 20000ms\./);
-	assert.match(notice.message, /\n\nThe code may still be running in pi-repl-python\. Don't send it again: pi-repl keeps the session for it until it finishes or its runtime ends, then records its output \(record \S+, entry pi-repl:command:send:[^)]+\); other sends wait until then\. Its result will be posted here when it's done\.$/);
+	assert.match(notice.message, /\n\nThe code may still be running in pi-repl-python\. Don't send it again: pi-repl keeps the session for it until it finishes or its runtime ends, then records its output \(record \S+, entry pi-repl:pi:send:[^)]+\); other sends wait until then\. Its result will be posted here when it's done\.$/);
 	await waits.settle();
 	// When it finishes, its result is posted as the command's would have been, with the pane text the agent hadn't seen.
 	assert.equal(f.messages.length, 1);

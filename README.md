@@ -105,6 +105,8 @@ Restart pi after installing.
 | `/repl send` | Run the code on the lines below it in the shared Python/IPython session |
 | `/repl send julia` | Run the code on the lines below it in the shared Julia session (likewise for the other runtimes) |
 | `/repl input <text>` | Answer the READ that an LFortran cell from pi-repl is waiting on |
+| `/repl name` | Show the name your `/repl send` and `/repl env` are recorded under |
+| `/repl name <your name>` | Save the name for everyone on this account (`--clear` removes it) |
 | `/repl attach` | Show how to attach from a new terminal window |
 | `/repl attach julia` | Show how to attach to the shared Julia session |
 | `/repl attach r` | Show how to attach to the shared R session |
@@ -159,6 +161,8 @@ end
 The result goes into the conversation as a message, so it stays in the scrollback and the agent sees it at its next turn, together with any pane text it hadn't seen yet. It doesn't start a turn, or a session. Pi shows you the code and the end of its output; Ctrl+O shows the rest.
 
 If the code is still running after 20 seconds, the command stops waiting and tells you so. The code goes on, and its result is posted when it finishes, marked "done, after the wait". If you start, resume or fork another conversation first, it isn't posted there; the session's record keeps it. `/repl env` likewise shows its result as a notice when its code finishes.
+
+Your `/repl send` and `/repl env` are recorded under your name, so the session's record and pi-markdown-preview's REPL page show who sent them ("Oliver · via Pi"). `/repl name Oliver` saves the name in `~/.config/pi-repl/person.json` (under `$XDG_CONFIG_HOME` when that's set), where `agent-repl` finds it too. It's one setting for everyone on the machine account, and `PI_REPL_USER_NAME` overrides it for one process. Without either, sends are recorded as `User`. `/repl name` alone shows the name in use and where it comes from. Names are self-declared, so they suit people who trust each other, not auditing, and earlier entries keep the name they were recorded with.
 
 ## Tools used by pi
 

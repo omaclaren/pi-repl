@@ -53,6 +53,31 @@ The record is a bounded JSON snapshot:
 
 Each entry has a stable `id`, optional `requestId`, timestamps, session/runtime identity, `origin` (`pi-repl` or `pi-studio`), a presentation `label`, `mode` (`raw`, `literate`, or `agent`), prose, code, cleaned output, status, and skipped/truncation metadata.
 
+## People's sends
+
+These are conventions within version 1. They add no fields, so older writers keep them.
+
+**The route rule.** An entry with `mode: "agent"` came through an agent's tool. `raw` and `literate` came through a person's command or editor. The rule describes the route, not who was at the keyboard: an agent that runs `agent-repl send` through its shell takes the person's route. A mode that a writer normalised from an unknown value is evidence of neither.
+
+**A person's name and channel.** A person's send records the name the person chose as its `label`, and a `requestId` whose prefix gives the channel:
+
+| `requestId` prefix | `origin` | Written by | Channel |
+|---|---|---|---|
+| `pi:send:<uuid>`, `pi:env:<uuid>` | `pi-repl` | Pi's `/repl send` and `/repl env` | Pi |
+| `cli:send:<uuid>`, `cli:env:<uuid>` | `pi-repl` | `agent-repl send` and `agent-repl env` | terminal |
+| `studio:send:<uuid>` | `pi-studio` | Pi Studio's editor sends | Pi Studio |
+| `studio:note:<uuid>` | `pi-studio` | both of Pi Studio's note routes, assigned when the note is created | Pi Studio |
+
+The label is a chosen name only under one of these prefixes, on its matching origin. The prefix is a hint for display, not identity, authorisation or idempotency, and request IDs stay unique. Names are self-declared, so they suit collaborators who trust each other, not auditing. pi-repl's clients take the name from `PI_REPL_USER_NAME`, then the account's shared setting (`person.json` in `$XDG_CONFIG_HOME/pi-repl/`, else `~/.config/pi-repl/`), then `User`. Names are trimmed, at most 80 characters, with no control characters. Older person entries, with `command:send:` or `command:env:` and labels such as `/repl send`, keep them; records aren't rewritten.
+
+**How a reader shows an entry,** in this order:
+
+1. `mode: "agent"`: its label, the agent's name.
+2. One of the prefixes above, on its matching origin: `<label> · via <channel>`.
+3. Anything else from a person's route: `User`, with "via Pi Studio" when `origin` is `pi-studio`, and no channel otherwise. Older labels such as `/repl send`, `/repl env`, `REPL send` and Studio's descriptions of what was sent aren't names.
+
+Readers escape labels for HTML and for terminals.
+
 ## Concurrency and bounds
 
 Record updates take a short cross-process directory lock, read the latest snapshot, upsert by stable entry ID, and replace the snapshot atomically. A stale lock can be recovered. The implementation retains at most 300 entries, bounds individual prose/code/output fields, and caps the serialized record at 16 MiB by dropping the oldest entries first.

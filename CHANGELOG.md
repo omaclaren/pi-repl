@@ -4,6 +4,14 @@ All notable changes to `pi-repl` are documented here.
 
 ## [Unreleased]
 
+### Added
+- `/repl name [name|--clear]` shows, saves or removes the name a person's sends are recorded under. It's the account's shared setting, `person.json` in `$XDG_CONFIG_HOME/pi-repl/` or `~/.config/pi-repl/`, saved atomically with mode 0600 and never written on read. `PI_REPL_USER_NAME` overrides it, and without either the name is `User`. Names are trimmed, at most 80 characters, without control characters. A setting that can't be used gives a warning, and `User`.
+- `resolvePersonName`, `savePersonName`, `clearPersonName`, `formatPersonNameStatus` and `personRequestId` are exported, so a host such as agent-repl records its own person commands the same way.
+
+### Changed
+- Pi's `/repl send` and `/repl env` record the person's name as the entry's label, with request IDs `pi:send:<uuid>` and `pi:env:<uuid>` in place of `command:send:` and `command:env:`. Readers show these as "<name> · via Pi", and older entries as `User`. Agent tool sends are unchanged. LFortran's `/repl send lfortran` keeps its label for now.
+- The record protocol states the route rule (`mode: "agent"` for an agent's tool, `raw` and `literate` for a person's command or editor), the person prefixes for Pi, the terminal and Pi Studio, and how readers show who sent an entry. These are conventions within version 1, with no new fields.
+
 ## [0.11.4] — 2026-10-30
 
 ### Changed
