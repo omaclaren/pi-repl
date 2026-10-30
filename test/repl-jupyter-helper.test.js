@@ -968,6 +968,23 @@ test("the record writer writes an entry per execution in a thread of its own, an
 	assert.equal(entry("pi-repl:tool:skipped").output, "Not run: a cell before it failed, so LFortran skipped it (stop_on_error).");
 	assert.deepEqual([entry("pi-repl:tool:lost").status, entry("pi-repl:tool:lost").output], ["error", "before\n[Outcome unconfirmed: the kernel exited (signal SIGSEGV); it had started.]"]);
 	assert.equal(entry("pi-repl:tool:refused"), undefined);
+	// A failed cell's error is in its entry once, in plain text. LFortran writes it to stderr and colours its reply's copy;
+	// another kernel may publish it, or leave it to the reply alone. The reply's copy is left out only when the kept
+	// output holds all of it: not for a line that merely starts the same way, nor for an error that was cut.
+	const coloured = (evalue) => ({ status: "error", ename: "CompilerError", evalue });
+	const failedCell = (id, evalue, fields) => recordedCell({ id, recordKey: `tool:${id}`, state: "completed", status: "error", reply: coloured(evalue), settledAt: Date.now(), ...fields });
+	const lfortranError = "\x1b[0;31;1msemantic error\x1b[0;0m: Variable 'y' is not declared\r\n \x1b[0;34;1m-->\x1b[0;0m <cell 3>:1:10\r\n";
+	writer.queue(failedCell("stderr", lfortranError, { text: "semantic error: Variable 'y' is not declared\n --> <cell 3>:1:10\n\n\nNote: please report\n" }));
+	writer.queue(failedCell("published", "name 'y' is not defined", { text: "Traceback (most recent call last):\nNameError: name 'y' is not defined\n" }));
+	writer.queue(failedCell("reply-only", lfortranError, { text: "partial\n" }));
+	writer.queue(failedCell("same-start", "Error\nUndefined parameter theta\x07", { text: "Error handling enabled\n" }));
+	writer.queue(failedCell("cut", "UNIQUE_ERROR_DETAIL", { text: "partial\n", output: { text: () => "partial\n", truncated: true } }));
+	await writer.drain(5000);
+	assert.equal(entry("pi-repl:tool:stderr").output, "semantic error: Variable 'y' is not declared\n --> <cell 3>:1:10\n\n\nNote: please report\n[The cell failed: CompilerError.]");
+	assert.equal(entry("pi-repl:tool:published").output, "Traceback (most recent call last):\nNameError: name 'y' is not defined\n[The cell failed: CompilerError.]");
+	assert.equal(entry("pi-repl:tool:reply-only").output, "partial\n[The cell failed: CompilerError: semantic error: Variable 'y' is not declared\n --> <cell 3>:1:10]");
+	assert.equal(entry("pi-repl:tool:same-start").output, "Error handling enabled\n[The cell failed: CompilerError: Error\nUndefined parameter theta]");
+	assert.equal(entry("pi-repl:tool:cut").output, "partial\n[The output was cut here: more was received than the helper keeps in memory.]\n[The cell failed: CompilerError: UNIQUE_ERROR_DETAIL]");
 	assert.deepEqual(warnings, []);
 });
 

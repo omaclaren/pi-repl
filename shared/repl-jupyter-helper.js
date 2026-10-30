@@ -575,13 +575,24 @@ function displayText(data) {
 }
 
 /** The text a settled execution leaves in the shared record: what was received, and what the status alone would lose. */
+// A reply's text without the terminal colours and other control characters a kernel may give it.
+function plainReplyText(text) {
+	return typeof text === "string" ? text.replace(/\x1b\[[0-?]*[ -/]*[@-~]|\x1b[^[\r\n]?/g, "").replace(/[\x00-\x08\x0b-\x1f\x7f]/g, "").trim() : "";
+}
+
 function recordOutput(execution) {
 	const received = execution.output.text().replace(/\n$/, "");
 	const notes = [];
 	if (execution.output.truncated) notes.push("[The output was cut here: more was received than the helper keeps in memory.]");
 	if (execution.state === "completed" && execution.status === "aborted") return "Not run: a cell before it failed, so LFortran skipped it (stop_on_error).";
 	if (execution.state === "completed" && execution.status === "error") {
-		notes.push(`[The cell failed${execution.reply?.ename ? `: ${execution.reply.ename}${execution.reply.evalue ? `: ${execution.reply.evalue}` : ""}` : "."}]`);
+		// The reply's message, which LFortran colours, only if the kept output doesn't hold all of it already, as it
+		// does when LFortran writes the error to stderr or a kernel publishes it, and none of it was cut.
+		const ename = plainReplyText(execution.reply?.ename);
+		const evalue = plainReplyText(execution.reply?.evalue);
+		const squash = (text) => text.replace(/\s+/g, " ").trim();
+		const message = evalue && squash(received).includes(squash(evalue)) ? "" : evalue;
+		notes.push(`[The cell failed${ename ? `: ${ename}${message ? `: ${message}` : "."}` : "."}]`);
 	}
 	if (execution.state === "unconfirmed") {
 		const outcome = execution.outcome ?? {};

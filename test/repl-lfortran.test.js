@@ -215,8 +215,8 @@ test("the session's clean record: an entry for each cell, as the other runtimes'
 	const [hello, failed, read, person] = entries();
 	assert.match(hello.id, /^pi-repl:tool:[0-9a-f-]{36}$/);
 	assert.deepEqual([hello.origin, hello.mode, hello.label, hello.runtime, hello.sessionName, hello.status, hello.code, hello.output], ["pi-repl", "agent", "Pi", "lfortran", "pi-repl-lfortran", "captured", "print:hello", "hello"]);
-	// What it printed, and then what the status alone would lose.
-	assert.deepEqual([failed.status, failed.output], ["captured", "it failed\n[The cell failed: Error: it failed]"]);
+	// What it printed, the kernel's error among it, and then what the status alone would lose.
+	assert.deepEqual([failed.status, failed.output], ["captured", "it failed\n[The cell failed: Error.]"]);
 	assert.deepEqual([read.status, read.output], ["captured", "got 21"]);
 	assert.match(person.id, /^pi-repl:pi:send:[0-9a-f-]{36}$/);
 	assert.equal(person.requestId, person.id.slice("pi-repl:".length));
@@ -319,11 +319,15 @@ test("with LFortran: repl_start, repl_send, and a READ through repl_input", { sk
 	const reading = await f.send("integer :: n\nread *, n\nprint *, n + 1");
 	assert.match(text(reading), /Waiting for input/);
 	assert.match(text(await f.input(TOKEN.exec(text(reading))[1], "9")), /Output:\n\s*10\s*$/);
-	// LFortran's cells are in the session's clean record.
+	assert.match(text(await f.send("print *, no_such_variable")), /^Completed, with an error[\s\S]*'no_such_variable' is not declared/);
+	// LFortran's cells are in the session's clean record, a failed one's error once and in plain text.
 	const { recordPath } = (await f.status({ target: "lfortran" })).details.lfortran;
 	const entries = () => JSON.parse(readFileSync(recordPath, "utf8")).entries;
-	await until(() => entries().length === 2 && entries().every((entry) => entry.status === "captured"), { what: "two captured entries" });
+	await until(() => entries().length === 3 && entries().every((entry) => entry.status === "captured"), { what: "three captured entries" });
 	assert.match(entries()[0].output, /^\s*42\s*$/);
+	assert.match(entries()[2].output, /'no_such_variable' is not declared[\s\S]*\n\[The cell failed: CompilerError\.\]$/);
+	assert.equal(entries()[2].output.match(/is not declared/g).length, 1);
+	assert.doesNotMatch(entries()[2].output, /\x1b/);
 	const [stopped] = await f.repl("stop lfortran");
 	assert.match(stopped.message, /Stopped the shared LFortran session/);
 });
