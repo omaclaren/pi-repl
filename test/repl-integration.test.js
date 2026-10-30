@@ -2395,6 +2395,56 @@ test("a session's record directory is keyed when it starts; another directory's 
 	assert.doesNotMatch(await pane(), /AFTER_WAIT|MALFORMED_KEY|REPLACED\n/);
 });
 
+test("a failed metadata read, or metadata this version can't use, never lets another directory's terminal send", { timeout: 60000 }, async (t) => {
+	const ours = mkdtempSync(join(root, "record-root-"));
+	process.env.TMPDIR = ours;
+	t.after(() => { process.env.TMPDIR = root; });
+	const f = await fixture(t, { startWithTool: true });
+	if (!f) return;
+	const recordRoot = (tmp) => join(tmp, `pi-repl-session-records-${process.getuid()}`);
+	const key = () => f.tmux("show-options", "-qv", "-t", f.sessionName, "@pi_repl_record_root_key");
+	const pane = () => f.tmux("capture-pane", "-p", "-t", `${f.sessionName}:^`, "-S", "-200");
+	const ourKey = readReplSessionRecordRootKey();
+	const other = mkdtempSync(join(root, "other-tmp-"));
+
+	// Keyless metadata an older client made here; from the other terminal, one read of its record ID fails.
+	await f.tmux("set-option", "-u", "-t", f.sessionName, "@pi_repl_record_root_key");
+	process.env.TMPDIR = other;
+	let failed = 0;
+	f.onExec((command, args) => {
+		if (command !== "tmux" || args[0] !== "show-options" || !args.includes("@pi_repl_record_id") || failed > 0) return undefined;
+		failed += 1;
+		return { stdout: "", stderr: "lost server", code: 1, killed: false };
+	});
+	await assert.rejects(f.send("print('FAILED_' + 'READ')"), /^Error: Nothing was sent: Could not read pi-repl-python's @pi_repl_record_id: lost server\.$/);
+	f.onExec(undefined);
+	assert.equal(failed, 1);
+	assert.equal(await key(), "", "a failed read is never taken for fresh metadata");
+	assert.equal(existsSync(recordRoot(other)), false);
+
+	// Metadata this version can't use is left as it is, but a key naming another directory still refuses...
+	process.env.TMPDIR = ours;
+	assert.match((await f.send("print('KEYED')")).content[0].text, /KEYED/);
+	assert.equal(await key(), ourKey);
+	await f.tmux("set-option", "-t", f.sessionName, "@pi_repl_record_version", "2");
+	process.env.TMPDIR = other;
+	await assert.rejects(f.send("print('V2_' + 'ELSEWHERE')"), /^Error: Nothing was sent: pi-repl-python's shared record is in a different or replaced record directory/);
+	assert.equal(await f.tmux("show-options", "-qv", "-t", f.sessionName, "@pi_repl_record_version"), "2");
+	// ...and so does a malformed key, with an invalid record ID.
+	await f.tmux("set-option", "-t", f.sessionName, "@pi_repl_record_version", "1");
+	await f.tmux("set-option", "-t", f.sessionName, "@pi_repl_record_id", "not-an-id");
+	await f.tmux("set-option", "-t", f.sessionName, "@pi_repl_record_root_key", "v2:unknown");
+	await assert.rejects(f.send("print('BAD_' + 'METADATA')"), /^Error: Nothing was sent: pi-repl-python's record-directory key \(@pi_repl_record_root_key\) isn't one this version understands/);
+	// With no key to say otherwise, unusable metadata still runs unsynchronised, as before.
+	await f.tmux("set-option", "-u", "-t", f.sessionName, "@pi_repl_record_root_key");
+	const unsynchronised = await f.send("print('UNSYNC' + 'HRONISED')");
+	assert.match(unsynchronised.content[0].text, /UNSYNCHRONISED/);
+	assert.match(unsynchronised.details.recordWarning, /metadata is invalid for pi-repl-python; leaving it untouched/);
+	assert.equal(await f.tmux("show-options", "-qv", "-t", f.sessionName, "@pi_repl_record_id"), "not-an-id");
+	process.env.TMPDIR = ours;
+	assert.doesNotMatch(await pane(), /FAILED_READ|V2_ELSEWHERE|BAD_METADATA/);
+});
+
 test("a settling send waits through failed inspections, and only a verified end of its session releases it", { timeout: 60000 }, async (t) => {
 	const f = await fixture(t, { startWithTool: true });
 	if (!f) return;

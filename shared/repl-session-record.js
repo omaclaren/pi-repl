@@ -582,7 +582,8 @@ export function readReplSessionRecordStrict(recordId, identity, options = {}) {
 	const path = getReplSessionRecordPath(recordId, options);
 	let fd;
 	try {
-		fd = openSync(path, constants.O_RDONLY | (constants.O_NOFOLLOW ?? 0));
+		// Nonblocking, so a FIFO at the path is refused by the checks below rather than waited on.
+		fd = openSync(path, constants.O_RDONLY | (constants.O_NOFOLLOW ?? 0) | (constants.O_NONBLOCK ?? 0));
 	} catch (error) {
 		if (isMissing(error)) return null;
 		if (error && typeof error === "object" && error.code === "ELOOP") throw new Error(`Shared REPL record is not a regular file: ${path}`);
@@ -606,18 +607,21 @@ export function readReplSessionRecordStrict(recordId, identity, options = {}) {
 	} catch (error) {
 		throw new Error(`Could not parse shared REPL record ${path}: ${error instanceof Error ? error.message : String(error)}`);
 	}
-	if (!parsed || typeof parsed !== "object" || !Array.isArray(parsed.entries) || parsed.entries.some((entry) => !entry || typeof entry !== "object")) {
+	// Checked as stored, before normalising: normalising would round, trim or fill in what isn't there.
+	const isObject = (value) => Boolean(value) && typeof value === "object" && !Array.isArray(value);
+	if (!isObject(parsed) || !Array.isArray(parsed.entries) || !parsed.entries.every(isObject)) {
 		throw new Error(`Shared REPL record ${path} is not a record with a list of entries.`);
 	}
-	const record = normalizeRecord(parsed, recordId);
+	const session = parsed.session;
 	if (
-		record.session.sessionName !== expected.sessionName
-		|| record.session.tmuxSessionId !== expected.tmuxSessionId
-		|| record.session.tmuxSessionCreatedAt !== expected.tmuxSessionCreatedAt
+		!isObject(session)
+		|| session.sessionName !== expected.sessionName
+		|| session.tmuxSessionId !== expected.tmuxSessionId
+		|| session.tmuxSessionCreatedAt !== expected.tmuxSessionCreatedAt
 	) {
 		throw new Error(`Shared REPL record ${path} belongs to another tmux session or session lifetime.`);
 	}
-	return record;
+	return normalizeRecord(parsed, recordId);
 }
 
 const ROOT_KEY_REMEDY = "Use it from a terminal with the same temporary directory (TMPDIR) as its other clients. Restarting the session also fixes this, but discards its state, so that is the user's decision.";
@@ -671,28 +675,32 @@ export function classifyReplSessionRecordRoot(storedKey, options = {}) {
  * it only if it is unset (tmux `set-option -o`). `recordId` is the record ID the
  * session already holds, if any. With an ID and no key, an older client made
  * the metadata, and the key is set only if this directory already holds that
- * session's record. A set is always read back: the key that stuck decides.
+ * session's record, checked before anything is created or repaired. Only a
+ * fresh session's writer creates its record directory. A set is always read
+ * back: the key that stuck decides.
  * Resolves to { ok: true, key, adopted } or { ok: false, reason }.
  */
 export async function bindReplSessionRecordRoot(tmux, { sessionName, recordId, identity }, options = {}) {
-	const own = getReplSessionRecordRootKey(options);
 	let stored = await tmux.readKey();
-	let adopted = false;
-	if (stored === undefined) {
-		if (recordId) {
-			let local;
-			try {
-				local = readReplSessionRecordStrict(recordId, identity, options);
-			} catch (error) {
-				return { ok: false, reason: describeReplSessionRecordRoot("unusable", sessionName, options, error instanceof Error ? error.message : String(error)) };
-			}
-			if (!local) return { ok: false, reason: describeReplSessionRecordRoot("elsewhere", sessionName, options) };
-			adopted = true;
+	// Only a writer setting a fresh session's key may create its record directory.
+	if (stored !== undefined) return checkStoredRootKey(stored, readReplSessionRecordRootKey(options), sessionName, options, false);
+	let own;
+	if (recordId) {
+		// Adoption is checked first, creating and repairing nothing.
+		let local;
+		try {
+			local = readReplSessionRecordStrict(recordId, identity, options);
+		} catch (error) {
+			return { ok: false, reason: describeReplSessionRecordRoot("unusable", sessionName, options, error instanceof Error ? error.message : String(error)) };
 		}
-		await tmux.setKeyIfAbsent(own);
-		stored = await tmux.readKey();
+		own = local ? readReplSessionRecordRootKey(options) : null;
+		if (!own) return { ok: false, reason: describeReplSessionRecordRoot("elsewhere", sessionName, options) };
+	} else {
+		own = getReplSessionRecordRootKey(options);
 	}
-	return checkStoredRootKey(stored, own, sessionName, options, adopted);
+	await tmux.setKeyIfAbsent(own);
+	stored = await tmux.readKey();
+	return checkStoredRootKey(stored, own, sessionName, options, Boolean(recordId));
 }
 
 /**

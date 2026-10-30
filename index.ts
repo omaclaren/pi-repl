@@ -1022,21 +1022,26 @@ async function checkRecordRootAtUse(pi: ExtensionAPI, identity: ReplSessionIdent
  * terminal's record directory, refusing one the session's key doesn't name.
  */
 async function readTmuxSessionRecord(pi: ExtensionAPI, identity: ReplSessionIdentity, cwd: string): Promise<SessionRecordState> {
-	const recordId = await readTmuxSessionOption(pi, identity.tmuxSessionId, REPL_SESSION_RECORD_ID_OPTION, cwd);
-	if (!recordId) return {};
-	if (!isValidReplSessionRecordId(recordId)) {
-		return { warning: `Shared REPL record metadata is invalid for ${identity.sessionName}; leaving it untouched.` };
-	}
-	const version = await readTmuxSessionOption(pi, identity.tmuxSessionId, REPL_SESSION_RECORD_VERSION_OPTION, cwd);
-	if (version && version !== String(REPL_SESSION_RECORD_VERSION)) {
-		return { recordId, warning: `Shared REPL record version ${version} is not supported by this pi-repl version.` };
-	}
+	let metadata: { recordId?: string; version?: string };
+	let state: ReturnType<typeof classifyReplSessionRecordRoot>;
 	try {
-		const state = classifyReplSessionRecordRoot(await recordRootKeyTmux(pi, identity, cwd).readKey());
-		if (state === "different" || state === "malformed") {
-			const reason = describeReplSessionRecordRoot(state, identity.sessionName);
-			return { recordId, warning: reason, refusal: reason };
-		}
+		metadata = await readSessionRecordMetadata(pi, identity, cwd);
+		// The key decides first, whatever the rest of the metadata is.
+		state = classifyReplSessionRecordRoot(await recordRootKeyTmux(pi, identity, cwd).readKey());
+	} catch (error) {
+		const reason = error instanceof Error ? error.message : String(error);
+		return { warning: reason, refusal: reason };
+	}
+	const { recordId, version } = metadata;
+	const validId = recordId !== undefined && isValidReplSessionRecordId(recordId) ? recordId : undefined;
+	if (state === "different" || state === "malformed") {
+		const reason = describeReplSessionRecordRoot(state, identity.sessionName);
+		return { recordId: validId, warning: reason, refusal: reason };
+	}
+	if (recordId === undefined) return {};
+	const unusable = unusableRecordMetadata(identity, metadata);
+	if (unusable) return { recordId: validId, warning: unusable };
+	try {
 		const unverified = state === "unverified";
 		const record = readReplSessionRecordStrict(recordId, identity);
 		if (!record) {
@@ -1056,6 +1061,29 @@ async function readTmuxSessionRecord(pi: ExtensionAPI, identity: ReplSessionIden
 	}
 }
 
+/** A session's record option: undefined only when tmux says it is unset; any other failure rejects. */
+async function readSessionRecordOption(pi: ExtensionAPI, identity: ReplSessionIdentity, optionName: string, cwd: string): Promise<string | undefined> {
+	const result = await execTmux(pi, ["show-options", "-v", "-t", identity.tmuxSessionId, optionName], cwd, 3_000);
+	if (result.code === 0) return result.stdout.trim();
+	if (/invalid option|unknown option/i.test(result.stderr)) return undefined;
+	throw new Error(`Could not read ${identity.sessionName}'s ${optionName}: ${result.stderr.trim() || `tmux exited with ${result.code}`}.`);
+}
+
+/** The record ID and version, read before the key, whose read checks that they came from this lifetime. */
+async function readSessionRecordMetadata(pi: ExtensionAPI, identity: ReplSessionIdentity, cwd: string): Promise<{ recordId?: string; version?: string }> {
+	return {
+		recordId: await readSessionRecordOption(pi, identity, REPL_SESSION_RECORD_ID_OPTION, cwd),
+		version: await readSessionRecordOption(pi, identity, REPL_SESSION_RECORD_VERSION_OPTION, cwd),
+	};
+}
+
+/** Why record metadata that is set can't be used by this version, if it can't. */
+function unusableRecordMetadata(identity: ReplSessionIdentity, { recordId, version }: { recordId?: string; version?: string }): string | undefined {
+	if (recordId !== undefined && !isValidReplSessionRecordId(recordId)) return `Shared REPL record metadata is invalid for ${identity.sessionName}; leaving it untouched.`;
+	if (version && version !== String(REPL_SESSION_RECORD_VERSION)) return `Shared REPL record version ${version} is not supported by this pi-repl version.`;
+	return undefined;
+}
+
 /**
  * The session's record for a writer, before a send: its record-directory key
  * set or checked first, then its record ID and version set if absent, then
@@ -1067,17 +1095,24 @@ async function ensureTmuxSessionRecord(
 	identity: ReplSessionIdentity,
 	cwd: string,
 ): Promise<SessionRecordState> {
-	let recordId = await readTmuxSessionOption(pi, identity.tmuxSessionId, REPL_SESSION_RECORD_ID_OPTION, cwd);
-	let version = await readTmuxSessionOption(pi, identity.tmuxSessionId, REPL_SESSION_RECORD_VERSION_OPTION, cwd);
-	if (recordId && !isValidReplSessionRecordId(recordId)) {
-		return { warning: `Shared REPL record metadata is invalid for ${identity.sessionName}; leaving it untouched.` };
-	}
-	if (version && version !== String(REPL_SESSION_RECORD_VERSION)) {
-		return { recordId, warning: `Shared REPL record version ${version} is not supported by this pi-repl version.` };
-	}
-	// The key comes before the record ID, so an ID without a key was made by an older client.
+	let recordId: string | undefined;
+	let version: string | undefined;
 	try {
-		const bound = await bindReplSessionRecordRoot(recordRootKeyTmux(pi, identity, cwd), { sessionName: identity.sessionName, recordId, identity });
+		// A read that fails is never taken for metadata that isn't there.
+		({ recordId, version } = await readSessionRecordMetadata(pi, identity, cwd));
+		const unusable = unusableRecordMetadata(identity, { recordId, version });
+		const keys = recordRootKeyTmux(pi, identity, cwd);
+		if (unusable) {
+			// Metadata this version can't use is left as it is, but a key the session holds still decides whether to send from here.
+			const state = classifyReplSessionRecordRoot(await keys.readKey());
+			if (state === "different" || state === "malformed") {
+				const reason = describeReplSessionRecordRoot(state, identity.sessionName);
+				return { warning: reason, refusal: reason };
+			}
+			return { recordId: recordId !== undefined && isValidReplSessionRecordId(recordId) ? recordId : undefined, warning: unusable };
+		}
+		// The key comes before the record ID, so an ID without a key was made by an older client.
+		const bound = await bindReplSessionRecordRoot(keys, { sessionName: identity.sessionName, recordId, identity });
 		if (!bound.ok) return { recordId, warning: bound.reason, refusal: bound.reason };
 	} catch (error) {
 		const reason = error instanceof Error ? error.message : String(error);
@@ -1275,7 +1310,7 @@ function formatSessionInfo(info: SessionInfo, pi?: ExtensionAPI): string {
 		`Path: ${info.currentPath}`,
 		...(info.recordPath ? [`Clean shared record: ${info.recordPath} (${info.recordEntryCount ?? 0} entries)`] : []),
 		...(latestRecordEntry ? [`Latest clean entry: ${latestRecordEntry.origin} · ${latestRecordEntry.label} · ${latestRecordEntry.status}`] : []),
-		...(info.recordUnverified && info.recordPath ? [`Record directory not verified: the session has no record-directory key yet. The next send from here sets it to this terminal's record directory; a copy older clients kept anywhere else then stops being used.`] : []),
+		...(info.recordUnverified && info.recordPath ? [`Record directory not verified: the session has no record-directory key yet. The next send from here sets it to this terminal's record directory; upgraded clients then stop using any copy older clients kept elsewhere.`] : []),
 		...(info.recordWarning ? [`Shared record warning: ${info.recordWarning}`] : []),
 		...(info.historyPath ? [`Raw history log: ${info.historyPath}`] : []),
 		...[formatSendLease(info)].filter((line): line is string => Boolean(line)),

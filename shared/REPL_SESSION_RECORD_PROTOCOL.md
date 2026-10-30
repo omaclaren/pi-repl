@@ -69,8 +69,10 @@ The record directory is under the operating system's temporary directory, which 
 **Writers,** clients that set a session's metadata, write its record or take its lease:
 
 1. **Fresh metadata.** The key comes first. A writer sets it with `set-option -o` before the record ID, the record or the lease, then reads it back and compares it with its own: a set that succeeds doesn't prove it won. So an upgraded writer never leaves a record ID without a key.
-2. **A record ID without a key** was made by an older client. A writer sets the key, as in 1, only if its own directory already holds a valid record for this exact session (name, tmux session ID and creation time), read without creating, locking or repairing anything. Otherwise it refuses, and it never creates an empty record to claim the session. This doesn't prove that no split happened earlier: if older clients made valid copies in two directories, either qualifies, and the key chooses where upgraded writers go from then on.
-3. **A key** that doesn't name the writer's own directory, or is malformed, is refused.
+2. **A record ID without a key** was made by an older client. A writer sets the key, as in 1, only if its own directory already holds a valid record for this exact session (name, tmux session ID and creation time, as stored, not normalised), read without creating, locking or repairing anything, its directory included. Otherwise it refuses, and it never creates a directory or an empty record to claim the session. This doesn't prove that no split happened earlier: if older clients made valid copies in two directories, either qualifies, and the key chooses where upgraded writers go from then on.
+3. **A key** that doesn't name the writer's own directory, or is malformed, is refused. This holds even when the rest of the metadata can't be used (an invalid record ID, an unsupported version), which the writer leaves as it is.
+
+A read of the metadata that fails is never taken for metadata that isn't there: only tmux's answer that an option is unset counts as unset.
 
 Reads of the key are bound to the session's exact lifetime (session ID and creation time). A writer checks the key again where it uses the record or lease, including after waiting for the lease, and recomputes its own key there, so a replaced directory is found. On any failure it refuses before sending, and never falls back to an unsynchronised send.
 

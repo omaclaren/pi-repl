@@ -1,6 +1,7 @@
 import test from "node:test";
 import assert from "node:assert/strict";
-import { chmodSync, existsSync, linkSync, lstatSync, mkdirSync, mkdtempSync, readdirSync, readFileSync, renameSync, rmSync, statSync, symlinkSync } from "node:fs";
+import { chmodSync, existsSync, linkSync, lstatSync, mkdirSync, mkdtempSync, readdirSync, readFileSync, renameSync, rmSync, statSync, symlinkSync, writeFileSync } from "node:fs";
+import { spawnSync } from "node:child_process";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 
@@ -304,7 +305,7 @@ test("a writer adopts metadata older clients made only from a record its own dir
 	assert.equal(refused.ok, false);
 	assert.match(refused.reason, /^pi-repl-python's record isn't in this terminal's record directory \(.*\), and the session has no record-directory key to say which directory holds it/);
 	assert.equal(elsewhere.key, undefined);
-	assert.deepEqual(readdirSync(rootB), [], "no empty record is made to claim the session");
+	assert.equal(existsSync(rootB), false, "no directory or empty record is made to claim the session");
 	// A record of another lifetime, or one that isn't private, doesn't qualify.
 	ensureReplSessionRecord(recordId, identity({ tmuxSessionCreatedAt: 1_600_000_000 }), { root: rootB });
 	assert.match((await bindReplSessionRecordRoot(elsewhere.tmux, session, { root: rootB })).reason, /record in this terminal's record directory can't be checked \(.*another tmux session or session lifetime\.\)/);
@@ -343,4 +344,56 @@ test("readers classify a session's key and never adopt it", async () => withTemp
 	const key = getReplSessionRecordRootKey({ root });
 	assert.equal(classifyReplSessionRecordRoot(key, { root }), "verified");
 	assert.equal(classifyReplSessionRecordRoot("v1:ac72368a586a18c19088393573ce0307", { root }), "different");
+}));
+
+test("a strict read checks the record as stored, and refuses a FIFO without waiting on it", async () => withTempRoot((root) => {
+	const recordId = createReplSessionRecordId();
+	const path = getReplSessionRecordPath(recordId, { root });
+	const stored = (changes) => {
+		rmSync(path, { force: true });
+		const record = { protocol: REPL_SESSION_RECORD_PROTOCOL, version: REPL_SESSION_RECORD_VERSION, recordId, session: identity(), revision: 1, createdAt: 1, updatedAt: 1, clearedAt: null, droppedEntries: 0, entries: [], ...changes };
+		writeFileSync(path, JSON.stringify(record), { mode: 0o600 });
+	};
+	stored({});
+	assert.equal(readReplSessionRecordStrict(recordId, identity(), { root }).entries.length, 0);
+	// Normalising would round the creation time or trim the name into a match.
+	stored({ session: identity({ tmuxSessionCreatedAt: 1_700_000_000.9 }) });
+	assert.throws(() => readReplSessionRecordStrict(recordId, identity(), { root }), /another tmux session or session lifetime/);
+	stored({ session: identity({ sessionName: " pi-repl-python" }) });
+	assert.throws(() => readReplSessionRecordStrict(recordId, identity(), { root }), /another tmux session or session lifetime/);
+	stored({ session: [identity()] });
+	assert.throws(() => readReplSessionRecordStrict(recordId, identity(), { root }), /another tmux session or session lifetime/);
+	// Normalising would make up an entry from an array.
+	stored({ entries: [[]] });
+	assert.throws(() => readReplSessionRecordStrict(recordId, identity(), { root }), /not a record with a list of entries/);
+	stored({ entries: [null] });
+	assert.throws(() => readReplSessionRecordStrict(recordId, identity(), { root }), /not a record with a list of entries/);
+	rmSync(path);
+	const fifo = spawnSync("mkfifo", ["-m", "600", path]);
+	if (fifo.status !== 0) return;
+	const startedAt = Date.now();
+	assert.throws(() => readReplSessionRecordStrict(recordId, identity(), { root }), /not a regular file/);
+	assert.ok(Date.now() - startedAt < 1_000, "a FIFO is refused at once");
+}));
+
+test("adoption checks the record before it creates or repairs a record directory", async () => withTempRoot(async (base) => {
+	const root = join(base, "records");
+	const recordId = createReplSessionRecordId();
+	const session = { sessionName: "pi-repl-python", recordId, identity: identity() };
+	const store = keyStore();
+	// No directory: refused, and none is made.
+	assert.match((await bindReplSessionRecordRoot(store.tmux, session, { root })).reason, /record isn't in this terminal's record directory/);
+	assert.equal(existsSync(root), false);
+	// A directory that isn't private: refused, and left as it is, though it holds the record.
+	ensureReplSessionRecord(recordId, identity(), { root });
+	chmodSync(root, 0o755);
+	assert.match((await bindReplSessionRecordRoot(store.tmux, session, { root })).reason, /can't be checked \(Shared REPL record root is not private \(mode 0700\)/);
+	assert.equal(statSync(root).mode & 0o777, 0o755);
+	assert.equal(store.key, undefined);
+	assert.equal(store.sets, 0);
+	// A writer with a key to check doesn't create its directory either.
+	const keyed = keyStore();
+	keyed.key = "v1:ac72368a586a18c19088393573ce0307";
+	assert.match((await bindReplSessionRecordRoot(keyed.tmux, { sessionName: "pi-repl-python", identity: identity() }, { root: join(base, "fresh") })).reason, /different or replaced record directory/);
+	assert.equal(existsSync(join(base, "fresh")), false);
 }));
