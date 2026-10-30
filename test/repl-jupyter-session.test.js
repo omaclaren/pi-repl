@@ -481,3 +481,30 @@ test("with LFortran: start, a cell from each side, and stop", { skip: !REAL_LFOR
 	assert.deepEqual(await alive([helperPid, kernelPid]), []);
 	assert.equal(existsSync(started.dir), false);
 });
+
+test("start sets up the session's shared record last: options, then record.json for this launch; a failed setup leaves neither", async (t) => {
+	const f = sessionFixture(t);
+	if (!f) return;
+	const started = await f.start();
+	defer(t, () => f.stop().catch(() => {}));
+	assert.deepEqual([started.ready, started.warnings], [true, []], JSON.stringify(started));
+	const named = JSON.parse(readFileSync(join(started.dir, "record.json"), "utf8"));
+	assert.equal(named.owner, started.owner);
+	assert.deepEqual([named.identity.tmuxSessionId, String(named.identity.tmuxSessionCreatedAt), named.identity.runtime], [started.sessionId, started.createdAt, "lfortran"]);
+	const option = async (session, name) => (await f.tmux(["show-options", "-qv", "-t", session, name])).stdout.trim();
+	assert.equal(await option(started.sessionId, "@pi_repl_record_id"), named.recordId);
+	assert.equal(await option(started.sessionId, "@pi_repl_record_version"), "1");
+	await f.stop();
+
+	// The record's tmux option can't be set: no record.json, nothing left naming the record, and the warning is true.
+	const refusing = (args) => args[0] === "set-option" && args.includes("@pi_repl_record_id") && !args.includes("-qu")
+		? Promise.resolve({ code: 1, stdout: "", stderr: "refused" })
+		: f.tmux(args);
+	const failed = await f.start({ tmux: refusing });
+	defer(t, () => f.stop().catch(() => {}));
+	assert.equal(failed.ready, true);
+	assert.deepEqual(failed.warnings, ["The session's shared record couldn't be set up (its tmux options couldn't be set), so its cells won't be recorded."]);
+	assert.equal(existsSync(join(failed.dir, "record.json")), false);
+	assert.deepEqual([await option(failed.sessionId, "@pi_repl_record_id"), await option(failed.sessionId, "@pi_repl_record_version")], ["", ""]);
+	assert.equal((await runCell(failed, "print:unrecorded")).output.text, "unrecorded");
+});

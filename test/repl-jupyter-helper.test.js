@@ -3,14 +3,16 @@ import assert from "node:assert/strict";
 import { spawnSync } from "node:child_process";
 import { randomBytes } from "node:crypto";
 import { once } from "node:events";
-import { existsSync, lstatSync, mkdtempSync, readFileSync, rmSync, statSync, symlinkSync, unlinkSync, writeFileSync } from "node:fs";
+import { existsSync, lstatSync, mkdirSync, mkdtempSync, readFileSync, rmSync, statSync, symlinkSync, unlinkSync, writeFileSync } from "node:fs";
 import net from "node:net";
+import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { fileURLToPath } from "node:url";
 import v8 from "node:v8";
 import vm from "node:vm";
 import { JupyterClient, readConnectionFile, waitForExecution } from "../shared/repl-jupyter.js";
-import { HelperClient, Journal, JupyterHelper, OutputBuffer, normalizeInputText } from "../shared/repl-jupyter-helper.js";
+import { readReplSessionRecord, recordEntryKey } from "../shared/repl-session-record.js";
+import { HelperClient, Journal, JupyterHelper, OutputBuffer, normalizeInputText, RecordWriter } from "../shared/repl-jupyter-helper.js";
 
 const FAKE_PROCESS = fileURLToPath(new URL("./helpers/fake-kernel-process.js", import.meta.url));
 const fakeKernel = (file) => [process.execPath, [FAKE_PROCESS, "kernel", "-f", file, "--managed"]];
@@ -920,4 +922,141 @@ test("the session directory must be private", async (t) => {
 	const helper = new JupyterHelper({ dir, kernelCommand: fakeKernel });
 	await assert.rejects(helper.start(), /private directory/);
 	assert.equal(existsSync(join(dir, "ready.json")), false, "a directory that isn't this launch's gets no marker");
+});
+
+/** A record.json for a writer, in a private directory of its own: { dir, path, recordId, root, identity, owner }. */
+function recordFile(t, fields = {}) {
+	const dir = mkdtempSync(join(tmpdir(), "pi-repl-record-writer-"));
+	t.after(() => rmSync(dir, { recursive: true, force: true }));
+	const named = {
+		recordId: randomBytes(16).toString("hex"), root: join(dir, "records"), owner: randomBytes(16).toString("hex"),
+		identity: { sessionName: "pi-repl-lfortran", tmuxSessionId: "$1", tmuxSessionCreatedAt: 1793317832, runtime: "lfortran" },
+		...fields,
+	};
+	writeFileSync(join(dir, "record.json"), JSON.stringify(named), { mode: 0o600 });
+	return { dir, path: join(dir, "record.json"), ...named };
+}
+
+const recordedCell = (fields = {}) => ({
+	id: "e1", recordKey: "tool:abc", recordRequestId: "tool:abc", state: "running", label: "Claude Code", mode: "agent", code: "print *, 1",
+	submittedAt: Date.now(), output: { text: () => fields.text ?? "", truncated: false }, ...fields,
+});
+
+test("the record writer writes an entry per execution in a thread of its own, and never changes a settled one back", async (t) => {
+	const file = recordFile(t);
+	const warnings = [];
+	const writer = new RecordWriter(file.path, { owner: file.owner, warn: (message) => warnings.push(message) });
+	t.after(() => writer.close(1000));
+	const entries = () => readReplSessionRecord(file.recordId, file.identity, { root: file.root })?.entries ?? [];
+	const entry = (id) => entries().find((e) => e.id === id);
+	writer.queue(recordedCell());
+	await writer.drain(5000);
+	assert.deepEqual(["status", "completedAt", "mode", "label", "requestId", "runtime"].map((key) => entry("pi-repl:tool:abc")[key]), ["sent", null, "agent", "Claude Code", "tool:abc", "lfortran"]);
+	writer.queue(recordedCell({ state: "completed", status: "error", reply: { status: "error", ename: "Error", evalue: "it failed" }, settledAt: Date.now(), text: "partial\n" }));
+	await writer.drain(5000);
+	assert.deepEqual([entry("pi-repl:tool:abc").status, entry("pi-repl:tool:abc").output], ["captured", "partial\n[The cell failed: Error: it failed]"]);
+	assert.ok(entry("pi-repl:tool:abc").completedAt);
+	// A settled entry is never changed back.
+	writer.queue(recordedCell());
+	await writer.drain(5000);
+	assert.equal(entry("pi-repl:tool:abc").status, "captured");
+	// Skipped and unconfirmed cells; a cell that wasn't sent isn't recorded.
+	writer.queue(recordedCell({ id: "e2", recordKey: "tool:skipped", state: "completed", status: "aborted", reply: { status: "aborted" }, settledAt: Date.now() }));
+	writer.queue(recordedCell({ id: "e3", recordKey: "tool:lost", state: "unconfirmed", outcome: { exit: { signal: "SIGSEGV" }, started: true }, settledAt: Date.now(), text: "before\n" }));
+	writer.queue(recordedCell({ id: "e4", recordKey: "tool:refused", state: "not-sent" }));
+	await writer.drain(5000);
+	assert.equal(entry("pi-repl:tool:skipped").output, "Not run: a cell before it failed, so LFortran skipped it (stop_on_error).");
+	assert.deepEqual([entry("pi-repl:tool:lost").status, entry("pi-repl:tool:lost").output], ["error", "before\n[Outcome unconfirmed: the kernel exited (signal SIGSEGV); it had started.]"]);
+	assert.equal(entry("pi-repl:tool:refused"), undefined);
+	assert.deepEqual(warnings, []);
+});
+
+test("the record writer never stalls the helper while another writer holds the record, and warns once when it can't write", async (t) => {
+	const file = recordFile(t);
+	const warnings = [];
+	const writer = new RecordWriter(file.path, { owner: file.owner, warn: (message) => warnings.push(message) });
+	t.after(() => writer.close(1000));
+	// Another writer holds the record's lock, as Studio or pi-repl may.
+	mkdirSync(file.root, { recursive: true, mode: 0o700 });
+	const lock = join(file.root, `${file.recordId}.record.lock`);
+	mkdirSync(lock, { mode: 0o700 });
+	writeFileSync(join(lock, "owner.json"), JSON.stringify({ token: "other", pid: process.pid, createdAt: Date.now() }));
+	writer.queue(recordedCell());
+	const started = Date.now();
+	await new Promise((resolve) => setTimeout(resolve, 25));
+	assert.ok(Date.now() - started < 200, `a 25 ms timer took ${Date.now() - started} ms while the write waited`);
+	rmSync(lock, { recursive: true, force: true });
+	await writer.drain(10_000);
+	assert.equal(readReplSessionRecord(file.recordId, file.identity, { root: file.root }).entries[0].status, "sent");
+	assert.deepEqual(warnings, []);
+
+	// A record it can't write to: one warning, until a write succeeds.
+	const blocked = recordFile(t);
+	writeFileSync(blocked.root, "");
+	const failing = new RecordWriter(blocked.path, { owner: blocked.owner, warn: (message) => warnings.push(message) });
+	t.after(() => failing.close(1000));
+	failing.queue(recordedCell({ recordKey: "tool:f1" }));
+	failing.queue(recordedCell({ recordKey: "tool:f2" }));
+	await failing.drain(5000);
+	assert.equal(warnings.length, 1);
+	assert.match(warnings[0], /^the shared record couldn't be written \(.+\); this cell's entry may be missing or out of date\.$/);
+});
+
+test("the record writer uses only record.json written for its launch, as a regular file, never following a link or blocking", async (t) => {
+	const file = recordFile(t);
+	const tried = async (path, owner, setup) => {
+		const warnings = [];
+		setup?.();
+		const writer = new RecordWriter(path, { owner, warn: (message) => warnings.push(message) });
+		t.after(() => writer.close(1000));
+		writer.queue(recordedCell());
+		await writer.drain(2000);
+		return warnings;
+	};
+	assert.match((await tried(file.path, "another-launch"))[0], /^record\.json can't be used \(it was written for another launch\), so cells aren't recorded\.$/);
+	const link = join(file.dir, "link.json");
+	assert.match((await tried(link, file.owner, () => symlinkSync(file.path, link)))[0], /^record\.json can't be used/);
+	const fifo = join(file.dir, "fifo.json");
+	const made = spawnSync("mkfifo", [fifo]);
+	if (made.status === 0) {
+		const before = Date.now();
+		assert.match((await tried(fifo, file.owner))[0], /^record\.json can't be used \(.*isn't a regular file/);
+		assert.ok(Date.now() - before < 1000, "a FIFO doesn't block the read");
+	}
+	// Without record.json, nothing is written and nothing is said.
+	assert.deepEqual(await tried(join(file.dir, "missing.json"), file.owner), []);
+	assert.equal(readReplSessionRecord(file.recordId, file.identity, { root: file.root }), null);
+});
+
+test("a requestId names one cell's record entry: a second cell with it is refused before anything is sent", async (t) => {
+	const { helper, sent, finish } = stubbed(t);
+	helper.execute({ lifetimeId: helper.lifetimeId, submissionId: "first-cell-1", code: "print:a", requestId: "tool:same" });
+	const posted = sent.length;
+	assert.throws(() => helper.execute({ lifetimeId: helper.lifetimeId, submissionId: "second-cell-2", code: "print:b", requestId: "tool:same" }), (error) => error.code === "duplicate-request");
+	assert.equal(sent.length, posted, "nothing was sent for the second cell");
+	assert.throws(() => helper.execute({ lifetimeId: helper.lifetimeId, submissionId: "third-cell-3", code: "print:c", requestId: "line\nbreak" }), (error) => error.code === "invalid-request");
+	assert.throws(() => helper.execute({ lifetimeId: helper.lifetimeId, submissionId: "third-cell-4", code: "print:c", requestId: " padded" }), (error) => error.code === "invalid-request");
+	assert.throws(() => helper.execute({ lifetimeId: helper.lifetimeId, submissionId: "fourth-cell-4", code: "print:d", mode: "other" }), (error) => error.code === "invalid-request");
+	// A request ID spelled like another's derived key belongs to a different cell: it isn't refused as a duplicate.
+	finish(sent[0].message.header.msg_id);
+	helper.execute({ lifetimeId: helper.lifetimeId, submissionId: "nested-cell-5", code: "print:e", requestId: "tool:call_parent/1" });
+	finish(sent.at(-1).message.header.msg_id);
+	const spelled = helper.execute({ lifetimeId: helper.lifetimeId, submissionId: "spelled-cell-6", code: "print:f", requestId: recordEntryKey("tool:call_parent/1") });
+	assert.equal(spelled.state, "submitted");
+});
+
+test("a request ID an entry ID can't hold, such as a nested tool call's, gets a stable key of its own", () => {
+	assert.equal(recordEntryKey("tool:call_1"), "tool:call_1");
+	const nested = recordEntryKey("tool:call_parent/1");
+	assert.match(nested, /^hashed:tool:call_parent_1\.[0-9a-f]{20}$/);
+	assert.equal(recordEntryKey("tool:call_parent/1"), nested, "the same request ID, the same key");
+	assert.notEqual(recordEntryKey("tool:call_parent_1"), nested, "IDs that read alike once made safe keep apart");
+	// A request ID spelled like another's derived key is never taken as it is.
+	assert.notEqual(recordEntryKey(nested), nested);
+	assert.match(recordEntryKey(nested), /^hashed:hashed:tool:call_parent_1\.[0-9a-f]{20}\.[0-9a-f]{20}$/);
+	const spelledLikeOldKey = nested.slice("hashed:".length);
+	assert.equal(recordEntryKey(spelledLikeOldKey), spelledLikeOldKey, "without the prefix, it's an ordinary request ID");
+	assert.notEqual(recordEntryKey(spelledLikeOldKey), nested);
+	assert.notEqual(recordEntryKey("tool:a/b"), recordEntryKey("tool:a\\b"));
+	assert.ok(`pi-repl:${recordEntryKey("x/".repeat(150))}`.length <= 240);
 });

@@ -20,6 +20,7 @@ import {
 	REPL_SESSION_RECORD_VERSION_OPTION,
 	acquireReplSessionSendLease,
 	readReplSessionSendLease,
+	recordEntryKey,
 	createReplSessionRecordId,
 	ensureReplSessionRecord,
 	getReplSessionRecordPath,
@@ -46,7 +47,7 @@ import { mStringLiteral, buildMLanguageControlSource, buildMLanguageDriverSource
 import { buildGnuplotSubmissionLine, buildGnuplotGuardSource, buildGnuplotDriverSource } from "./shared/repl-gnuplot.js";
 import { cppInclude, buildCppDriverSource, buildCppRequest, createCppControlCleanup, prepareCppSubmission, readCppCompletion } from "./shared/repl-cpp.js";
 import { GNUPLOT_OWNER_ENV, GNUPLOT_OWNER_OPTION } from "./shared/repl-gnuplot-processes.js";
-import { LFORTRAN_GUIDELINES, answerLfortranInput, lfortranStatus, sendLfortranCode, startLfortranRuntime, stopLfortranSession } from "./shared/repl-lfortran.js";
+import { LFORTRAN_GUIDELINES, answerLfortranInput, exportLfortranRecord, lfortranStatus, sendLfortranCode, startLfortranRuntime, stopLfortranSession } from "./shared/repl-lfortran.js";
 import { clearPersonName, formatPersonNameStatus, personRequestId, resolvePersonName, savePersonName } from "./shared/repl-person.js";
 
 // For a host's own person commands, such as agent-repl's `name`, `send` and `env`.
@@ -237,7 +238,7 @@ type ReplCommand =
 	| { action: "attach"; runtime?: ManagedRuntime }
 	| { action: "export"; runtime?: ManagedRuntime }
 	| { action: "start"; runtime: SupportedRuntime; name?: string }
-	| { action: "lfortran"; command: "start" | "status" | "stop" | "attach" }
+	| { action: "lfortran"; command: "start" | "status" | "stop" | "attach" | "export" }
 	| { action: "input"; token?: string; text: string }
 	| { action: "send"; target?: string; code: string }
 	| { action: "error"; message: string };
@@ -468,7 +469,7 @@ function formatUsage(): string {
 		"  /repl attach [python|julia|r|ghci|clojure|ruby|java|octave|matlab|gnuplot|cpp]",
 		"  /repl export [python|julia|r|ghci|clojure|ruby|java|octave|matlab|gnuplot|cpp]",
 		"  /repl stop [python|julia|r|ghci|clojure|ruby|java|octave|matlab|gnuplot|cpp]",
-		"  /repl status lfortran, /repl attach lfortran, /repl stop lfortran",
+		"  /repl status lfortran, /repl attach lfortran, /repl export lfortran, /repl stop lfortran",
 		"",
 		"Supported runtimes right now: python, ipython, julia, r, ghci, clojure, ruby, java, octave, matlab, gnuplot, cpp",
 		"For R, both /repl R and /repl r work. The same applies to /lab, /repl status, /repl attach, /repl export, and /repl stop.",
@@ -550,7 +551,7 @@ function parseReplCommand(args: string): ReplCommand {
 	}
 
 	if (firstLower === "lfortran" && rest.length === 0) return { action: "lfortran", command: "start" };
-	if ((firstLower === "status" || firstLower === "stop" || firstLower === "attach") && rest.length === 1 && rest[0].toLowerCase() === "lfortran") {
+	if ((firstLower === "status" || firstLower === "stop" || firstLower === "attach" || firstLower === "export") && rest.length === 1 && rest[0].toLowerCase() === "lfortran") {
 		return { action: "lfortran", command: firstLower };
 	}
 
@@ -2423,7 +2424,8 @@ async function runTrackedReplCode(
 ): Promise<{ output: string; details: ReplSendDetails }> {
 	const target = normalizeReplSendTarget(params.target) ?? "python";
 	const sessionName = getSessionNameForSelector(target);
-	const submissionId = `pi-repl:${metadata.requestId}`;
+	// The record's entry ID, from which the control files and the pane's anchor are named too.
+	const submissionId = `pi-repl:${recordEntryKey(metadata.requestId)}`;
 	const sessionInfo = await readSessionInfo(pi, sessionName, ctx.cwd);
 	if (!sessionInfo?.recordId || !sessionInfo.recordPath || sessionInfo.recordWarning) {
 		const execution = await runReplCode(pi, params, ctx, signal, { submissionId, forAgent });
@@ -2751,7 +2753,7 @@ export async function sendAndSettle(pi: ExtensionAPI, ctx: ExtensionContext, opt
 	}
 	const runtime: ImplementedRuntime = target === "python" ? normalizePythonRuntime(sessionInfo) : target;
 	const identity: ReplSessionIdentity = { sessionName, tmuxSessionId: sessionInfo.tmuxSessionId, tmuxSessionCreatedAt: sessionInfo.tmuxSessionCreatedAt, runtime };
-	const submissionId = `pi-repl:${options.requestId}`;
+	const submissionId = `pi-repl:${recordEntryKey(options.requestId)}`;
 	let lease: Awaited<ReturnType<typeof acquireReplSessionSendLease>>;
 	try {
 		lease = await acquireReplSessionSendLease(sessionInfo.recordId, { owner: `pi-repl:${options.requestId}`, waitMs: options.leaseWaitMs ?? 60_000, signal: options.signal });
@@ -2977,6 +2979,28 @@ export function formatReplEnvResult(execution: { output: string; details: Pick<R
 	].join("\n");
 }
 
+/** A person's LFortran cell, recorded under the caller's request ID and label, as /repl send sends it. */
+function sendLfortranAsPerson(pi: ExtensionAPI, ctx: ExtensionContext, code: string, record: { requestId: string; label: string }) {
+	return sendLfortranCode({
+		tmux: lfortranTmux(pi, ctx.cwd), code, timeoutMs: clampReplSendTimeout(undefined), ownerKey: lfortranOwnerKey(ctx),
+		mode: "raw", requestId: record.requestId, label: record.label,
+	});
+}
+
+/**
+ * A person's LFortran cell for a host that prints the result, such as
+ * agent-repl's `send lfortran`: recorded under the host's request ID and
+ * label, with the result as /repl send gives it, its code and output in a
+ * fence and how to answer a READ after it.
+ */
+export async function sendLfortranForHost(pi: ExtensionAPI, ctx: ExtensionContext, options: { code: string; requestId: string; label: string }): Promise<{ text: string; waitingForInput: boolean }> {
+	const result = await sendLfortranAsPerson(pi, ctx, options.code, options);
+	return {
+		text: formatReplCommandContent(`/repl send to ${result.details.sessionName}`, lfortranCommandText(result), lfortranCommandHint(result)),
+		waitingForInput: result.details.state === "waiting-input",
+	};
+}
+
 /**
  * /repl send: the person's own code, sent to the running session as repl_send
  * sends the agent's (none is started). The result goes into the conversation.
@@ -2984,9 +3008,7 @@ export function formatReplEnvResult(execution: { output: string; details: Pick<R
 async function sendReplCommand(pi: ExtensionAPI, ctx: ExtensionCommandContext, target: string | undefined, code: string): Promise<void> {
 	try {
 		if (target?.toLowerCase() === "lfortran") {
-			const result = await sendLfortranCode({
-				tmux: lfortranTmux(pi, ctx.cwd), code, timeoutMs: clampReplSendTimeout(undefined), label: "/repl send", ownerKey: lfortranOwnerKey(ctx),
-			});
+			const result = await sendLfortranAsPerson(pi, ctx, code, { requestId: personRequestId("pi", "send"), label: personSending(ctx).name });
 			postReplCommandResult(pi, ctx, `/repl send to ${result.details.sessionName}`, lfortranCommandText(result), lfortranCommandView(`/repl send · ${result.details.sessionName}`, result, code), lfortranCommandHint(result));
 			return;
 		}
@@ -3758,7 +3780,7 @@ function boundToolText(fullText: string): { text: string; truncation?: Truncatio
 	return { text: truncation.content + notice, truncation, fullOutputPath: tempFile };
 }
 
-async function handleLfortranCommand(pi: ExtensionAPI, ctx: ExtensionCommandContext, command: "start" | "status" | "stop" | "attach"): Promise<void> {
+async function handleLfortranCommand(pi: ExtensionAPI, ctx: ExtensionCommandContext, command: "start" | "status" | "stop" | "attach" | "export"): Promise<void> {
 	const tmux = lfortranTmux(pi, ctx.cwd);
 	try {
 		if (command === "start") {
@@ -3766,6 +3788,9 @@ async function handleLfortranCommand(pi: ExtensionAPI, ctx: ExtensionCommandCont
 			notify(ctx, result.text, result.details.ready ? "info" : "warning");
 		} else if (command === "status") {
 			notify(ctx, (await lfortranStatus({ tmux })).text, "info");
+		} else if (command === "export") {
+			const result = await exportLfortranRecord({ tmux, cwd: ctx.cwd });
+			notify(ctx, result.text, result.details.exported ? "info" : "warning");
 		} else if (command === "stop") {
 			const result = await stopLfortranSession({ tmux });
 			notify(ctx, result.text, result.details.stopped && (result.details as { verified?: boolean }).verified !== false && !result.details.warnings?.length ? "info" : "warning");
@@ -4169,7 +4194,7 @@ export default function (pi: ExtensionAPI) {
 			if (send.target?.trim().toLowerCase() === "lfortran") {
 				const result = await sendLfortranCode({
 					tmux: lfortranTmux(pi, ctx.cwd), code: send.code, timeoutMs: clampReplSendTimeout(send.timeoutMs), signal,
-					label: getToolSubmissionLabel(), ownerKey: lfortranOwnerKey(ctx),
+					label: getToolSubmissionLabel(), ownerKey: lfortranOwnerKey(ctx), mode: "agent", requestId: `tool:${toolCallId}`,
 				});
 				const bounded = boundToolText(result.text);
 				return { content: [{ type: "text", text: bounded.text }], details: { ...result.details, ...(bounded.truncation ? { truncation: bounded.truncation, fullOutputPath: bounded.fullOutputPath } : {}) } };

@@ -164,6 +164,8 @@ async function fixture(t, { index = 0, runtime = "python", controlName, startWit
 	const target = runtime === "ipython" ? "python" : runtime;
 	const repl = (args) => commands.get("repl").handler(args, ctx);
 	const send = (code, options = {}, signal) => tools.get("repl_send").execute(randomUUID(), { code, target, ...options }, signal, undefined, ctx);
+	// A tool call with an ID of the caller's choosing, such as a nested call's.
+	const sendAs = (toolCallId, code, options = {}, signal) => tools.get("repl_send").execute(toolCallId, { code, target, ...options }, signal, undefined, ctx);
 	const status = (options = {}) => tools.get("repl_status").execute(randomUUID(), { target, ...options }, undefined, undefined, ctx);
 	const start = (options = {}, signal) => tools.get("repl_start").execute(randomUUID(), { runtime, ...options }, signal, undefined, { cwd });
 	// Another agent on the same session: by default another process (a fresh
@@ -219,7 +221,7 @@ async function fixture(t, { index = 0, runtime = "python", controlName, startWit
 	} catch (error) {
 		throw new Error(`${runtime} startup failed: ${startupOutput}`, { cause: error });
 	}
-	return { pi, ctx, module, cwd, calls, notifications, messages, renderers, withoutMessages: () => { pi.sendMessage = undefined; }, tmux, sessionName, target, repl, send, status, start, otherAgent, fire, onExec: (override) => { execOverride = override; }, owned: () => tmuxHarness.owned(), cleanup: () => tmuxHarness.cleanup(), onEnter: (callback) => { afterEnter = callback; }, onBeforePaste: (callback) => { beforePaste = callback; }, onBeforeStop: (callback) => { beforeStop = callback; } };
+	return { pi, ctx, module, sendAs, cwd, calls, notifications, messages, renderers, withoutMessages: () => { pi.sendMessage = undefined; }, tmux, sessionName, target, repl, send, status, start, otherAgent, fire, onExec: (override) => { execOverride = override; }, owned: () => tmuxHarness.owned(), cleanup: () => tmuxHarness.cleanup(), onEnter: (callback) => { afterEnter = callback; }, onBeforePaste: (callback) => { beforePaste = callback; }, onBeforeStop: (callback) => { beforeStop = callback; } };
 }
 
 async function assertCompletionGap(f, result) {
@@ -2642,4 +2644,21 @@ test("/repl env that outlasts its wait shows its result later; a late /repl send
 	await waits.settle();
 	assert.equal(f.notifications.length, notices);
 	assert.equal(readReplSessionRecord(recordId).entries.at(-1).output, "LATE_UNPOSTED");
+});
+
+test("a nested tool call's send has one entry, whose ID, request ID and control files all match", { timeout: 60000 }, async (t) => {
+	const f = await fixture(t);
+	if (!f) return;
+	const recordId = (await f.status()).details.python.recordId;
+	// Outlasting its wait keeps its control files, to compare with its entry.
+	await assert.rejects(f.sendAs("call_parent/1", "import time\ntime.sleep(2)\nprint('NESTED')", { timeoutMs: 1000 }), /^Error: Timed out waiting/);
+	const [pending, ...others] = readReplSessionRecord(recordId).entries;
+	assert.deepEqual(others, []);
+	assert.match(pending.id, /^pi-repl:hashed:tool:call_parent_1\.[0-9a-f]{20}$/);
+	assert.equal(pending.requestId, "tool:call_parent/1");
+	assertCorrelatedControlFiles(readdirSync(process.env.PI_REPL_CONTROL_ROOT), pending.id);
+	await f.module.drainSettlingSends();
+	const settled = readReplSessionRecord(recordId).entries;
+	assert.equal(settled.length, 1);
+	assert.deepEqual([settled[0].id, settled[0].status, settled[0].output], [pending.id, "captured", "NESTED"]);
 });

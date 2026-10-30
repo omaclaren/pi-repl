@@ -1,4 +1,4 @@
-import { randomUUID } from "node:crypto";
+import { createHash, randomUUID } from "node:crypto";
 import {
 	chmodSync,
 	closeSync,
@@ -49,6 +49,23 @@ function getRootSuffix() {
  */
 export function getReplSessionRecordRoot(options = {}) {
 	return resolve(options.root || join(tmpdir(), `pi-repl-session-records-${getRootSuffix()}`));
+}
+
+// Every derived key starts with this, and no request ID is used as it is when it does, so the two kinds never meet.
+const DERIVED_KEY_PREFIX = "hashed:";
+
+/**
+ * A stable entry-ID key for a send's request ID, as `pi-repl:<key>`. A
+ * request ID an entry ID can hold is its own key. Any other, such as a Pi
+ * nested tool call's with its slash, is derived: `hashed:`, its characters made
+ * safe, and a hash of the whole, so that two request IDs never share a key. A
+ * request ID that itself starts with `hashed:` is always derived, so that it
+ * can't be taken for another's derived key.
+ */
+export function recordEntryKey(requestId) {
+	if (/^[A-Za-z0-9_.:-]{1,200}$/.test(requestId) && !requestId.startsWith(DERIVED_KEY_PREFIX)) return requestId;
+	const hash = createHash("sha256").update(requestId).digest("hex").slice(0, 20);
+	return `${DERIVED_KEY_PREFIX}${requestId.replace(/[^A-Za-z0-9_.:-]/g, "_").slice(0, 160)}.${hash}`;
 }
 
 export function createReplSessionRecordId() {

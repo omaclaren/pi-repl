@@ -13,8 +13,12 @@ import { randomBytes } from "node:crypto";
 import { chmodSync, closeSync, constants, fstatSync, lstatSync, mkdirSync, openSync, readdirSync, readSync, realpathSync, renameSync, rmdirSync, unlinkSync, writeSync } from "node:fs";
 import { basename, dirname, join } from "node:path";
 import { fileURLToPath } from "node:url";
-import { HELPER_FILES, HELPER_PROTOCOL_VERSION, HelperClient, checkPrivateDirectory } from "./repl-jupyter-helper.js";
+import { HELPER_FILES, HELPER_PROTOCOL_VERSION, HelperClient, RECORD_FILE, checkPrivateDirectory } from "./repl-jupyter-helper.js";
 import { readOwnerMarkers } from "./repl-gnuplot-processes.js";
+import {
+	REPL_SESSION_RECORD_ID_OPTION, REPL_SESSION_RECORD_VERSION, REPL_SESSION_RECORD_VERSION_OPTION,
+	createReplSessionRecordId, ensureReplSessionRecord, getReplSessionRecordRoot,
+} from "./repl-session-record.js";
 import { SessionStopProcesses, endVerifiedSurvivors, fingerprint, fingerprintFormat, live, processKey, readPanes, readStopProcessTable } from "./repl-session-stop.js";
 
 export const LFORTRAN_SESSION_NAME = "pi-repl-lfortran";
@@ -214,6 +218,38 @@ async function setOption(tmux, target, name, value, scope = []) {
 	return result.code === 0;
 }
 
+/**
+ * The session's shared clean record, as the other runtimes' sessions have
+ * one: its ID in the session's tmux options, and DIR/record.json, which tells
+ * this launch's helper (`owner`) where to write its entries. record.json is
+ * written last, so that the helper records only once everything else is in
+ * place. Resolves with a warning, rather than failing the start, when it
+ * can't be set up; cells are then not recorded.
+ */
+async function setUpRecord(tmux, { sessionId, sessionName, dir, owner, recordRoot }) {
+	let options = false;
+	try {
+		const created = await tmux(["display-message", "-p", "-t", sessionId, "#{session_created}"]);
+		const tmuxSessionCreatedAt = Number(created.stdout.trim());
+		if (created.code !== 0 || !Number.isSafeInteger(tmuxSessionCreatedAt)) throw new Error("its creation time couldn't be read");
+		const identity = { sessionName, tmuxSessionId: sessionId, tmuxSessionCreatedAt, runtime: "lfortran" };
+		const recordId = createReplSessionRecordId();
+		const root = getReplSessionRecordRoot(recordRoot ? { root: recordRoot } : {});
+		ensureReplSessionRecord(recordId, identity, { root });
+		options = true;
+		if (!(await setOption(tmux, sessionId, REPL_SESSION_RECORD_ID_OPTION, recordId)) || !(await setOption(tmux, sessionId, REPL_SESSION_RECORD_VERSION_OPTION, String(REPL_SESSION_RECORD_VERSION)))) {
+			throw new Error("its tmux options couldn't be set");
+		}
+		const fd = openSync(join(dir, RECORD_FILE), constants.O_WRONLY | constants.O_CREAT | constants.O_EXCL | constants.O_NOFOLLOW, 0o600);
+		try { writeSync(fd, `${JSON.stringify({ recordId, root, identity, owner })}\n`); } finally { closeSync(fd); }
+		return null;
+	} catch (error) {
+		// Nothing names a record that won't be written to.
+		if (options) for (const name of [REPL_SESSION_RECORD_ID_OPTION, REPL_SESSION_RECORD_VERSION_OPTION]) await tmux(["set-option", "-qu", "-t", sessionId, name]).catch(() => {});
+		return `The session's shared record couldn't be set up (${error.message}), so its cells won't be recorded.`;
+	}
+}
+
 /** DIR/ready.json, if it's there and readable: never followed through a link, and bounded. */
 export function readReadyMarker(dir) {
 	let fd;
@@ -312,7 +348,7 @@ const complete = (identity) => identity.runtime === "lfortran" && OWNER.test(ide
  */
 export async function startJupyterSession({
 	tmux, cwd, lfortran, shell = defaultShell(), nodePath = process.execPath, helperScript = HELPER_SCRIPT,
-	sessionName = LFORTRAN_SESSION_NAME, root = "/tmp", uid = process.getuid(), timeoutMs = 60_000, signal, connect,
+	sessionName = LFORTRAN_SESSION_NAME, root = "/tmp", uid = process.getuid(), timeoutMs = 60_000, signal, connect, recordRoot,
 }) {
 	const deadline = Date.now() + timeoutMs;
 	const warnings = [];
@@ -353,6 +389,9 @@ export async function startJupyterSession({
 				throw new Error(`Could not start the helper's window in ${sessionName}: ${helper.stderr.trim() || `exit code ${helper.code}`}. The person's window waits; stop the session with /repl stop lfortran.`);
 			}
 			if (!(await setOption(tmux, sessionId, JUPYTER_OPTIONS.helperPane, helperPane))) throw new Error(`Could not record the helper's pane in ${sessionName}; it can't be verified to stop. It has not been stopped.`);
+			// Before the helper starts, so that its first cell is recorded.
+			const recordWarning = await setUpRecord(tmux, { sessionId, sessionName, dir, owner, recordRoot });
+			if (recordWarning) warnings.push(recordWarning);
 			if (!(await setOption(tmux, helperWindow, "remain-on-exit", "on", ["-w"]))) warnings.push("Could not keep the helper's pane if it ends (remain-on-exit).");
 			const started = await tmux(["respawn-pane", "-k", "-t", helperPane, "-c", cwd, "-e", `${JUPYTER_OWNER_ENV}=${owner}`, helperCommand({ shell, nodePath, helperScript, dir, lfortran })]);
 			if (started.code !== 0) throw new Error(`Could not start the helper in ${sessionName}: ${started.stderr.trim() || `exit code ${started.code}`}. The person's window waits; stop the session with /repl stop lfortran.`);
@@ -428,7 +467,7 @@ export function removeSessionDir(dir, { root = "/tmp", uid = process.getuid(), o
 	}
 	hooks.afterRename?.(retiring);
 	const warnings = [];
-	const known = new Set([...Object.values(HELPER_FILES), LAUNCH_FILE]);
+	const known = new Set([...Object.values(HELPER_FILES), RECORD_FILE, LAUNCH_FILE]);
 	const names = readdirSync(retiring).sort((a, b) => (a === LAUNCH_FILE) - (b === LAUNCH_FILE));
 	for (const name of names) {
 		const path = join(retiring, name);

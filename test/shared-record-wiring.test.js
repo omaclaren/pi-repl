@@ -47,7 +47,7 @@ test("repl_send emits bounded pane echoes with clean-record-derived anchors", ()
 	assert.match(source, /entryId: details\.submissionId/);
 	assert.match(source, /origin: "pi-repl"/);
 	assert.match(source, /stripReplSubmissionDisplay\(scaffoldCleaned, display\)/);
-	assert.match(source, /submissionId = `pi-repl:\$\{metadata\.requestId\}`/);
+	assert.match(source, /submissionId = `pi-repl:\$\{recordEntryKey\(metadata\.requestId\)\}`/);
 	assert.match(source, /\/repl echo \[off\|summary\|full\]/);
 	assert.match(source, /PI_REPL_ECHO_MODE/);
 	assert.match(source, /repl_send shows bounded submitted code and alignment anchors in the raw pane by default \(Summary\)/);

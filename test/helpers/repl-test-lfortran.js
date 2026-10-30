@@ -3,11 +3,18 @@
 // that run in the right order.
 import { execFile, spawnSync } from "node:child_process";
 import { mkdirSync, mkdtempSync, rmSync, writeFileSync } from "node:fs";
+import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { fileURLToPath } from "node:url";
 import { createTestTmux } from "./repl-test-tmux.js";
 
 export const FAKE_LFORTRAN = fileURLToPath(new URL("./fake-lfortran.js", import.meta.url));
+
+// Every LFortran start sets up a shared record, under the temporary directory:
+// the tests' records go to a private one, removed when the test process ends.
+const temporary = mkdtempSync(join(tmpdir(), "pi-repl-lfortran-tests-"));
+process.env.TMPDIR = temporary;
+process.on("exit", () => rmSync(temporary, { recursive: true, force: true }));
 export const REAL_LFORTRAN = process.env.PI_REPL_LFORTRAN;
 export const tmuxAvailable = process.platform !== "win32" && spawnSync("tmux", ["-V"]).status === 0;
 const quote = (text) => `'${text.replace(/'/g, `'"'"'`)}'`;

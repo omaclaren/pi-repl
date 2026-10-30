@@ -4,9 +4,11 @@
 // the host to bound and show; `tmux(args)` resolves with { code, stdout, stderr }.
 
 import { randomBytes } from "node:crypto";
+import { writeFileSync } from "node:fs";
 import { join } from "node:path";
-import { HELPER_FILES, HELPER_PROTOCOL_VERSION, HelperClient } from "./repl-jupyter-helper.js";
+import { HELPER_FILES, HELPER_PROTOCOL_VERSION, HelperClient, RECORD_FILE, readRecordFile } from "./repl-jupyter-helper.js";
 import { LFORTRAN_SESSION_NAME, defaultShell, personPrompt, preflightLfortran, readReadyMarker, readSessionIdentity, runCommand, startJupyterSession, stopVerifiedJupyterSession } from "./repl-jupyter-session.js";
+import { REPL_SESSION_RECORD_ID_OPTION, getReplSessionRecordPath, readReplSessionRecord, renderReplSessionRecordMarkdown } from "./repl-session-record.js";
 
 /** @typedef {(args: string[]) => Promise<{ code: number, stdout: string, stderr: string }>} Tmux */
 
@@ -188,9 +190,10 @@ function executionDetails(snapshot, identity) {
  * Sends a cell and waits up to `timeoutMs` for it to settle or to ask for
  * input. A wait that runs out leaves the cell running; nothing is resent.
  * Resolves with the result's text, its details, and the output it holds.
- * @param {{ tmux: Tmux, code: string, timeoutMs?: number, signal?: AbortSignal, label?: string, ownerKey?: string }} options
+ * The shared record's entry takes `label`, `mode` (agent, raw or literate) and `requestId`, as the other runtimes' sends do.
+ * @param {{ tmux: Tmux, code: string, timeoutMs?: number, signal?: AbortSignal, label?: string, ownerKey?: string, mode?: "agent" | "raw" | "literate", requestId?: string }} options
  */
-export async function sendLfortranCode({ tmux, code, timeoutMs = 20_000, signal, label = "", ownerKey = "" }) {
+export async function sendLfortranCode({ tmux, code, timeoutMs = 20_000, signal, label = "", ownerKey = "", mode = "raw", requestId }) {
 	if (typeof code !== "string" || !code.trim()) throw new Error("There's no LFortran code to send.");
 	const deadline = Date.now() + timeoutMs;
 	const { client, hello } = await connectHelper(tmux, signal, "the cell wasn't sent.");
@@ -200,7 +203,7 @@ export async function sendLfortranCode({ tmux, code, timeoutMs = 20_000, signal,
 		if (signal?.aborted) throw cancelled("the cell wasn't sent.");
 		let snapshot;
 		try {
-			snapshot = await client.request("execute", { lifetimeId: hello.lifetimeId, submissionId, code, label, ownerKey }, { timeoutMs: 10_000 });
+			snapshot = await client.request("execute", { lifetimeId: hello.lifetimeId, submissionId, code, label, ownerKey, mode, ...(requestId ? { requestId } : {}) }, { timeoutMs: 10_000 });
 		} catch (error) {
 			if (error.code === "busy") throw new Error(`Another LFortran cell is still unresolved (execution ${error.details?.executionId}, ${error.details?.state}); nothing was sent. Wait for it: look it up with ${lookup(error.details?.executionId)}${error.details?.state === "waiting-input" ? ", and answer its READ with repl_input" : ""}.`);
 			if (error.code === "not-accepting") throw new Error(`The LFortran session isn't taking cells: ${error.details?.state === "kernel-exited" ? "its kernel has exited" : error.details?.state ?? error.message}. Nothing was sent. Stop it with ${STOP}, and start a new one.`);
@@ -302,14 +305,62 @@ export async function lfortranStatus({ tmux, execution }) {
 		for (const warning of status.warnings ?? []) lines.push(`- Warning: ${warning.message}`);
 		if (status.current) lines.push("", "The latest cell from pi-repl:", formatExecution(status.current));
 	}
+	const record = await sessionRecord(tmux, identity);
+	lines.push(record?.record ? `- Clean shared record: ${record.path} (${record.record.entries.length} entries).` : "- Clean shared record: none; this session's cells aren't recorded.");
 	lines.push("", `Attach: ${ATTACH}`);
 	return {
 		text: lines.join("\n"),
 		details: {
-			runtime: "lfortran", sessionName: LFORTRAN_SESSION_NAME, running: true, personPrompt: prompt,
+			runtime: "lfortran", sessionName: LFORTRAN_SESSION_NAME, running: true, personPrompt: prompt, recordId: record?.recordId ?? null, recordPath: record?.path ?? null,
 			helper: status ? status.state : "unavailable", kernel: status?.kernel ?? null, current: status?.current ? executionDetails(status.current, status) : null, attachCommand: ATTACH,
 		},
 	};
+}
+
+/**
+ * The session's shared record, as DIR/record.json names it, but only if it is
+ * this session's: written for this launch, naming the session's tmux ID and
+ * creation time, and the record ID in its tmux options. { recordId, path,
+ * record }, or null.
+ */
+async function sessionRecord(tmux, identity) {
+	if (!identity?.dir) return null;
+	let named;
+	try {
+		named = readRecordFile(join(identity.dir, RECORD_FILE), identity.owner);
+	} catch {
+		return null;
+	}
+	const option = await tmux(["show-options", "-qv", "-t", identity.sessionId, REPL_SESSION_RECORD_ID_OPTION]);
+	if (option.code !== 0 || option.stdout.trim() !== named.recordId) return null;
+	const expected = { sessionName: LFORTRAN_SESSION_NAME, tmuxSessionId: identity.sessionId, tmuxSessionCreatedAt: Number(identity.createdAt), runtime: "lfortran" };
+	if (named.identity.sessionName !== expected.sessionName || named.identity.tmuxSessionId !== expected.tmuxSessionId || named.identity.tmuxSessionCreatedAt !== expected.tmuxSessionCreatedAt) return null;
+	const options = { root: named.root };
+	return { recordId: named.recordId, path: getReplSessionRecordPath(named.recordId, options), record: readReplSessionRecord(named.recordId, expected, options) };
+}
+
+/**
+ * /repl export lfortran: the session's clean record as canonical Markdown, in
+ * a new file in `cwd` that never replaces another.
+ * @param {{ tmux: Tmux, cwd: string }} options
+ */
+export async function exportLfortranRecord({ tmux, cwd }) {
+	const identity = await readSessionIdentity(tmux, LFORTRAN_SESSION_NAME);
+	if (!identity) return { text: noSession(), details: { exported: false } };
+	const found = await sessionRecord(tmux, identity);
+	if (!found?.record) return { text: `${LFORTRAN_SESSION_NAME} has no clean record to export: it was started without one, or its record can't be read.`, details: { exported: false } };
+	const markdown = renderReplSessionRecordMarkdown(found.record);
+	const base = `${LFORTRAN_SESSION_NAME}.record.${new Date().toISOString().replace(/[:.]/g, "-")}`;
+	for (let suffix = 0; suffix < 100; suffix++) {
+		const path = join(cwd, `${base}${suffix ? `-${suffix}` : ""}.md`);
+		try {
+			writeFileSync(path, markdown, { encoding: "utf8", flag: "wx", mode: 0o600 });
+			return { text: `Exported ${found.record.entries.length} clean record entries to ${path}`, details: { exported: true, path, entries: found.record.entries.length } };
+		} catch (error) {
+			if (error?.code !== "EEXIST") throw error;
+		}
+	}
+	throw new Error("Could not choose an unused export filename.");
 }
 
 /**

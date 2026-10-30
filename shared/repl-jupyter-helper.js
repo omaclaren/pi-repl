@@ -9,20 +9,60 @@
 //
 // DIR is new for each launch, and the helper claims it before anything else.
 // It holds k.json (the connection file), h.sock, ready.json, kernel.log,
-// helper.pid, kernel.pid and output spools. The helper runs until it is signalled; when the kernel ends
-// it stays, to report.
+// helper.pid, kernel.pid and output spools, and record.json, which the starter
+// writes: where the session's shared clean record is, for the helper's entries.
+// The helper runs until it is signalled; when the kernel ends it stays, to report.
 
 import { createHash, randomBytes, timingSafeEqual } from "node:crypto";
 import { spawn } from "node:child_process";
 import { EventEmitter } from "node:events";
-import { chmodSync, closeSync, constants, createWriteStream, fstatSync, lstatSync, openSync, renameSync, unlinkSync, writeSync } from "node:fs";
+import { chmodSync, closeSync, constants, createWriteStream, fstatSync, lstatSync, openSync, readSync, renameSync, unlinkSync, writeSync } from "node:fs";
 import net from "node:net";
 import { join } from "node:path";
 import { pathToFileURL } from "node:url";
+import { Worker } from "node:worker_threads";
 import { JupyterClient, readConnectionFile } from "./repl-jupyter.js";
+import { isValidReplSessionRecordId, recordEntryKey } from "./repl-session-record.js";
 
 export const HELPER_PROTOCOL_VERSION = 1;
 export const HELPER_FILES = { connection: "k.json", socket: "h.sock", ready: "ready.json", kernelLog: "kernel.log", pid: "helper.pid", kernelPid: "kernel.pid" };
+// Written by the starter, before the helper claims DIR, and only read by the helper.
+export const RECORD_FILE = "record.json";
+const MAX_RECORD_FILE_BYTES = 64 * 1024;
+const RECORD_WORKER = new URL("./repl-record-worker.js", import.meta.url);
+
+/**
+ * A small file of this user's in a private directory, read without following a
+ * link or blocking: only a regular file with one link, of at most `maxBytes`.
+ */
+export function readPrivateFile(path, maxBytes) {
+	const fd = openSync(path, constants.O_RDONLY | constants.O_NOFOLLOW | constants.O_NONBLOCK);
+	try {
+		const stat = fstatSync(fd);
+		if (!stat.isFile() || stat.uid !== process.getuid() || stat.nlink !== 1) throw new Error(`${path} isn't a regular file of this user's with one link`);
+		if (stat.size > maxBytes) throw new Error(`${path} is larger than ${maxBytes} bytes`);
+		const buffer = Buffer.alloc(stat.size);
+		const size = readSync(fd, buffer, 0, buffer.length, 0);
+		return buffer.subarray(0, size).toString("utf8");
+	} finally {
+		closeSync(fd);
+	}
+}
+
+/**
+ * DIR/record.json, validated: { recordId, root, identity, owner }, written by
+ * the starter for the launch whose owner marker is `owner`. Throws why not.
+ */
+export function readRecordFile(path, owner) {
+	const read = JSON.parse(readPrivateFile(path, MAX_RECORD_FILE_BYTES));
+	const identity = read?.identity;
+	if (!isValidReplSessionRecordId(read?.recordId) || typeof read.root !== "string" || !read.root.startsWith("/")
+		|| !identity || typeof identity.sessionName !== "string" || !/^\$\d+$/.test(identity.tmuxSessionId) || !Number.isSafeInteger(identity.tmuxSessionCreatedAt)) {
+		throw new Error("it doesn't name a usable shared record");
+	}
+	if (read.owner !== owner) throw new Error("it was written for another launch");
+	return { recordId: read.recordId, root: read.root, owner, identity: { sessionName: identity.sessionName, tmuxSessionId: identity.tmuxSessionId, tmuxSessionCreatedAt: identity.tmuxSessionCreatedAt, runtime: "lfortran" } };
+}
 const MAX_REQUEST_LINE_BYTES = 32 * 1024 * 1024;
 const MAX_RESPONSE_LINE_BYTES = 64 * 1024 * 1024;
 const MAX_CODE_BYTES = 16 * 1024 * 1024;
@@ -49,6 +89,10 @@ const RETAIN = { executions: 200, bytes: 64 * 1024 * 1024, spoolBytes: 512 * 102
 const TERMINAL_STATES = new Set(["completed", "unconfirmed", "not-sent"]);
 const REPLY_STATUSES = new Set(["ok", "error", "aborted"]);
 const SUBMISSION_ID = /^[A-Za-z0-9_-]{8,128}$/;
+// A shared-record request ID, as the other runtimes' sends use (`tool:<id>`, `command:send:<uuid>`):
+// any text the record keeps whole. Its entry's key is derived from it (recordEntryKey).
+const RECORD_REQUEST_ID = /^[^\r\n\0]{1,300}$/;
+const RECORD_MODES = new Set(["agent", "raw", "literate"]);
 const HEX_ID = /^[0-9a-f]{32}$/;
 
 const randomId = () => randomBytes(16).toString("hex");
@@ -530,6 +574,156 @@ function displayText(data) {
 	return mime ? `[${clip(mime, 128)} output]` : "";
 }
 
+/** The text a settled execution leaves in the shared record: what was received, and what the status alone would lose. */
+function recordOutput(execution) {
+	const received = execution.output.text().replace(/\n$/, "");
+	const notes = [];
+	if (execution.output.truncated) notes.push("[The output was cut here: more was received than the helper keeps in memory.]");
+	if (execution.state === "completed" && execution.status === "aborted") return "Not run: a cell before it failed, so LFortran skipped it (stop_on_error).";
+	if (execution.state === "completed" && execution.status === "error") {
+		notes.push(`[The cell failed${execution.reply?.ename ? `: ${execution.reply.ename}${execution.reply.evalue ? `: ${execution.reply.evalue}` : ""}` : "."}]`);
+	}
+	if (execution.state === "unconfirmed") {
+		const outcome = execution.outcome ?? {};
+		const exit = outcome.exit ? (outcome.exit.signal ? `signal ${outcome.exit.signal}` : `status ${outcome.exit.code}`) : null;
+		notes.push(`[Outcome unconfirmed: ${exit ? `the kernel exited (${exit})` : outcome.reason ?? "the connection to the kernel ended"}; ${outcome.started ? "it had started" : "there's no evidence it started"}.]`);
+	}
+	return [received, ...notes].filter(Boolean).join("\n");
+}
+
+/**
+ * Writes the shared clean record's entries for this helper's executions, as
+ * record.json says where: one entry each, `sent` until it settles, then
+ * `captured` or, unconfirmed, `error`. A write takes the record's lock and
+ * fsyncs, so it happens in a thread of its own (repl-record-worker.js), one at
+ * a time: the protocol reader never waits for one. An entry's newest fields
+ * are written together. A settled entry is never changed back: once queued,
+ * nothing later for its key is. A failed write becomes a warning, once until a
+ * write succeeds again; it never stops the helper.
+ */
+export class RecordWriter {
+	constructor(path, { owner, warn, workerUrl = RECORD_WORKER }) {
+		this.path = path;
+		this.owner = owner;
+		this.warn = warn;
+		this.workerUrl = workerUrl;
+		this.pending = new Map();
+		this.settled = new Set();
+		this.failing = false;
+		this.config = undefined;
+		this.worker = null;
+		this.inFlight = null;
+		this.seq = 0;
+		this.idle = [];
+	}
+
+	/** record.json's recordId, root and identity, or null when the session has no record. */
+	target() {
+		if (this.config !== undefined) return this.config;
+		let config = null;
+		try {
+			config = readRecordFile(this.path, this.owner);
+		} catch (error) {
+			if (error?.code !== "ENOENT") this.warn(`record.json can't be used (${error.message}), so cells aren't recorded.`);
+		}
+		this.config = config;
+		return config;
+	}
+
+	/** Queues the execution's entry as it stands now. */
+	queue(execution) {
+		const key = execution.recordKey;
+		if (!this.target() || execution.state === "not-sent" || this.settled.has(key)) return;
+		const settled = TERMINAL_STATES.has(execution.state);
+		if (settled) this.settled.add(key);
+		this.pending.set(key, {
+			id: `pi-repl:${key}`,
+			requestId: execution.recordRequestId,
+			origin: "pi-repl",
+			label: execution.label || "LFortran cell",
+			mode: execution.mode,
+			code: execution.code,
+			status: !settled ? "sent" : execution.state === "completed" ? "captured" : "error",
+			output: settled ? recordOutput(execution) : "",
+			createdAt: execution.submittedAt,
+			completedAt: settled ? execution.settledAt : null,
+		});
+		this.pump();
+	}
+
+	pump() {
+		if (this.inFlight || !this.pending.size) {
+			if (!this.inFlight) this.wake();
+			return;
+		}
+		const [key, entry] = this.pending.entries().next().value;
+		this.pending.delete(key);
+		try {
+			this.worker ??= this.startWorker();
+		} catch (error) {
+			this.failed(error.message);
+			this.pending.clear();
+			this.wake();
+			return;
+		}
+		this.inFlight = { seq: ++this.seq };
+		const { recordId, identity, root } = this.config;
+		this.worker.postMessage({ seq: this.inFlight.seq, recordId, identity, root, entry });
+	}
+
+	startWorker() {
+		const worker = new Worker(this.workerUrl);
+		worker.on("message", ({ seq, ok, error }) => {
+			if (seq !== this.inFlight?.seq) return;
+			this.inFlight = null;
+			if (ok) this.failing = false;
+			else this.failed(error);
+			this.pump();
+		});
+		// The thread itself failing: nothing more is written, and that is said once.
+		worker.on("error", (error) => this.lost(error.message));
+		worker.on("exit", (code) => { if (this.worker === worker && !this.closed) this.lost(`it exited (${code})`); });
+		// After the listeners, which would otherwise ref it again: the thread never keeps the helper alive.
+		worker.unref();
+		return worker;
+	}
+
+	failed(reason) {
+		if (!this.failing) this.warn(`the shared record couldn't be written (${reason}); this cell's entry may be missing or out of date.`);
+		this.failing = true;
+	}
+
+	lost(reason) {
+		this.failed(`its writer stopped: ${reason}`);
+		this.worker = null;
+		this.inFlight = null;
+		this.pending.clear();
+		this.config = null;
+		this.wake();
+	}
+
+	wake() {
+		for (const resolve of this.idle.splice(0)) resolve();
+	}
+
+	/** Resolves when every queued entry has been written, or after `ms`. */
+	drain(ms) {
+		if (!this.inFlight && !this.pending.size) return Promise.resolve();
+		return new Promise((resolve) => {
+			const timer = setTimeout(resolve, ms);
+			this.idle.push(() => { clearTimeout(timer); resolve(); });
+		});
+	}
+
+	/** Writes what it can within `ms`, then stops the thread. */
+	async close(ms) {
+		await this.drain(ms);
+		this.closed = true;
+		await this.worker?.terminate().catch(() => {});
+		this.worker = null;
+	}
+}
+
 const delay = (ms) => {
 	let timer;
 	const promise = new Promise((resolve) => { timer = setTimeout(resolve, ms); });
@@ -577,6 +771,9 @@ export class JupyterHelper extends EventEmitter {
 		this.retiring = new Set();
 		this.warnings = [];
 		this.counts = { dropped: 0, listenerErrors: 0 };
+		this.recordWriter = new RecordWriter(join(dir, RECORD_FILE), { owner: launchId, warn: (message) => this.warn(message) });
+		// Each record entry's key, which only one execution may have.
+		this.recordKeys = new Set();
 	}
 
 	/**
@@ -944,9 +1141,14 @@ export class JupyterHelper extends EventEmitter {
 		return new HelperRequestError("expired", "That execution is no longer kept; it isn't run again.", { executionId: entry.id, state: entry.state, status: entry.status });
 	}
 
-	execute({ lifetimeId, submissionId, code, label = "", ownerKey = "" }) {
+	execute({ lifetimeId, submissionId, code, label = "", ownerKey = "", mode = "raw", requestId }) {
 		this.checkLifetime(lifetimeId);
 		if (typeof submissionId !== "string" || !SUBMISSION_ID.test(submissionId)) throw new HelperRequestError("invalid-request", "A submissionId of 8–128 letters, digits, _ or - is needed.");
+		if (!RECORD_MODES.has(mode)) throw new HelperRequestError("invalid-request", "mode is agent, raw or literate.");
+		if (requestId !== undefined && (typeof requestId !== "string" || !RECORD_REQUEST_ID.test(requestId) || requestId.trim() !== requestId)) {
+			throw new HelperRequestError("invalid-request", "A requestId is 1–300 characters, without line breaks, NUL, or space at either end.");
+		}
+		const recordKey = requestId === undefined ? undefined : recordEntryKey(requestId);
 		if (typeof code !== "string" || byteLength(code) > MAX_CODE_BYTES) throw new HelperRequestError("invalid-request", "Code must be a string of at most 16 MiB.");
 		const codeHash = hashCode(code);
 		const existing = this.submissions.get(submissionId);
@@ -957,6 +1159,7 @@ export class JupyterHelper extends EventEmitter {
 			return this.snapshot(entry);
 		}
 		if (!this.admitting) throw new HelperRequestError("not-accepting", `The session isn't accepting cells: ${this.state}.`, { state: this.state });
+		if (recordKey !== undefined && this.recordKeys.has(recordKey)) throw new HelperRequestError("duplicate-request", "That requestId names another cell's record entry; nothing was sent.");
 		if (this.current && !TERMINAL_STATES.has(this.current.state)) {
 			throw new HelperRequestError("busy", "Another cell is still unresolved; wait for it first.", { executionId: this.current.id, state: this.current.state });
 		}
@@ -966,7 +1169,7 @@ export class JupyterHelper extends EventEmitter {
 		// The helper's own policy, whatever the caller wants: never silent, READs allowed, stop on error.
 		const request = this.client.prepareExecute(code, { silent: false, storeHistory: true, allowStdin: true, stopOnError: true });
 		const execution = {
-			id, submissionId, code, codeHash, codeBytes: byteLength(code), label: String(label).slice(0, 200), ownerKey: String(ownerKey).slice(0, 256),
+			id, submissionId, code, codeHash, codeBytes: byteLength(code), label: String(label).slice(0, 200), ownerKey: String(ownerKey).slice(0, 256), mode, recordRequestId: requestId, recordKey: recordKey ?? `lfortran:${id}`,
 			requestId: request.header.msg_id, state: "submitted", version: 1, started: false, idle: false, reply: null, input: null, outcome: null, late: 0,
 			submittedAt: Date.now(), startedAt: null, settledAt: null, journal: { first: null, last: null, count: 0 },
 			output: new OutputBuffer({ ...this.outputOptions, spoolPath: join(this.dir, `out-${id}.txt`), spoolBudget: this.spoolBudget, onSpool: (state, error) => this.spooled(execution, state, error) }),
@@ -974,6 +1177,7 @@ export class JupyterHelper extends EventEmitter {
 		this.executions.set(id, execution);
 		this.retained.add(id);
 		this.submissions.set(submissionId, id);
+		this.recordKeys.add(execution.recordKey);
 		this.requests.set(execution.requestId, id);
 		this.current = execution;
 		this.trim();
@@ -986,6 +1190,7 @@ export class JupyterHelper extends EventEmitter {
 			return this.snapshot(execution);
 		}
 		this.record(execution, { kind: "execution", event: "submitted", executionId: id, requestId: clip(execution.requestId), label: execution.label });
+		this.recordWriter.queue(execution);
 		this.changed(execution);
 		return this.snapshot(execution);
 	}
@@ -1030,6 +1235,7 @@ export class JupyterHelper extends EventEmitter {
 		execution.settledAt = Date.now();
 		execution.output.close();
 		this.record(execution, { kind: "execution", event: state, executionId: execution.id, status: execution.status, outcome: execution.outcome });
+		this.recordWriter.queue(execution);
 		this.changed(execution);
 		this.trim();
 	}
@@ -1276,6 +1482,8 @@ export class JupyterHelper extends EventEmitter {
 		await new Promise((resolve) => setImmediate(resolve));
 		await this.closeServer();
 		await this.closeSpools();
+		// The entries of cells this stop settled are written, within a bound.
+		await this.recordWriter.close(this.spoolCloseMs);
 	}
 
 	/**

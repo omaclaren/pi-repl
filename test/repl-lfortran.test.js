@@ -5,13 +5,14 @@ import assert from "node:assert/strict";
 import { execFile } from "node:child_process";
 import { randomUUID } from "node:crypto";
 import { getEventListeners } from "node:events";
-import { mkdtempSync, rmSync } from "node:fs";
+import { mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import net from "node:net";
 import { join } from "node:path";
 import { promisify } from "node:util";
 import { DEFAULT_MAX_BYTES } from "@earendil-works/pi-coding-agent";
 import { visibleWidth } from "@earendil-works/pi-tui";
 import { answerLfortranInput, formatExecution, lfortranStatus } from "../shared/repl-lfortran.js";
+import { readSessionIdentity } from "../shared/repl-jupyter-session.js";
 import { REAL_LFORTRAN, defer, lfortranFixture, until } from "./helpers/repl-test-lfortran.js";
 
 const exec = promisify(execFile);
@@ -46,8 +47,8 @@ async function piFixture(t, options = {}) {
 	const previousShell = process.env.SHELL;
 	process.env.SHELL = "/bin/sh";
 	defer(t, () => { if (previousShell === undefined) delete process.env.SHELL; else process.env.SHELL = previousShell; });
-	const { default: register } = await import(`../index.ts?lfortran=${randomUUID()}`);
-	register(pi);
+	const module = await import(`../index.ts?lfortran=${randomUUID()}`);
+	module.default(pi);
 	const tool = (name, params, signal) => tools.get(name).execute(randomUUID(), params, signal, undefined, ctx);
 	const repl = async (args) => {
 		const before = notifications.length;
@@ -57,7 +58,7 @@ async function piFixture(t, options = {}) {
 	// Whatever a test leaves running is stopped, through the verified stop.
 	defer(t, () => repl("stop lfortran"));
 	return {
-		...f, tools, notifications, messages,
+		...f, tools, notifications, messages, ctx, pi, module,
 		// A posted message as Pi renders it, without colours, its lines trimmed; none is wider than `width`.
 		shown(message, width = 100) {
 			const plain = { fg: (_color, text) => text, bg: (_color, text) => text, bold: (text) => text };
@@ -191,6 +192,63 @@ test("repl_start, repl_send, a READ answered with repl_input and /repl input, re
 	await assert.rejects(f.send("print:x"), /No shared LFortran session is running/);
 });
 
+test("the session's clean record: an entry for each cell, as the other runtimes' sends are recorded, and /repl export lfortran", async (t) => {
+	const f = await piFixture(t);
+	if (!f) return;
+	// The person's name for their sends, rather than whatever this account has saved.
+	const previousName = process.env.PI_REPL_USER_NAME;
+	process.env.PI_REPL_USER_NAME = "Ada";
+	defer(t, () => { if (previousName === undefined) delete process.env.PI_REPL_USER_NAME; else process.env.PI_REPL_USER_NAME = previousName; });
+	assert.equal((await f.start()).details.ready, true);
+	const { recordId, recordPath } = (await f.status({ target: "lfortran" })).details.lfortran;
+	assert.match(recordId, /^[0-9a-f]{32}$/);
+	const entries = () => JSON.parse(readFileSync(recordPath, "utf8")).entries;
+	await f.send("print:hello");
+	await f.send("fail");
+	// A READ that waits: its entry is pending until the cell settles.
+	const reading = await f.send("read");
+	await until(() => entries().at(-1)?.code === "read", { what: "the READ's entry" });
+	assert.equal(entries().at(-1).status, "sent");
+	await f.input(TOKEN.exec(text(reading))[1], "21");
+	assert.deepEqual(await f.repl("send lfortran\nprint:from the person"), []);
+	await until(() => entries().length === 4 && entries().every((entry) => entry.status !== "sent"), { what: "four settled entries" });
+	const [hello, failed, read, person] = entries();
+	assert.match(hello.id, /^pi-repl:tool:[0-9a-f-]{36}$/);
+	assert.deepEqual([hello.origin, hello.mode, hello.label, hello.runtime, hello.sessionName, hello.status, hello.code, hello.output], ["pi-repl", "agent", "Pi", "lfortran", "pi-repl-lfortran", "captured", "print:hello", "hello"]);
+	// What it printed, and then what the status alone would lose.
+	assert.deepEqual([failed.status, failed.output], ["captured", "it failed\n[The cell failed: Error: it failed]"]);
+	assert.deepEqual([read.status, read.output], ["captured", "got 21"]);
+	assert.match(person.id, /^pi-repl:pi:send:[0-9a-f-]{36}$/);
+	assert.equal(person.requestId, person.id.slice("pi-repl:".length));
+	// A nested tool call's ID, which an entry ID can't hold, gets a key of its own; its request ID stays as it was.
+	await f.tools.get("repl_send").execute("call_parent/1", { code: "print:nested", target: "lfortran" }, undefined, undefined, f.ctx);
+	await until(() => entries().length === 5 && entries()[4].status === "captured", { what: "the nested call's entry" });
+	assert.match(entries()[4].id, /^pi-repl:hashed:tool:call_parent_1\.[0-9a-f]{20}$/);
+	assert.deepEqual([entries()[4].requestId, entries()[4].output], ["tool:call_parent/1", "nested"]);
+	assert.deepEqual([person.mode, person.label, person.output], ["raw", "Ada", "from the person"]);
+	// A host that prints the result, as agent-repl's `send lfortran` does, gives its own request ID and label.
+	const hosted = await f.module.sendLfortranForHost(f.pi, f.ctx, { code: "print:from the terminal", requestId: "cli:send:00000000-0000-4000-8000-000000000001", label: "Ada" });
+	assert.match(hosted.text, /^\/repl send to pi-repl-lfortran:\n\n```\nCompleted\.[\s\S]*Output:\nfrom the terminal\n```$/);
+	await until(() => entries().length === 6 && entries()[5].status === "captured", { what: "the host's entry" });
+	assert.deepEqual([entries()[5].id, entries()[5].label, entries()[5].mode], ["pi-repl:cli:send:00000000-0000-4000-8000-000000000001", "Ada", "raw"]);
+	assert.match(text(await f.status({ target: "lfortran" })), new RegExp(`- Clean shared record: ${recordPath.replace(/[.*+?^${}()|[\]\\]/g, "\\$&")} \\(6 entries\\)\\.`));
+	const [exported] = await f.repl("export lfortran");
+	const path = /^Exported 6 clean record entries to (.+\.md)$/.exec(exported.message)?.[1];
+	assert.ok(path, exported.message);
+	assert.match(readFileSync(path, "utf8"), /print:hello[\s\S]*from the person/);
+	assert.equal(exported.level, "info");
+
+	// A record.json that doesn't belong to this session, as a reused directory might hold, is never used.
+	const file = join((await readSessionIdentity(f.tmux, "pi-repl-lfortran")).dir, "record.json");
+	const original = readFileSync(file, "utf8");
+	for (const change of [{ identity: { ...JSON.parse(original).identity, tmuxSessionId: "$99" } }, { owner: "0".repeat(32) }, { recordId: "f".repeat(32) }]) {
+		writeFileSync(file, JSON.stringify({ ...JSON.parse(original), ...change }));
+		assert.match(text(await f.status({ target: "lfortran" })), /- Clean shared record: none; this session's cells aren't recorded\./, JSON.stringify(change));
+		assert.match((await f.repl("export lfortran"))[0].message, /^pi-repl-lfortran has no clean record to export/);
+	}
+	writeFileSync(file, original);
+});
+
 test("a cell that ends the kernel: its outcome is unconfirmed, the session says it's over, and it still stops", async (t) => {
 	const f = await piFixture(t);
 	if (!f) return;
@@ -261,6 +319,11 @@ test("with LFortran: repl_start, repl_send, and a READ through repl_input", { sk
 	const reading = await f.send("integer :: n\nread *, n\nprint *, n + 1");
 	assert.match(text(reading), /Waiting for input/);
 	assert.match(text(await f.input(TOKEN.exec(text(reading))[1], "9")), /Output:\n\s*10\s*$/);
+	// LFortran's cells are in the session's clean record.
+	const { recordPath } = (await f.status({ target: "lfortran" })).details.lfortran;
+	const entries = () => JSON.parse(readFileSync(recordPath, "utf8")).entries;
+	await until(() => entries().length === 2 && entries().every((entry) => entry.status === "captured"), { what: "two captured entries" });
+	assert.match(entries()[0].output, /^\s*42\s*$/);
 	const [stopped] = await f.repl("stop lfortran");
 	assert.match(stopped.message, /Stopped the shared LFortran session/);
 });
