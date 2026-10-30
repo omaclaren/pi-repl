@@ -10,6 +10,7 @@ All notable changes to `pi-repl` are documented here.
 - The shared record module exports the key and its checks for other clients: `getReplSessionRecordRootKey`, `readReplSessionRecordRootKey`, `readReplSessionRecordStrict`, `bindReplSessionRecordRoot`, `verifyReplSessionRecordRoot`, `classifyReplSessionRecordRoot`, `describeReplSessionRecordRoot` and `replSessionRecordRootKeyTmux`. The protocol document describes the key, with test vectors, as a version 1 convention.
 
 ### Changed
+- `repl_send`'s guidance asks agents to save a plot the user wants to see to an image file (for example under `attachments/`) and print its path, unless the user wants a window. pi-markdown-preview's REPL page shows saved plots to people watching the session; it can't show windows.
 - `/repl status`, `repl_status` and `/repl export` only read. They no longer set a session's record metadata or create its record, and they read the record without changing its mode. Status says when a session's record directory isn't verified yet, or is a different one.
 
 ## [0.11.6] — 2026-10-30

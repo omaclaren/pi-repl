@@ -4334,6 +4334,7 @@ export default function (pi: ExtensionAPI) {
 			"This is a shared long-lived session: inspect state before mutating it, and do not assume variables already exist.",
 			"repl_send shows bounded submitted code and alignment anchors in the raw pane by default (Summary). Respect the current /repl echo setting; use echoMode='off' when the user asks for quiet output, and echoMode='full' only when explicitly requested.",
 			"Keep snippets small. If you need a value back reliably, print it explicitly.",
+			"When the user wants to see a plot, save it to an image file (for example under attachments/) and print its path, unless they want it in a window: people watching the shared session see saved plots on the REPL page, but not windows.",
 			"In GHCi, use normal interactive syntax such as let-bindings or :{ ... :} blocks for multiline declarations.",
 			"In Clojure, use normal interactive syntax such as let-bindings, def/defn, or do forms for multiline code.",
 			"In Ruby, definitions persist in the active IRB workspace and are shared with direct terminal input. Use normal Ruby source, including string interpolation.",
