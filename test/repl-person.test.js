@@ -1,6 +1,6 @@
 import test from "node:test";
 import assert from "node:assert/strict";
-import { existsSync, mkdirSync, mkdtempSync, readdirSync, readFileSync, rmSync, statSync, writeFileSync } from "node:fs";
+import { chmodSync, closeSync, existsSync, mkdirSync, mkdtempSync, openSync, readdirSync, readFileSync, rmSync, statSync, writeFileSync } from "node:fs";
 import { homedir, tmpdir } from "node:os";
 import { join } from "node:path";
 
@@ -36,6 +36,10 @@ test("names are trimmed, at most 80 characters, and without control characters",
 	assert.match(validatePersonName(42).error, /text/);
 	for (const bad of ["Sam\nSmith", "Sam\u0007", "Sam\u2028Smith", "\u202eSam", "Sam\u2066x"]) {
 		assert.match(validatePersonName(bad).error, /control characters/, JSON.stringify(bad));
+	}
+	// Every bidirectional control, U+061C included.
+	for (const code of [0x061c, 0x200e, 0x200f, 0x202a, 0x202b, 0x202c, 0x202d, 0x202e, 0x2066, 0x2067, 0x2068, 0x2069]) {
+		assert.match(validatePersonName(`Sam${String.fromCodePoint(code)}`).error ?? "", /control characters/, code.toString(16));
 	}
 });
 
@@ -74,8 +78,16 @@ test("saving replaces the file atomically with mode 0600; an invalid name is ref
 	assert.deepEqual(savePersonName("  Sam ", env), { name: "Sam", path });
 	assert.deepEqual(JSON.parse(readFileSync(path, "utf8")), { name: "Sam" });
 	if (process.platform !== "win32") assert.equal(statSync(path).mode & 0o777, 0o600);
-	writeFileSync(path, '{"name":"Old"}', { mode: 0o644 });
-	savePersonName("Sam Smith", env);
+	writeFileSync(path, '{"name":"Old"}');
+	chmodSync(path, 0o644);
+	// The old file is replaced, not rewritten in place: a descriptor opened before still reads it.
+	const oldFd = openSync(path, "r");
+	try {
+		savePersonName("Sam Smith", env);
+		assert.equal(readFileSync(oldFd, "utf8"), '{"name":"Old"}');
+	} finally {
+		closeSync(oldFd);
+	}
 	assert.deepEqual(JSON.parse(readFileSync(path, "utf8")), { name: "Sam Smith" });
 	if (process.platform !== "win32") assert.equal(statSync(path).mode & 0o777, 0o600);
 	assert.deepEqual(readdirSync(join(env.XDG_CONFIG_HOME, "pi-repl")), ["person.json"], "no temporary file is left");

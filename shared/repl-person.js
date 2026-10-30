@@ -13,9 +13,9 @@ export const DEFAULT_PERSON_NAME = "User";
 export const PERSON_NAME_MAX_CHARS = 80;
 export const PERSON_NAME_ENV = "PI_REPL_USER_NAME";
 
-// Control characters, line and paragraph separators, and bidirectional controls,
+// Control characters, line and paragraph separators, and Unicode's bidirectional controls,
 // which could break or disguise a name where it is shown.
-const UNSHOWABLE = /[\p{Cc}\p{Zl}\p{Zp}\u200e\u200f\u202a-\u202e\u2066-\u2069]/u;
+const UNSHOWABLE = /[\p{Cc}\p{Zl}\p{Zp}\p{Bidi_Control}]/u;
 
 /** The shared setting: person.json in $XDG_CONFIG_HOME/pi-repl, else ~/.config/pi-repl. */
 export function getPersonSettingPath(env = process.env) {
