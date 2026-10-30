@@ -2442,7 +2442,26 @@ test("a failed metadata read, or metadata this version can't use, never lets ano
 	assert.match(unsynchronised.details.recordWarning, /metadata is invalid for pi-repl-python; leaving it untouched/);
 	assert.equal(await f.tmux("show-options", "-qv", "-t", f.sessionName, "@pi_repl_record_id"), "not-an-id");
 	process.env.TMPDIR = ours;
-	assert.doesNotMatch(await pane(), /FAILED_READ|V2_ELSEWHERE|BAD_METADATA/);
+
+	// After this terminal sets the record ID or version, a read-back that fails refuses too, rather than sending without the lease.
+	await f.tmux("set-option", "-u", "-t", f.sessionName, "@pi_repl_record_id");
+	await f.tmux("set-option", "-u", "-t", f.sessionName, "@pi_repl_record_version");
+	const failSecondRead = (option) => {
+		let reads = 0;
+		f.onExec((command, args) => {
+			if (command !== "tmux" || args[0] !== "show-options" || !args.includes(option)) return undefined;
+			reads += 1;
+			return reads === 2 ? { stdout: "", stderr: "lost server", code: 1, killed: false } : undefined;
+		});
+	};
+	failSecondRead("@pi_repl_record_id");
+	await assert.rejects(f.send("print('LOST_' + 'ID')"), /^Error: Nothing was sent: Could not read pi-repl-python's @pi_repl_record_id: lost server\.$/);
+	failSecondRead("@pi_repl_record_version");
+	await assert.rejects(f.send("print('LOST_' + 'VERSION')"), /^Error: Nothing was sent: Could not read pi-repl-python's @pi_repl_record_version: lost server\.$/);
+	f.onExec(undefined);
+	assert.match((await f.send("print('RECOVERED')")).content[0].text, /RECOVERED/);
+	assert.equal(await key(), ourKey);
+	assert.doesNotMatch(await pane(), /FAILED_READ|V2_ELSEWHERE|BAD_METADATA|LOST_ID|LOST_VERSION/);
 });
 
 test("a settling send waits through failed inspections, and only a verified end of its session releases it", { timeout: 60000 }, async (t) => {

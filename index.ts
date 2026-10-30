@@ -1118,25 +1118,27 @@ async function ensureTmuxSessionRecord(
 		const reason = error instanceof Error ? error.message : String(error);
 		return { recordId, warning: reason, refusal: reason };
 	}
-	if (!recordId) {
-		const candidate = createReplSessionRecordId();
-		if (!(await setTmuxSessionOptionIfAbsent(pi, identity.tmuxSessionId, REPL_SESSION_RECORD_ID_OPTION, candidate, cwd))) {
-			return { warning: `Could not attach shared record metadata to ${identity.sessionName}.` };
+	// A set or read-back that fails refuses too: the fallback would send without the lease.
+	try {
+		if (!recordId) {
+			const candidate = createReplSessionRecordId();
+			if (!(await setTmuxSessionOptionIfAbsent(pi, identity.tmuxSessionId, REPL_SESSION_RECORD_ID_OPTION, candidate, cwd))) {
+				throw new Error(`Could not attach shared record metadata to ${identity.sessionName}.`);
+			}
+			recordId = await readSessionRecordOption(pi, identity, REPL_SESSION_RECORD_ID_OPTION, cwd);
 		}
-		recordId = await readTmuxSessionOption(pi, identity.tmuxSessionId, REPL_SESSION_RECORD_ID_OPTION, cwd);
+		if (!version) {
+			if (!(await setTmuxSessionOptionIfAbsent(pi, identity.tmuxSessionId, REPL_SESSION_RECORD_VERSION_OPTION, String(REPL_SESSION_RECORD_VERSION), cwd))) {
+				throw new Error(`Could not attach shared record metadata to ${identity.sessionName}.`);
+			}
+			version = await readSessionRecordOption(pi, identity, REPL_SESSION_RECORD_VERSION_OPTION, cwd);
+		}
+	} catch (error) {
+		const reason = error instanceof Error ? error.message : String(error);
+		return { recordId, warning: reason, refusal: reason };
 	}
 	if (!recordId || !isValidReplSessionRecordId(recordId)) {
 		return { warning: `Could not read valid shared record metadata from ${identity.sessionName}.` };
-	}
-	if (!version) {
-		await setTmuxSessionOptionIfAbsent(
-			pi,
-			identity.tmuxSessionId,
-			REPL_SESSION_RECORD_VERSION_OPTION,
-			String(REPL_SESSION_RECORD_VERSION),
-			cwd,
-		);
-		version = await readTmuxSessionOption(pi, identity.tmuxSessionId, REPL_SESSION_RECORD_VERSION_OPTION, cwd);
 	}
 	if (version !== String(REPL_SESSION_RECORD_VERSION)) {
 		return {
