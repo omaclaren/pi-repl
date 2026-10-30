@@ -220,9 +220,10 @@ async function setOption(tmux, target, name, value, scope = []) {
 
 /**
  * The session's shared clean record, as the other runtimes' sessions have
- * one: its ID in the session's tmux options, and DIR/record.json, which tells
- * this launch's helper (`owner`) where to write its entries. record.json is
- * written last, so that the helper records only once everything else is in
+ * one: its record-directory key, bound first, before the record or its ID
+ * exists; its ID in the session's tmux options; and DIR/record.json, which
+ * tells this launch's helper (`owner`) where to write its entries. record.json
+ * is written last, so that the helper records only once everything else is in
  * place. Resolves with a warning, rather than failing the start, when it
  * can't be set up; cells are then not recorded.
  */
