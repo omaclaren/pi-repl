@@ -4,6 +4,8 @@ All notable changes to `pi-repl` are documented here.
 
 ## [Unreleased]
 
+## [0.11.6] — 2026-10-30
+
 ### Added
 - LFortran's session has a clean record, as the other runtimes' sessions do. The helper writes an entry for each cell sent through pi-repl, the agent's and `/repl send lfortran`'s, with the sender's label, mode and request ID: `sent` until the cell finishes, then `captured`, or `error` if its outcome couldn't be confirmed. A failed cell keeps its output with a last line saying it failed, and a cell LFortran skipped after an earlier failure says so. Writes are queued off the helper's protocol reader, a finished entry is never changed back, and a failed write is a warning in status. `/repl status lfortran` shows the record, and `/repl export lfortran` writes it as Markdown. Cells run at the person's prompt aren't recorded.
 - `/repl send lfortran` records under the person's name, with a `pi:send:` request ID, as `/repl send` does for the other runtimes. `sendLfortranForHost` sends a person's LFortran cell for a host that prints the result, under the host's request ID and label, such as agent-repl's `cli:send:`.
