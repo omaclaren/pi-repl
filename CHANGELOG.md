@@ -4,6 +4,8 @@ All notable changes to `pi-repl` are documented here.
 
 ## [Unreleased]
 
+## [0.11.5] — 2026-10-30
+
 ### Added
 - `/repl name [name|--clear]` shows, saves or removes the name a person's sends are recorded under. It's the account's shared setting, `person.json` in `$XDG_CONFIG_HOME/pi-repl/` or `~/.config/pi-repl/`, saved atomically with mode 0600 and never written on read. `PI_REPL_USER_NAME` overrides it, and without either the name is `User`. Names are trimmed, at most 80 characters, without control characters. A setting that can't be used gives a warning, and `User`.
 - `resolvePersonName`, `savePersonName`, `clearPersonName`, `formatPersonNameStatus` and `personRequestId` are exported, so a host such as agent-repl records its own person commands the same way.

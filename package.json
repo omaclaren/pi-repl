@@ -1,6 +1,6 @@
 {
   "name": "pi-repl",
-  "version": "0.11.4",
+  "version": "0.11.5",
   "description": "Collaborative tmux-backed REPL sessions for pi",
   "type": "module",
   "license": "MIT",
