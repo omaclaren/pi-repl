@@ -8,6 +8,7 @@ Compatible clients inspect two tmux session options:
 
 - `@pi_repl_record_id`: 32 lowercase hexadecimal characters
 - `@pi_repl_record_version`: `1`
+- `@pi_repl_record_root_key`: which record directory holds the record (see "One record directory per session")
 
 A client creating metadata uses tmux `set-option -o`, so concurrent first writers cannot replace an ID already chosen by another client. The option contains an opaque ID, never a filesystem path.
 
@@ -52,6 +53,32 @@ The record is a bounded JSON snapshot:
 ```
 
 Each entry has a stable `id`, optional `requestId`, timestamps, session/runtime identity, `origin` (`pi-repl` or `pi-studio`), a presentation `label`, `mode` (`raw`, `literate`, or `agent`), prose, code, cleaned output, status, and skipped/truncation metadata.
+
+## One record directory per session
+
+The record directory is under the operating system's temporary directory, which can differ between terminals of one account: an ssh login and a desktop terminal can have different `TMPDIR` values. Clients in each would otherwise keep separate records and separate send leases for one session. So a session records which directory holds its record, and clients refuse a different one. This adds a tmux option, not a record field, and keeps version 1.
+
+**The key.** `@pi_repl_record_root_key` holds `v1:` and the first 32 lowercase hexadecimal characters of the SHA-256 of `<device>:<inode>` of the record directory, both written as exact decimal integers (from a `bigint` stat), after the directory passes the checks above. It is not a path, and different spellings of one directory give the same key. Any other value is malformed: clients refuse it and never replace it. Test vectors:
+
+| `<device>:<inode>` | Key |
+|---|---|
+| `0:0` | `v1:ac72368a586a18c19088393573ce0307` |
+| `16777232:1234567` | `v1:1e42c564492d3e74e2ef33a98ea2fc21` |
+| `18446744073709551615:9223372036854775813` | `v1:eb75db16e5ba9caa199d69d116a8ac77` |
+
+**Writers,** clients that set a session's metadata, write its record or take its lease:
+
+1. **Fresh metadata.** The key comes first. A writer sets it with `set-option -o` before the record ID, the record or the lease, then reads it back and compares it with its own: a set that succeeds doesn't prove it won. So an upgraded writer never leaves a record ID without a key.
+2. **A record ID without a key** was made by an older client. A writer sets the key, as in 1, only if its own directory already holds a valid record for this exact session (name, tmux session ID and creation time), read without creating, locking or repairing anything. Otherwise it refuses, and it never creates an empty record to claim the session. This doesn't prove that no split happened earlier: if older clients made valid copies in two directories, either qualifies, and the key chooses where upgraded writers go from then on.
+3. **A key** that doesn't name the writer's own directory, or is malformed, is refused.
+
+Reads of the key are bound to the session's exact lifetime (session ID and creation time). A writer checks the key again where it uses the record or lease, including after waiting for the lease, and recomputes its own key there, so a replaced directory is found. On any failure it refuses before sending, and never falls back to an unsynchronised send.
+
+**Readers,** such as status views, exports, previews and history tools, never set the key, create a directory, record or lock, or change a mode. With a matching key, they read as usual. With a different or malformed key, they refuse, with a notice. With no key, they may show a strictly validated local record, with a "record directory not verified" notice.
+
+**What it guarantees.** It detects a client whose record directory is a different directory from the one the session's record was made in. A replaced directory, for example after temporary-file cleanup, almost always has a new inode, so it is refused too, but reuse of the same device and inode can't be detected. Refusals say "different or replaced record directory" rather than naming one cause. The remedy is the person's: use a terminal with the same temporary directory, or restart the session, which discards its state. Clients never move a session between directories or repair its key.
+
+**Rollout.** Older clients ignore the key, so the check holds only among upgraded clients until every client is updated.
 
 ## People's sends
 

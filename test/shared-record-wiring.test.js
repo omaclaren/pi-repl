@@ -58,7 +58,9 @@ test("repl_send emits bounded pane echoes with clean-record-derived anchors", ()
 
 test("/repl export writes the canonical record without clobbering a file", () => {
 	assert.match(source, /case "export":/);
-	assert.match(source, /readReplSessionRecord\(/);
+	// Export only reads: never the reading helper that creates or repairs.
+	assert.match(source, /readReplSessionRecordStrict\(/);
+	assert.doesNotMatch(source, /readReplSessionRecord\(/);
 	assert.match(source, /renderReplSessionRecordMarkdown\(/);
 	assert.match(source, /flag: "wx"/);
 });

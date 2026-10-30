@@ -16,18 +16,23 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import {
 	REPL_SESSION_RECORD_ID_OPTION,
+	REPL_SESSION_RECORD_ROOT_KEY_OPTION,
 	REPL_SESSION_RECORD_VERSION,
 	REPL_SESSION_RECORD_VERSION_OPTION,
 	acquireReplSessionSendLease,
+	bindReplSessionRecordRoot,
+	classifyReplSessionRecordRoot,
+	describeReplSessionRecordRoot,
 	readReplSessionSendLease,
 	recordEntryKey,
 	createReplSessionRecordId,
 	ensureReplSessionRecord,
 	getReplSessionRecordPath,
 	isValidReplSessionRecordId,
-	readReplSessionRecord,
+	readReplSessionRecordStrict,
 	renderReplSessionRecordMarkdown,
 	upsertReplSessionRecordEntry,
+	verifyReplSessionRecordRoot,
 } from "./shared/repl-session-record.js";
 import {
 	createReplSubmissionDisplay,
@@ -272,6 +277,10 @@ type SessionInfo = {
 	recordEntryCount?: number;
 	recordTail?: SharedReplRecordEntry[];
 	recordWarning?: string;
+	// The session's record is in another record directory, or can't be checked: sends from here are refused.
+	recordRefusal?: string;
+	// The session has no record-directory key, so this terminal's record may not be the one other clients use.
+	recordUnverified?: boolean;
 	currentCommand: string;
 	currentPath: string;
 	tail: string;
@@ -962,21 +971,117 @@ type ReplSessionIdentity = {
 	runtime: string;
 };
 
-async function ensureTmuxSessionRecord(
-	pi: ExtensionAPI,
-	identity: ReplSessionIdentity,
-	cwd: string,
-): Promise<{
+type SessionRecordState = {
 	recordId?: string;
 	recordPath?: string;
 	recordEntryCount?: number;
 	recordTail?: SharedReplRecordEntry[];
 	warning?: string;
-}> {
+	refusal?: string;
+	unverified?: boolean;
+};
+
+/**
+ * tmux access to one session lifetime's record-directory key: unset is
+ * undefined, and a read that fails, or finds another lifetime, rejects.
+ */
+function recordRootKeyTmux(pi: ExtensionAPI, identity: ReplSessionIdentity, cwd: string) {
+	return {
+		async readKey(): Promise<string | undefined> {
+			const result = await execTmux(pi, ["show-options", "-v", "-t", identity.tmuxSessionId, REPL_SESSION_RECORD_ROOT_KEY_OPTION], cwd, 3_000);
+			const lifetime = await execTmux(pi, ["display-message", "-p", "-t", identity.tmuxSessionId, "#{session_id}\t#{session_created}"], cwd, 3_000);
+			if (lifetime.code !== 0 || lifetime.stdout.trim() !== `${identity.tmuxSessionId}\t${identity.tmuxSessionCreatedAt}`) {
+				throw new Error(`${identity.sessionName} changed while its record-directory key was read.`);
+			}
+			if (result.code === 0) return result.stdout.replace(/\r?\n$/, "");
+			if (/invalid option|unknown option/i.test(result.stderr)) return undefined;
+			throw new Error(`Could not read ${identity.sessionName}'s record-directory key: ${result.stderr.trim() || `tmux exited with ${result.code}`}.`);
+		},
+		async setKeyIfAbsent(key: string): Promise<void> {
+			await execTmux(pi, ["set-option", "-qo", "-t", identity.tmuxSessionId, REPL_SESSION_RECORD_ROOT_KEY_OPTION, key], cwd, 3_000);
+		},
+	};
+}
+
+/**
+ * The record-directory check where a send uses the record or lease, after
+ * waiting for the lease: why the send must stop, or undefined to go ahead.
+ */
+async function checkRecordRootAtUse(pi: ExtensionAPI, identity: ReplSessionIdentity, cwd: string): Promise<string | undefined> {
+	try {
+		const checked = await verifyReplSessionRecordRoot(recordRootKeyTmux(pi, identity, cwd), identity.sessionName);
+		return checked.ok ? undefined : checked.reason;
+	} catch (error) {
+		return error instanceof Error ? error.message : String(error);
+	}
+}
+
+/**
+ * The session's record as a reader sees it: it never sets an option or
+ * creates a directory, record or key, and reads the record only from this
+ * terminal's record directory, refusing one the session's key doesn't name.
+ */
+async function readTmuxSessionRecord(pi: ExtensionAPI, identity: ReplSessionIdentity, cwd: string): Promise<SessionRecordState> {
+	const recordId = await readTmuxSessionOption(pi, identity.tmuxSessionId, REPL_SESSION_RECORD_ID_OPTION, cwd);
+	if (!recordId) return {};
+	if (!isValidReplSessionRecordId(recordId)) {
+		return { warning: `Shared REPL record metadata is invalid for ${identity.sessionName}; leaving it untouched.` };
+	}
+	const version = await readTmuxSessionOption(pi, identity.tmuxSessionId, REPL_SESSION_RECORD_VERSION_OPTION, cwd);
+	if (version && version !== String(REPL_SESSION_RECORD_VERSION)) {
+		return { recordId, warning: `Shared REPL record version ${version} is not supported by this pi-repl version.` };
+	}
+	try {
+		const state = classifyReplSessionRecordRoot(await recordRootKeyTmux(pi, identity, cwd).readKey());
+		if (state === "different" || state === "malformed") {
+			const reason = describeReplSessionRecordRoot(state, identity.sessionName);
+			return { recordId, warning: reason, refusal: reason };
+		}
+		const unverified = state === "unverified";
+		const record = readReplSessionRecordStrict(recordId, identity);
+		if (!record) {
+			if (!unverified) return { recordId, recordPath: getReplSessionRecordPath(recordId), recordEntryCount: 0, recordTail: [] };
+			return { recordId, unverified, warning: describeReplSessionRecordRoot("elsewhere", identity.sessionName) };
+		}
+		return {
+			recordId,
+			recordPath: getReplSessionRecordPath(recordId),
+			recordEntryCount: record.entries.length,
+			recordTail: record.entries.slice(-20) as SharedReplRecordEntry[],
+			unverified,
+		};
+	} catch (error) {
+		const reason = error instanceof Error ? error.message : String(error);
+		return { recordId, warning: reason, refusal: reason };
+	}
+}
+
+/**
+ * The session's record for a writer, before a send: its record-directory key
+ * set or checked first, then its record ID and version set if absent, then
+ * its record created if this directory has none. A key that doesn't name this
+ * terminal's record directory refuses the send.
+ */
+async function ensureTmuxSessionRecord(
+	pi: ExtensionAPI,
+	identity: ReplSessionIdentity,
+	cwd: string,
+): Promise<SessionRecordState> {
 	let recordId = await readTmuxSessionOption(pi, identity.tmuxSessionId, REPL_SESSION_RECORD_ID_OPTION, cwd);
 	let version = await readTmuxSessionOption(pi, identity.tmuxSessionId, REPL_SESSION_RECORD_VERSION_OPTION, cwd);
 	if (recordId && !isValidReplSessionRecordId(recordId)) {
 		return { warning: `Shared REPL record metadata is invalid for ${identity.sessionName}; leaving it untouched.` };
+	}
+	if (version && version !== String(REPL_SESSION_RECORD_VERSION)) {
+		return { recordId, warning: `Shared REPL record version ${version} is not supported by this pi-repl version.` };
+	}
+	// The key comes before the record ID, so an ID without a key was made by an older client.
+	try {
+		const bound = await bindReplSessionRecordRoot(recordRootKeyTmux(pi, identity, cwd), { sessionName: identity.sessionName, recordId, identity });
+		if (!bound.ok) return { recordId, warning: bound.reason, refusal: bound.reason };
+	} catch (error) {
+		const reason = error instanceof Error ? error.message : String(error);
+		return { recordId, warning: reason, refusal: reason };
 	}
 	if (!recordId) {
 		const candidate = createReplSessionRecordId();
@@ -1059,7 +1164,17 @@ async function enableSessionHistoryLogging(
 // tmux's explicit answer that a session (or its whole server) is gone; other failures prove nothing.
 const TMUX_SESSION_ABSENT = /no server running|can't find session:|(?:error connecting|failed to connect).*?(?:No such file|Connection refused)/i;
 
-async function readSessionInfo(pi: ExtensionAPI, sessionName: string, cwd: string, inspectPrompt = false): Promise<SessionInfo | null> {
+/**
+ * A session's state. Only a writer ({ write: true }: a start, or a send about
+ * to take the lease) sets the session's record metadata or creates its record;
+ * everything else reads, and changes nothing.
+ */
+async function readSessionInfo(
+	pi: ExtensionAPI,
+	sessionName: string,
+	cwd: string,
+	{ inspectPrompt = false, write = false }: { inspectPrompt?: boolean; write?: boolean } = {},
+): Promise<SessionInfo | null> {
 	if (!(await tmuxSessionExists(pi, sessionName, cwd))) return null;
 
 	let target: string;
@@ -1103,12 +1218,13 @@ async function readSessionInfo(pi: ExtensionAPI, sessionName: string, cwd: strin
 	}
 	const runtime = await readTmuxSessionOption(pi, tmuxSessionId, REPL_RUNTIME_OPTION, cwd);
 	const historyPath = await readTmuxSessionOption(pi, tmuxSessionId, REPL_HISTORY_OPTION, cwd);
-	const record = await ensureTmuxSessionRecord(pi, {
+	const identity = {
 		sessionName: resolvedSessionName,
 		tmuxSessionId,
 		tmuxSessionCreatedAt,
 		runtime: runtime || "unknown",
-	}, cwd);
+	};
+	const record = write ? await ensureTmuxSessionRecord(pi, identity, cwd) : await readTmuxSessionRecord(pi, identity, cwd);
 
 	return {
 		sessionName: resolvedSessionName,
@@ -1121,6 +1237,8 @@ async function readSessionInfo(pi: ExtensionAPI, sessionName: string, cwd: strin
 		recordEntryCount: record.recordEntryCount,
 		recordTail: record.recordTail,
 		recordWarning: record.warning,
+		recordRefusal: record.refusal,
+		recordUnverified: record.unverified,
 		currentCommand: currentCommand || "unknown",
 		currentPath: currentPath || cwd,
 		tail: tailResult.stdout.trim(),
@@ -1157,6 +1275,7 @@ function formatSessionInfo(info: SessionInfo, pi?: ExtensionAPI): string {
 		`Path: ${info.currentPath}`,
 		...(info.recordPath ? [`Clean shared record: ${info.recordPath} (${info.recordEntryCount ?? 0} entries)`] : []),
 		...(latestRecordEntry ? [`Latest clean entry: ${latestRecordEntry.origin} · ${latestRecordEntry.label} · ${latestRecordEntry.status}`] : []),
+		...(info.recordUnverified && info.recordPath ? [`Record directory not verified: the session has no record-directory key yet. The next send from here sets it to this terminal's record directory; a copy older clients kept anywhere else then stops being used.`] : []),
 		...(info.recordWarning ? [`Shared record warning: ${info.recordWarning}`] : []),
 		...(info.historyPath ? [`Raw history log: ${info.historyPath}`] : []),
 		...[formatSendLease(info)].filter((line): line is string => Boolean(line)),
@@ -1179,7 +1298,8 @@ async function formatSessionStatus(pi: ExtensionAPI, info: SessionInfo, cwd: str
 
 /** Which send holds the session, if one does: a send still settling holds it until its code finishes. */
 function formatSendLease(info: SessionInfo): string | undefined {
-	if (!info.recordId) return undefined;
+	// With the record in another directory, this terminal's lease isn't the session's.
+	if (!info.recordId || info.recordRefusal) return undefined;
 	let lease: ReturnType<typeof readReplSessionSendLease>;
 	try {
 		lease = readReplSessionSendLease(info.recordId);
@@ -1290,7 +1410,7 @@ async function waitForReplSessionInfo(
 	let identity: SessionInfo | undefined;
 	while (true) {
 		checkStartAborted(signal, sessionName);
-		const info = await readSessionInfo(pi, identity?.tmuxSessionId || sessionTarget, cwd, true);
+		const info = await readSessionInfo(pi, identity?.tmuxSessionId || sessionTarget, cwd, { inspectPrompt: true, write: true });
 		checkStartAborted(signal, sessionName);
 		if (!info) throw new Error(`REPL session ended while waiting for ${sessionName}. Check the runtime and your login-shell configuration before retrying.`);
 		if (identity && (info.tmuxSessionId !== identity.tmuxSessionId || info.tmuxSessionCreatedAt !== identity.tmuxSessionCreatedAt || info.recordId !== identity.recordId)) {
@@ -2249,6 +2369,8 @@ async function runReplCode(
 		);
 	}
 
+	if (sessionInfo.recordRefusal) throw new Error(`Nothing was sent: ${sessionInfo.recordRefusal}`);
+
 	if (
 		options.expectedSession
 		&& (
@@ -2426,7 +2548,9 @@ async function runTrackedReplCode(
 	const sessionName = getSessionNameForSelector(target);
 	// The record's entry ID, from which the control files and the pane's anchor are named too.
 	const submissionId = `pi-repl:${recordEntryKey(metadata.requestId)}`;
-	const sessionInfo = await readSessionInfo(pi, sessionName, ctx.cwd);
+	const sessionInfo = await readSessionInfo(pi, sessionName, ctx.cwd, { write: true });
+	// A session whose record is in another record directory is never sent to unsynchronised.
+	if (sessionInfo?.recordRefusal) throw new Error(`Nothing was sent: ${sessionInfo.recordRefusal}`);
 	if (!sessionInfo?.recordId || !sessionInfo.recordPath || sessionInfo.recordWarning) {
 		const execution = await runReplCode(pi, params, ctx, signal, { submissionId, forAgent });
 		return {
@@ -2451,6 +2575,11 @@ async function runTrackedReplCode(
 		waitMs: timeoutMs,
 		signal,
 	});
+	const atUse = await checkRecordRootAtUse(pi, identity, ctx.cwd);
+	if (atUse) {
+		await lease.release().catch(() => undefined);
+		throw new Error(`Nothing was sent: ${atUse}`);
+	}
 	const submissionStateRef: { current: ReplSubmissionState | null } = { current: null };
 	let recordEntry: SharedReplRecordEntry | null = null;
 	let recordWarning = sessionInfo.recordWarning;
@@ -2747,7 +2876,8 @@ export async function sendAndSettle(pi: ExtensionAPI, ctx: ExtensionContext, opt
 	const sessionName = getSessionNameForSelector(target);
 	if (!options.code.trim()) throw notSent("the code is empty.");
 	if (!(await tmuxSessionExists(pi, sessionName, ctx.cwd))) throw notSent(missingSessionError(target, sessionName).message);
-	const sessionInfo = await readSessionInfo(pi, sessionName, ctx.cwd);
+	const sessionInfo = await readSessionInfo(pi, sessionName, ctx.cwd, { write: true });
+	if (sessionInfo?.recordRefusal) throw notSent(sessionInfo.recordRefusal);
 	if (!sessionInfo?.recordId || !sessionInfo.recordPath || sessionInfo.recordWarning) {
 		throw notSent(`the session's shared record isn't usable${sessionInfo?.recordWarning ? ` (${sessionInfo.recordWarning})` : ""}, so the send couldn't be recorded.`);
 	}
@@ -2759,6 +2889,11 @@ export async function sendAndSettle(pi: ExtensionAPI, ctx: ExtensionContext, opt
 		lease = await acquireReplSessionSendLease(sessionInfo.recordId, { owner: `pi-repl:${options.requestId}`, waitMs: options.leaseWaitMs ?? 60_000, signal: options.signal });
 	} catch (error) {
 		throw notSent(error instanceof Error ? error.message : String(error));
+	}
+	const atUse = await checkRecordRootAtUse(pi, identity, ctx.cwd);
+	if (atUse) {
+		await lease.release().catch(() => undefined);
+		throw notSent(atUse);
 	}
 	let entry: SharedReplRecordEntry;
 	try {
@@ -3709,13 +3844,13 @@ async function exportReplRecord(
 	}
 
 	const { info } = selected;
-	if (!info.recordId) {
+	if (!info.recordId || info.recordRefusal) {
 		notify(ctx, info.recordWarning || `No compatible clean record is available for ${info.sessionName}.`, "error");
 		return;
 	}
 
 	try {
-		const record = readReplSessionRecord(info.recordId, {
+		const record = readReplSessionRecordStrict(info.recordId, {
 			sessionName: info.sessionName,
 			tmuxSessionId: info.tmuxSessionId,
 			tmuxSessionCreatedAt: info.tmuxSessionCreatedAt,
@@ -3740,7 +3875,8 @@ async function exportReplRecord(
 			}
 		}
 		if (!outputPath) throw new Error("Could not choose an unused export filename.");
-		notify(ctx, `Exported ${record.entries.length} clean record entries to ${outputPath}`, "info");
+		const unverified = info.recordUnverified ? `\n\n${describeReplSessionRecordRoot("unverified", info.sessionName)}` : "";
+		notify(ctx, `Exported ${record.entries.length} clean record entries to ${outputPath}${unverified}`, "info");
 	} catch (error) {
 		notify(ctx, `Could not export the shared REPL record: ${error instanceof Error ? error.message : String(error)}`, "error");
 	}

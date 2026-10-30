@@ -6,7 +6,7 @@ import { tmpdir } from "node:os";
 import { dirname, join } from "node:path";
 import { promisify } from "node:util";
 import { randomUUID } from "node:crypto";
-import { acquireReplSessionSendLease, readReplSessionRecord, upsertReplSessionRecordEntry } from "../shared/repl-session-record.js";
+import { acquireReplSessionSendLease, readReplSessionRecord, readReplSessionRecordRootKey, upsertReplSessionRecordEntry } from "../shared/repl-session-record.js";
 import { createReplSubmissionDisplay } from "../shared/repl-submission-display.js";
 import { gnuplotStringLiteral } from "../shared/repl-gnuplot.js";
 import { createTestTmux, readProcessTable } from "./helpers/repl-test-tmux.js";
@@ -2318,6 +2318,81 @@ test("a settling send that can't be recorded, or is cancelled before it is sent,
 	await assert.rejects(settlingSend(f, "print('UNRECORDED')"), /^Error: Nothing was sent: the session's shared record isn't usable \(Shared REPL record version 999 is not supported/);
 	assert.equal(await pane(), before);
 	assert.equal(readReplSessionRecord(recordId).entries.length, 0);
+});
+
+test("a session's record directory is keyed when it starts; another directory's sends are refused, and readers only read", { timeout: 60000 }, async (t) => {
+	// This test's own TMPDIR, so that replacing its record directory touches no other test's.
+	const ours = mkdtempSync(join(root, "record-root-"));
+	process.env.TMPDIR = ours;
+	t.after(() => { process.env.TMPDIR = root; });
+	const f = await fixture(t, { startWithTool: true });
+	if (!f) return;
+	const recordRoot = (tmp) => join(tmp, `pi-repl-session-records-${process.getuid()}`);
+	const key = () => f.tmux("show-options", "-qv", "-t", f.sessionName, "@pi_repl_record_root_key");
+	const pane = () => f.tmux("capture-pane", "-p", "-t", `${f.sessionName}:^`, "-S", "-200");
+	const ourKey = readReplSessionRecordRootKey();
+	assert.match(ourKey, /^v1:[0-9a-f]{32}$/);
+	assert.equal(await key(), ourKey, "the start sets the key");
+	const recordId = (await f.status()).details.python.recordId;
+	const entries = () => readReplSessionRecord(recordId).entries;
+	const statusText = async () => (await f.status()).content[0].text;
+	assert.match(await statusText(), /Clean shared record: /);
+	assert.doesNotMatch(await statusText(), /not verified/);
+
+	// Another terminal, with another TMPDIR: its status says so and creates nothing.
+	const other = mkdtempSync(join(root, "other-tmp-"));
+	process.env.TMPDIR = other;
+	const elsewhere = await statusText();
+	assert.match(elsewhere, /Shared record warning: pi-repl-python's shared record is in a different or replaced record directory, not this terminal's \(/);
+	assert.doesNotMatch(elsewhere, /Clean shared record:|Send lease:/);
+	assert.equal(existsSync(recordRoot(other)), false, "a reader creates no record directory");
+	// Its sends are refused before anything is sent: an agent's and a person's.
+	await assert.rejects(f.send("print('SPLIT_' + 'AGENT')"), /^Error: Nothing was sent: pi-repl-python's shared record is in a different or replaced record directory/);
+	await assert.rejects(settlingSend(f, "print('SPLIT_' + 'PERSON')"), /^Error: Nothing was sent: pi-repl-python's shared record is in a different or replaced record directory/);
+	assert.equal(existsSync(join(recordRoot(other), `${recordId}.json`)), false);
+	process.env.TMPDIR = ours;
+	assert.doesNotMatch(await pane(), /SPLIT_AGENT|SPLIT_PERSON/);
+	assert.equal(entries().length, 0);
+
+	// Metadata an older client made, without a key: readers say it isn't verified...
+	await f.tmux("set-option", "-u", "-t", f.sessionName, "@pi_repl_record_root_key");
+	assert.match(await statusText(), /\nRecord directory not verified: the session has no record-directory key yet\. The next send from here sets it to this terminal's record directory/);
+	assert.equal(await key(), "", "a reader never adopts the key");
+	// ...a terminal whose directory lacks the record is refused and claims nothing...
+	process.env.TMPDIR = other;
+	await assert.rejects(f.send("print('UNCLAIMED')"), /^Error: Nothing was sent: pi-repl-python's record isn't in this terminal's record directory/);
+	assert.equal(await key(), "");
+	assert.equal(existsSync(join(recordRoot(other), `${recordId}.json`)), false, "no empty record is made to claim the session");
+	process.env.TMPDIR = ours;
+	// ...and the terminal that holds it sets the key, and sends.
+	assert.match((await f.send("print('ADOPTED')")).content[0].text, /ADOPTED/);
+	assert.equal(await key(), ourKey);
+	assert.deepEqual(entries().map((entry) => entry.output), ["ADOPTED"]);
+
+	// A key that isn't one this version knows is refused and left as it is.
+	await f.tmux("set-option", "-t", f.sessionName, "@pi_repl_record_root_key", "v2:unknown");
+	await assert.rejects(f.send("print('MALFORMED_' + 'KEY')"), /^Error: Nothing was sent: pi-repl-python's record-directory key \(@pi_repl_record_root_key\) isn't one this version understands/);
+	assert.equal(await key(), "v2:unknown");
+	await f.tmux("set-option", "-t", f.sessionName, "@pi_repl_record_root_key", ourKey);
+
+	// A key that changes while a send waits for the lease stops it there, before anything is written or sent.
+	const held = await acquireReplSessionSendLease(recordId, { owner: "test", waitMs: 0 });
+	const callsBefore = f.calls.length;
+	const waiting = f.send("print('AFTER_' + 'WAIT')", { timeoutMs: 10000 });
+	waiting.catch(() => undefined);
+	await eventually(() => f.calls.slice(callsBefore).some((call) => call.args[0] === "show-options" && call.args.includes("@pi_repl_record_root_key")));
+	await new Promise((resolve) => setTimeout(resolve, 400));
+	await f.tmux("set-option", "-t", f.sessionName, "@pi_repl_record_root_key", "v1:ac72368a586a18c19088393573ce0307");
+	await held.release();
+	await assert.rejects(waiting, /^Error: Nothing was sent: pi-repl-python's shared record is in a different or replaced record directory/);
+	assert.equal(entries().length, 1);
+	await f.tmux("set-option", "-t", f.sessionName, "@pi_repl_record_root_key", ourKey);
+
+	// A replaced directory, as temporary-file cleanup might leave it, is refused until the session restarts.
+	renameSync(recordRoot(ours), `${recordRoot(ours)}-cleaned`);
+	await assert.rejects(f.send("print('REPLACED')"), /^Error: Nothing was sent: pi-repl-python's shared record is in a different or replaced record directory/);
+	assert.equal(await key(), ourKey);
+	assert.doesNotMatch(await pane(), /AFTER_WAIT|MALFORMED_KEY|REPLACED\n/);
 });
 
 test("a settling send waits through failed inspections, and only a verified end of its session releases it", { timeout: 60000 }, async (t) => {
