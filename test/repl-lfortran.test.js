@@ -11,7 +11,7 @@ import { join } from "node:path";
 import { promisify } from "node:util";
 import { DEFAULT_MAX_BYTES } from "@earendil-works/pi-coding-agent";
 import { visibleWidth } from "@earendil-works/pi-tui";
-import { answerLfortranInput, formatExecution, lfortranStatus } from "../shared/repl-lfortran.js";
+import { answerLfortranInput, formatExecution, lfortranStatus, sendLfortranCode } from "../shared/repl-lfortran.js";
 import { readSessionIdentity } from "../shared/repl-jupyter-session.js";
 import { REAL_LFORTRAN, defer, lfortranFixture, until } from "./helpers/repl-test-lfortran.js";
 
@@ -22,11 +22,11 @@ const TOKEN = /token='([0-9a-f]{32})'/;
 async function piFixture(t, options = {}) {
 	const f = lfortranFixture(t, options);
 	if (!f) return null;
-	const tools = new Map(), commands = new Map(), notifications = [], messages = [], renderers = new Map();
+	const tools = new Map(), commands = new Map(), notifications = [], messages = [], renderers = new Map(), handlers = new Map();
 	const pi = {
 		registerTool: (tool) => tools.set(tool.name, tool),
 		registerCommand: (name, definition) => commands.set(name, definition),
-		on() {},
+		on: (event, handler) => handlers.set(event, [...(handlers.get(event) ?? []), handler]),
 		sendMessage: (message, options) => messages.push({ message, options }),
 		registerMessageRenderer: (customType, renderer) => renderers.set(customType, renderer),
 		async exec(command, args, execOptions = {}) {
@@ -50,6 +50,12 @@ async function piFixture(t, options = {}) {
 	const module = await import(`../index.ts?lfortran=${randomUUID()}`);
 	module.default(pi);
 	const tool = (name, params, signal) => tools.get(name).execute(randomUUID(), params, signal, undefined, ctx);
+	// Pi's events, as Pi fires them for this registration.
+	const fire = async (event, payload = {}) => {
+		const results = [];
+		for (const handler of handlers.get(event) ?? []) results.push(await handler({ type: event, ...payload }, ctx));
+		return results;
+	};
 	const repl = async (args) => {
 		const before = notifications.length;
 		await commands.get("repl").handler(args, ctx);
@@ -72,6 +78,9 @@ async function piFixture(t, options = {}) {
 		status: (params = {}) => tool("repl_status", params),
 		tool,
 		repl,
+		fire,
+		// What the model is given next, as Pi's context_with_system shows it.
+		given: (...texts) => fire("context_with_system", { messages: texts.map((text) => ({ role: "toolResult", content: [{ type: "text", text }] })) }),
 	};
 }
 
@@ -330,4 +339,56 @@ test("with LFortran: repl_start, repl_send, and a READ through repl_input", { sk
 	assert.doesNotMatch(entries()[2].output, /\x1b/);
 	const [stopped] = await f.repl("stop lfortran");
 	assert.match(stopped.message, /Stopped the shared LFortran session/);
+});
+
+test("the agent is told of other clients' LFortran cells, the helper's later settled write as an update, and not of its own cells or what's typed at the prompt", async (t) => {
+	const f = await piFixture(t);
+	if (!f) return;
+	assert.equal((await f.start()).details.ready, true);
+	const { recordPath } = (await f.status({ target: "lfortran" })).details.lfortran;
+	const entries = () => JSON.parse(readFileSync(recordPath, "utf8")).entries;
+	const runStart = async () => (await f.fire("before_agent_start", { prompt: "next" })).find((result) => result?.message?.customType === "pi-repl-record-activity")?.message;
+	// The agent's own cell is known by its result, whenever the helper's entry for it lands.
+	const mine = text(await f.send("print:mine"));
+	assert.match(mine, /^Completed\.\nExecution: [0-9a-f]{32}\n/, "nothing else to tell yet");
+	await f.given(mine);
+	await until(() => entries().some((entry) => entry.code === "print:mine" && entry.status === "captured"), { what: "the agent's entry" });
+	assert.equal(await runStart(), undefined, "its own cell isn't told back");
+	// Another client's cell that waits on a READ is told as sent...
+	const requestId = `cli:send:${randomUUID()}`;
+	const waiting = await sendLfortranCode({ tmux: f.tmux, code: "read", requestId, label: "Ada", mode: "raw", timeoutMs: 5_000 });
+	assert.equal(waiting.details.state, "waiting-input");
+	await until(() => entries().some((entry) => entry.requestId === requestId), { what: "the other client's entry" });
+	const told = await runStart();
+	assert.match(told?.content ?? "", new RegExp(`pi-repl-lfortran \\(LFortran\\), since this conversation was last shown it:\n\n\\[entry pi-repl:${requestId} · Ada · via terminal · sent · [^\\]]*\\]\n\`\`\`fortran\nread\n\`\`\`$`));
+	await f.given(told.content);
+	assert.equal(await runStart(), undefined, "once told, not again");
+	// ...and, when the helper writes it settled, as an update.
+	await answerLfortranInput({ tmux: f.tmux, token: waiting.details.input.token, text: "7" });
+	await until(() => entries().some((entry) => entry.requestId === requestId && entry.status === "captured"), { what: "the other client's settled entry" });
+	const next = text(await f.send("print:after"));
+	assert.match(next, new RegExp(`\\[updated · entry pi-repl:${requestId} · Ada · via terminal · captured · [^\\]]*\\]\n\`\`\`fortran\nread\n\`\`\`\n\`\`\`text\ngot 7\n\`\`\``));
+	assert.match(next, /\n\nCompleted\.\nExecution: [0-9a-f]{32}\n\nSubmitted code:\nprint:after\n/);
+	await f.given(next);
+	// A cell of its own that waits on a READ, answered with repl_input: the answer's result shows how it ended.
+	const reading = text(await f.send("read"));
+	await f.given(reading);
+	const answered = text(await f.input(TOKEN.exec(reading)[1], "5"));
+	assert.match(answered, /^Completed\.[\s\S]*got 5/);
+	await f.given(answered);
+	await until(() => entries().filter((entry) => entry.code === "read").every((entry) => entry.status === "captured"), { what: "the agent's READ entry" });
+	assert.equal(await runStart(), undefined, "its own READ isn't told back either");
+	// What's typed at LFortran's own prompt isn't recorded, so it can't be told.
+	const [person] = await f.windows();
+	await f.tmux(["send-keys", "-t", person[2], "-l", "print:typed at the prompt"]);
+	await f.tmux(["send-keys", "-t", person[2], "Enter"]);
+	await until(async () => (await f.pane(person[2])).includes("typed at the prompt\n"), { what: "the prompt's cell" });
+	assert.equal(entries().some((entry) => entry.code.includes("typed")), false);
+	assert.equal(await runStart(), undefined);
+	assert.doesNotMatch(text(await f.send("print:last")), /typed at the prompt/);
+	// repl_history finds every cell recorded, and only those.
+	const history = text(await f.tool("repl_history", { runtime: "lfortran" }));
+	assert.match(history, new RegExp(`- pi-repl:${requestId} · Ada · via terminal · captured`));
+	assert.doesNotMatch(history, /typed/);
+	assert.match(text(await f.tool("repl_history", { runtime: "lfortran", entryId: `pi-repl:${requestId}` })), /```text\ngot 7\n```/);
 });

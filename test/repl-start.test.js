@@ -140,8 +140,8 @@ test("repl_start requires a canonical explicit runtime; no send auto-start or de
 		await assert.rejects(f.start({ runtime }), /explicit supported runtime/);
 	}
 	assert.equal(f.calls.length, 0);
-	// repl_input only answers an LFortran READ; there is still no tool that stops or resets a session.
-	assert.deepEqual([...f.tools.keys()].sort(), ["repl_input", "repl_send", "repl_start", "repl_status"]);
+	// repl_input only answers an LFortran READ, and repl_history only reads; there is still no tool that stops or resets a session.
+	assert.deepEqual([...f.tools.keys()].sort(), ["repl_history", "repl_input", "repl_send", "repl_start", "repl_status"]);
 	await assert.rejects(f.tools.get("repl_send").execute("test", { code: "print(1)" }, undefined, undefined, { cwd: root }), /No default/);
 	assert.equal(f.calls.some((call) => call.args[0] === "new-session"), false);
 });

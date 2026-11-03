@@ -107,6 +107,16 @@ The label is a chosen name only under one of these prefixes, on its matching ori
 
 Readers escape labels for HTML and for terminals.
 
+## Agents told of entries
+
+Clients can tell their agents of other clients' entries (pi-repl's and Pi Studio's do). These are readers: they never set metadata or the key, create a record, a directory or a lock, or change a mode. What they show follows the order above.
+
+**An entry's version** is the first 24 hex characters of SHA-256 over the JSON array `[requestId, origin, label, mode, status, prose, code, output, codeOmittedChars, proseOmittedChars, outputOmittedChars, skippedChunks]` (`replEntryVersion` in `repl-record-activity.js`). A changed version is told again as an update; times alone don't change it.
+
+**A client's own sends** are known by entry ID, never by label: pi-repl's entries, and LFortran's helper's, are `pi-repl:` followed by `recordEntryKey(requestId)`. LFortran's helper writes its entries from its own process, so an entry, or its settled version, can land after the sender has its result.
+
+**One view per agent.** When pi-repl and Pi Studio run in one Pi, pi-repl holds the view of the `pi-repl-*` sessions, and Studio tells it what its agent and pane use over Pi's event bus, on `pi-repl:record-activity:v1`: `{ kind: "probe", reply }`, answered at once with `{ protocol: 1 }`; `{ kind: "used", sessionName }`; `{ kind: "pane", sessionName | null }`; and `{ kind: "own", sessionName, id, version, text }`, where `text` is how Studio's result is recognised in what the model is given. Studio keeps its own sessions in its own view.
+
 ## Concurrency and bounds
 
 Record updates take a short cross-process directory lock, read the latest snapshot, upsert by stable entry ID, and replace the snapshot atomically. A stale lock can be recovered. The implementation retains at most 300 entries, bounds individual prose/code/output fields, and caps the serialized record at 16 MiB by dropping the oldest entries first.
@@ -115,7 +125,7 @@ Attribution-sensitive sends also take a separate cross-client send lease. A comp
 
 ## Clean record versus raw history
 
-The clean record includes submissions whose semantic boundaries are known to a compatible client, plus explicit literate notes. Code typed directly into tmux is retained only in the raw pane/history mirror unless future runtime-specific instrumentation can establish reliable boundaries. Clients must not present raw `pipe-pane` output as reliably parsed code/output.
+The clean record includes submissions whose semantic boundaries are known to a compatible client, plus explicit literate notes. Code typed directly into tmux is retained only in the raw pane/history mirror unless future runtime-specific instrumentation can establish reliable boundaries. LFortran's helper records only the cells sent through it, not those run at LFortran's own prompt, so no reader can report those. Clients must not present raw `pipe-pane` output as reliably parsed code/output.
 
 Canonical Markdown exports identify origin, mode, status, runtime, and timestamp and include this direct-input limitation.
 

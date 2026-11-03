@@ -4,6 +4,15 @@ All notable changes to `pi-repl` are documented here.
 
 ## [Unreleased]
 
+### Added
+- The agent is told of other clients' entries in the clean records of the sessions it has started or sent to: people's sends from Pi, `agent-repl send` and Pi Studio, Studio's notes, and other agents' sends, with who sent each and how, its status, prose, code and output. An entry it was told of that changes, such as a late capture, is told again as an update. In Pi it comes when a run starts, before the pane text and within its budget, and with each `repl_send` result, within 8,000 characters and at most 10 entries; entries left out are listed by ID. What a report tells counts only once Pi gives it to the model (`context_with_system`; an older Pi checks at the run's end), or, without Pi's events (agent-repl), once the result is returned uncancelled. The agent's own sends, known by entry ID, aren't told back, nor is a `/repl send` posted into its conversation; for LFortran, whose helper may write a cell's entry after its result, a result that showed how the cell ended stands for the entry's later versions. `PI_REPL_RECORD_ACTIVITY` (`on`, `send`, `off`) controls it, following `PI_REPL_PANE_ACTIVITY` when unset, and attach instructions and status say what is sent. The rules are in `shared/repl-record-activity.js`, which Pi Studio shares.
+- `repl_send` results name the agent's own entry (`Recorded as entry …`) when record activity is on.
+- `repl_history`: a read-only tool that lists a session's record entries (ID, who and how, status, time, sizes), paged before or after one within the same session lifetime, or shows one entry in full by its ID.
+- When Pi Studio is loaded in the same Pi, it can leave the `pi-repl-*` sessions its agent and pane use to pi-repl's view, over Pi's event bus (`pi-repl:record-activity:v1`), so an entry is told once. With Pi Studio 0.11.9 or earlier, which don't, an agent may be told an entry twice.
+
+### Changed
+- Development and typechecking use Pi 1.5.
+
 ## [0.11.7] — 2026-10-30
 
 ### Added

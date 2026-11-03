@@ -6,14 +6,16 @@ import { tmpdir } from "node:os";
 import { dirname, join } from "node:path";
 import { promisify } from "node:util";
 import { randomUUID } from "node:crypto";
+import { EventEmitter } from "node:events";
 import { acquireReplSessionSendLease, readReplSessionRecord, readReplSessionRecordRootKey, upsertReplSessionRecordEntry } from "../shared/repl-session-record.js";
+import { REPL_ACTIVITY_CHANNEL, REPL_ACTIVITY_HEADING, replEntryVersion } from "../shared/repl-record-activity.js";
 import { createReplSubmissionDisplay } from "../shared/repl-submission-display.js";
 import { gnuplotStringLiteral } from "../shared/repl-gnuplot.js";
 import { createTestTmux, readProcessTable } from "./helpers/repl-test-tmux.js";
 import { visibleWidth } from "@earendil-works/pi-tui";
 
 const exec = promisify(execFile);
-const originalEnv = { TMPDIR: process.env.TMPDIR, PI_REPL_CONTROL_ROOT: process.env.PI_REPL_CONTROL_ROOT, SHELL: process.env.SHELL, PI_REPL_ECHO_MODE: process.env.PI_REPL_ECHO_MODE, XDG_CONFIG_HOME: process.env.XDG_CONFIG_HOME, PI_REPL_USER_NAME: process.env.PI_REPL_USER_NAME };
+const originalEnv = { TMPDIR: process.env.TMPDIR, PI_REPL_CONTROL_ROOT: process.env.PI_REPL_CONTROL_ROOT, SHELL: process.env.SHELL, PI_REPL_ECHO_MODE: process.env.PI_REPL_ECHO_MODE, XDG_CONFIG_HOME: process.env.XDG_CONFIG_HOME, PI_REPL_USER_NAME: process.env.PI_REPL_USER_NAME, PI_REPL_PANE_ACTIVITY: process.env.PI_REPL_PANE_ACTIVITY, PI_REPL_RECORD_ACTIVITY: process.env.PI_REPL_RECORD_ACTIVITY };
 const root = mkdtempSync(join(tmpdir(), "pi-repl-integration-"));
 process.env.TMPDIR = root;
 process.env.PI_REPL_CONTROL_ROOT = join(root, "controls");
@@ -22,6 +24,10 @@ delete process.env.PI_REPL_ECHO_MODE;
 // The person setting is this run's own, never the account's.
 process.env.XDG_CONFIG_HOME = join(root, "config");
 delete process.env.PI_REPL_USER_NAME;
+delete process.env.PI_REPL_PANE_ACTIVITY;
+// What an agent is told of the record (D5) has tests of its own, which turn it on; the rest
+// see results and prompt starts as they are without it.
+process.env.PI_REPL_RECORD_ACTIVITY = "off";
 const available = process.platform !== "win32" && spawnSync("tmux", ["-V"]).status === 0;
 const optionalRuntimes = new Set((process.env.PI_REPL_TEST_RUNTIMES || "").split(","));
 
@@ -47,7 +53,7 @@ async function eventually(check, timeout = 15000) {
 	throw new Error("Timed out waiting for isolated REPL test condition");
 }
 
-async function fixture(t, { index = 0, runtime = "python", controlName, startWithTool = false, concurrentStart = false } = {}) {
+async function fixture(t, { index = 0, runtime = "python", controlName, startWithTool = false, concurrentStart = false, withoutEvents = false } = {}) {
 	if (!available) { t.skip("tmux is required for local integration tests"); return null; }
 	const command = runtime === "r" ? "R" : runtime === "python" ? "python3" : runtime === "ruby" ? "irb" : runtime === "java" ? "jshell" : runtime === "octave" ? "octave-cli" : runtime === "cpp" ? "cling" : runtime;
 	let executable = binary(command);
@@ -122,10 +128,20 @@ async function fixture(t, { index = 0, runtime = "python", controlName, startWit
 	let beforeStop;
 	let execOverride;
 	const handlers = new Map();
+	// Pi's event bus, shared by the extensions of one Pi session, as Pi's createEventBus.
+	const bus = new EventEmitter();
 	const pi = {
 		registerTool: (tool) => tools.set(tool.name, tool),
 		registerCommand: (name, definition) => commands.set(name, definition),
 		on: (event, handler) => handlers.set(event, [...(handlers.get(event) ?? []), handler]),
+		events: {
+			emit: (channel, data) => { bus.emit(channel, data); },
+			on: (channel, handler) => {
+				const safe = async (data) => { try { await handler(data); } catch {} };
+				bus.on(channel, safe);
+				return () => bus.off(channel, safe);
+			},
+		},
 		sendMessage: (message, options) => messages.push({ message, options }),
 		registerMessageRenderer: (customType, renderer) => renderers.set(customType, renderer),
 		async exec(command, args, options) {
@@ -151,6 +167,12 @@ async function fixture(t, { index = 0, runtime = "python", controlName, startWit
 			}
 		},
 	};
+	// A host like agent-repl's MCP server: tools and commands, no events, messages or event bus.
+	if (withoutEvents) {
+		delete pi.on;
+		delete pi.events;
+		delete pi.sendMessage;
+	}
 	const ctx = { cwd, hasUI: true, ui: { notify: (message, level) => notifications.push({ message, level }) } };
 	process.env.PI_REPL_CONTROL_ROOT = join(root, controlName ?? 'controls space "quoted" #{raise} λ');
 	// Fresh module preferences/config for each independent test extension.
@@ -221,7 +243,7 @@ async function fixture(t, { index = 0, runtime = "python", controlName, startWit
 	} catch (error) {
 		throw new Error(`${runtime} startup failed: ${startupOutput}`, { cause: error });
 	}
-	return { pi, ctx, module, sendAs, cwd, calls, notifications, messages, renderers, withoutMessages: () => { pi.sendMessage = undefined; }, tmux, sessionName, target, repl, send, status, start, otherAgent, fire, onExec: (override) => { execOverride = override; }, owned: () => tmuxHarness.owned(), cleanup: () => tmuxHarness.cleanup(), onEnter: (callback) => { afterEnter = callback; }, onBeforePaste: (callback) => { beforePaste = callback; }, onBeforeStop: (callback) => { beforeStop = callback; } };
+	return { pi, tools, ctx, module, sendAs, cwd, calls, notifications, messages, renderers, withoutMessages: () => { pi.sendMessage = undefined; }, tmux, sessionName, target, repl, send, status, start, otherAgent, fire, onExec: (override) => { execOverride = override; }, owned: () => tmuxHarness.owned(), cleanup: () => tmuxHarness.cleanup(), onEnter: (callback) => { afterEnter = callback; }, onBeforePaste: (callback) => { beforePaste = callback; }, onBeforeStop: (callback) => { beforeStop = callback; } };
 }
 
 async function assertCompletionGap(f, result) {
@@ -2805,4 +2827,150 @@ test("a nested tool call's send has one entry, whose ID, request ID and control 
 	const settled = readReplSessionRecord(recordId).entries;
 	assert.equal(settled.length, 1);
 	assert.deepEqual([settled[0].id, settled[0].status, settled[0].output], [pending.id, "captured", "NESTED"]);
+});
+
+// What an agent is told of the shared record (D5): on for these tests only.
+function recordActivity(t, mode = "on") {
+	process.env.PI_REPL_RECORD_ACTIVITY = mode;
+	t.after(() => { process.env.PI_REPL_RECORD_ACTIVITY = "off"; });
+}
+const resultText = (result) => result.content[0].text;
+// What the model is given next, as Pi's context_with_system shows it.
+const given = (f, ...texts) => f.fire("context_with_system", { messages: texts.map((text) => ({ role: "toolResult", content: [{ type: "text", text }] })) });
+const told = (text) => text.startsWith(REPL_ACTIVITY_HEADING);
+// A send whose result the model is then given, as Pi gives it every tool result.
+async function sendGiven(f, code, options) {
+	const text = resultText(await f.send(code, options));
+	await given(f, text);
+	return text;
+}
+
+test("an agent is told of other clients' record entries with its sends, once, and of a change as an update; not of its own sends or the person's posted ones", { timeout: 90000 }, async (t) => {
+	recordActivity(t);
+	const f = await fixture(t, { startWithTool: true });
+	if (!f) return;
+	const { recordId } = (await f.status()).details.python;
+	const first = resultText(await f.send("d5_a = 1"));
+	const ownId = /^Recorded as entry (pi-repl:tool:[0-9a-f-]{36})\.\n\nSubmitted code:\nd5_a = 1\n/.exec(first)?.[1];
+	assert.ok(ownId, first);
+	await given(f, first);
+	// Another agent with the same label: its send is another client's, by its entry ID.
+	const other = await f.otherAgent();
+	await other.send("d5_b = 2");
+	const second = resultText(await f.send("print(d5_b)"));
+	assert.ok(told(second), second);
+	assert.match(second, /\n\npi-repl-python \(Python\/IPython\), since this conversation was last shown it:\n\n\[entry pi-repl:tool:[0-9a-f-]{36} · Pi · captured · \d\d:\d\d:\d\d\]\n```python\nd5_b = 2\n```\n\n/);
+	assert.doesNotMatch(second, /d5_a = 1\n```/, "not its own send");
+	// The record entries come first, then the pane text, then its own entry and result.
+	assert.ok(second.indexOf("```python\nd5_b = 2") < second.indexOf(PANE_HEADING) && second.indexOf(PANE_HEADING) < second.indexOf("Recorded as entry pi-repl:tool:"), second);
+	await given(f, second);
+	assert.ok(!told(await sendGiven(f, "print(3)")), "told once");
+	// The person's /repl send, posted into the conversation, counts as told once the model is given it.
+	await f.repl("send\nd5_person = 4");
+	const posted = f.messages.at(-1).message;
+	const meanwhile = resultText(await f.send("print(4)"));
+	assert.ok(!told(meanwhile), "nor while its message is on its way");
+	await f.fire("context_with_system", { messages: [{ role: "custom", customType: posted.customType, content: posted.content }, { role: "toolResult", content: [{ type: "text", text: meanwhile }] }] });
+	const afterPerson = await sendGiven(f, "print(d5_person)");
+	assert.ok(!told(afterPerson), afterPerson);
+	// A send that outlasts its wait: its pending notice comes after what else there is to tell, and its capture
+	// later is told as an update, as the record has it.
+	await other.send("d5_c = 5");
+	let pending = "";
+	await assert.rejects(f.send("import time\ntime.sleep(2)\nprint('slept')", { timeoutMs: 1000 }), (error) => {
+		pending = error.message;
+		return true;
+	});
+	assert.match(pending, /^Recorded REPL activity[\s\S]*\]\n```python\nd5_c = 5\n```\n\nTimed out waiting for REPL output after 1000ms\.[\s\S]*entry (pi-repl:tool:[0-9a-f-]{36})\)/);
+	const lateId = /entry (pi-repl:tool:[0-9a-f-]{36})\)/.exec(pending)[1];
+	await given(f, pending);
+	await f.module.drainSettlingSends();
+	assert.equal(readReplSessionRecord(recordId).entries.find((entry) => entry.id === lateId).status, "captured");
+	const after = resultText(await f.send("print(6)"));
+	assert.match(after, new RegExp(`\\[updated · entry ${lateId} · Pi · captured · [^\\]]*\\]\n\`\`\`python\nimport time\ntime\\.sleep\\(2\\)\nprint\\('slept'\\)\n\`\`\`\n\`\`\`text\nslept\n\`\`\``));
+	// repl_history lists them all, and shows one in full, without counting as told.
+	const history = resultText(await f.tools.get("repl_history").execute(randomUUID(), { runtime: "python" }, undefined, undefined, f.ctx));
+	assert.match(history, new RegExp(`^pi-repl-python's record, lifetime ${recordId}/\\$\\d+/\\d+ \\(`));
+	assert.match(history, /\n- pi-repl:pi:send:[0-9a-f-]{36} · User · via Pi · captured · /);
+	assert.match(resultText(await f.tools.get("repl_history").execute(randomUUID(), { runtime: "ipython", entryId: ownId }, undefined, undefined, f.ctx)), /\[entry pi-repl:tool:[^\]]*\]\n```python\nd5_a = 1\n```$/);
+	await assert.rejects(f.tools.get("repl_history").execute(randomUUID(), { runtime: "python", before: ownId, after: ownId }, undefined, undefined, f.ctx), /one of entryId, before and after/);
+	assert.match(resultText(await f.tools.get("repl_history").execute(randomUUID(), { runtime: "julia" }, undefined, undefined, f.ctx)), /^pi-repl-julia isn't running, or has no shared record yet\.$/);
+	// What goes to the agent is said where the person looks, and in the agent's guidelines.
+	assert.match((await f.status()).content[0].text, /\nOther clients' entries in the shared record, with their code, output, notes and names, go to the agent and its model provider when a run starts and with its sends; PI_REPL_RECORD_ACTIVITY=send keeps them to sends, and =off stops them\./);
+	assert.ok(f.tools.get("repl_send").promptGuidelines.some((line) => /^pi-repl tells you of new entries .* when a run starts and in repl_send results\. .*LFortran's own prompt, isn't recorded/.test(line)));
+});
+
+test("at a run's start the record report comes before the pane text, within its budget; Studio's pane and agent bring sessions in", { timeout: 90000 }, async (t) => {
+	recordActivity(t);
+	const f = await fixture(t, { startWithTool: true });
+	if (!f) return;
+	const { recordId } = (await f.status()).details.python;
+	const runStart = async () => (await f.fire("before_agent_start", { prompt: "next" })).filter(Boolean).map((result) => result.message);
+	const recordOnly = async () => (await runStart()).filter((message) => message.customType === "pi-repl-record-activity");
+	const other = await f.otherAgent();
+	await other.send("d5_run = 1");
+	const [record, pane] = await runStart();
+	assert.equal(record.customType, "pi-repl-record-activity");
+	assert.equal(record.display, true);
+	assert.match(record.content, /\n\npi-repl-python \(Python\/IPython\), recent entries:\n\n\[entry pi-repl:tool:[^\]]*\]\n```python\nd5_run = 1\n```$/);
+	assert.equal(pane.customType, "pi-repl-pane-activity");
+	assert.ok(record.content.length + pane.content.length <= 6_000);
+	// Folded, it's one line.
+	assert.deepEqual(renderPosted(f, record, 120).map((line) => line.trim()), ["Told the agent: 1 REPL record entry from pi-repl-python (ctrl+o to expand)"]);
+	// Not yet given to the model, it's told again; once given, not again.
+	const again = await runStart();
+	await f.fire("agent_start");
+	await f.fire("context_with_system", { messages: again.map((message) => ({ role: "custom", content: message.content })) });
+	assert.deepEqual(await recordOnly(), []);
+	// A compaction keeps the sessions it used, and tells them again.
+	await f.fire("session_compact");
+	assert.match((await recordOnly())[0].content, /pi-repl-python \(Python\/IPython\), recent entries after a context reset:/);
+	// A new conversation has used nothing; Studio's pane brings its session in.
+	await f.fire("session_start", { reason: "new" });
+	assert.deepEqual(await recordOnly(), []);
+	let info;
+	f.pi.events.emit(REPL_ACTIVITY_CHANNEL, { kind: "probe", reply: (value) => { info = value; } });
+	assert.deepEqual(info, { protocol: 1 }, "answered at once");
+	f.pi.events.emit(REPL_ACTIVITY_CHANNEL, { kind: "used", sessionName: "pi-studio-repl-python" });
+	f.pi.events.emit(REPL_ACTIVITY_CHANNEL, { kind: "pane", sessionName: "pi-repl-python" });
+	const [fromPane] = await recordOnly();
+	assert.match(fromPane.content, /pi-repl-python \(Python\/IPython\), recent entries:[\s\S]*d5_run = 1/);
+	assert.doesNotMatch(fromPane.content, /pi-studio-repl/, "Studio's own sessions stay Studio's");
+	await f.fire("context_with_system", { messages: [{ role: "custom", content: fromPane.content }] });
+	// Studio's agent's own send counts by its result, not as another client's.
+	await other.send("d5_studio = 2");
+	const studioEntry = readReplSessionRecord(recordId).entries.at(-1);
+	f.pi.events.emit(REPL_ACTIVITY_CHANNEL, { kind: "own", sessionName: "pi-repl-python", id: studioEntry.id, version: replEntryVersion(studioEntry), text: `Recorded as entry ${studioEntry.id}.` });
+	await given(f, `d5_studio = 2\nRecorded as entry ${studioEntry.id}.`);
+	assert.deepEqual(await recordOnly(), []);
+	// Without the pane, the session is out of scope until Studio's agent uses it.
+	f.pi.events.emit(REPL_ACTIVITY_CHANNEL, { kind: "pane", sessionName: null });
+	await other.send("d5_later = 3");
+	assert.deepEqual(await recordOnly(), []);
+	f.pi.events.emit(REPL_ACTIVITY_CHANNEL, { kind: "used", sessionName: "pi-repl-python" });
+	assert.match((await recordOnly())[0].content, /d5_later = 3/);
+	// PI_REPL_RECORD_ACTIVITY=send keeps it to sends.
+	process.env.PI_REPL_RECORD_ACTIVITY = "send";
+	assert.deepEqual(await recordOnly(), []);
+	assert.match(resultText(await f.send("print(1)")), /d5_later = 3/);
+});
+
+test("a host without Pi's events marks what it reports when the result returns, unless the call was cancelled", { timeout: 90000 }, async (t) => {
+	recordActivity(t);
+	const f = await fixture(t, { startWithTool: true, withoutEvents: true });
+	if (!f) return;
+	assert.ok(f.tools.get("repl_send").promptGuidelines.some((line) => /^pi-repl tells you of new entries .*, in repl_send results\./.test(line) && !/when a run starts/.test(line)));
+	const other = await f.otherAgent();
+	await other.send("d5_mcp = 1");
+	// Cancelled while the record is read, after the code ran: the result doesn't reach the model.
+	const controller = new AbortController();
+	f.onExec(async (command, args) => {
+		if (command === "tmux" && args[0] === "list-panes" && args.at(-1) === "#{session_name}\t#{session_id}\t#{session_created}") controller.abort();
+	});
+	assert.match(resultText(await f.send("print(1)", {}, controller.signal)), /d5_mcp = 1/);
+	f.onExec(undefined);
+	assert.match(resultText(await f.send("print(2)")), /d5_mcp = 1/, "told again");
+	assert.ok(!told(resultText(await f.send("print(3)"))), "and then not again");
+	// Its own send, which another agent is told of, isn't told back to it.
+	assert.match(resultText(await other.send("print(4)")), /```python\nprint\(3\)\n```/);
 });
