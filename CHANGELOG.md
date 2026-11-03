@@ -4,6 +4,8 @@ All notable changes to `pi-repl` are documented here.
 
 ## [Unreleased]
 
+## [0.12.1] — 2026-11-03
+
 ### Added
 - Pi Studio can ask pi-repl for the report its tool's result should carry (`{ kind: "report", cwd, budget, own?, reply }` on `pi-repl:record-activity:v1`, and the probe now answers `{ protocol: 2 }`). With pi-repl 0.12.0, Studio's results left out the `pi-repl-*` sessions pi-repl holds, so entries written during a run waited for the next run, and with `PI_REPL_RECORD_ACTIVITY=send` an agent using only Studio's tools wasn't told of them. The report is what a `repl_send` result would carry, follows the same setting, and counts once it's in what the model is given. Studio uses it from the Studio release after 0.11.9; until then nothing changes.
 
