@@ -13,6 +13,7 @@ All notable changes to `pi-repl` are documented here.
 - When Pi Studio is loaded in the same Pi, it can leave the `pi-repl-*` sessions its agent and pane use to pi-repl's view, over Pi's event bus (`pi-repl:record-activity:v1`), so an entry is told once. With Pi Studio 0.11.9 or earlier, which don't, an agent may be told an entry twice.
 
 ### Changed
+- The pane text added when a run starts shows in Pi as one line, naming each pane and how many lines it showed, as the record report does; Ctrl+O shows the text. What the agent is given is unchanged.
 - Development and typechecking use Pi 1.5.
 - The LFortran and runtime tests use a person setting of their own, never the account's.
 

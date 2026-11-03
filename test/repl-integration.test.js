@@ -2951,6 +2951,15 @@ test("at a run's start the record report comes before the pane text, within its 
 	assert.ok(record.content.length + pane.content.length <= 6_000);
 	// Folded, it's one line.
 	assert.deepEqual(renderPosted(f, record, 120).map((line) => line.trim()), ["Told the agent: 1 REPL record entry from pi-repl-python (ctrl+o to expand)"]);
+	// So is the pane text, with its lines counted; expanded, Pi shows it as it is.
+	const paneText = pane.content.split("\n[pane text]\n")[1].split("\n[end of pane text]")[0];
+	assert.match(paneText, /d5_run = 1/);
+	assert.deepEqual(renderPosted(f, pane, 120).map((line) => line.trim()), [`Showed the agent: ${paneText.split("\n").length} lines of pi-repl-python's pane (ctrl+o to expand)`]);
+	assert.equal(f.renderers.get(pane.customType)(pane, { expanded: true, outputPad: 1 }, {}), undefined);
+	const folded = (details) => renderPosted(f, { ...pane, details }, 160).map((line) => line.trim());
+	assert.deepEqual(folded({ panes: [{ sessionName: "pi-repl-julia", lines: 1 }, { sessionName: "pi-repl-r", lines: 0 }], leftOut: 2 }),
+		["Showed the agent: 1 line of pi-repl-julia's pane, a note on pi-repl-r's pane, 2 panes left out or not read (ctrl+o to expand)"]);
+	assert.deepEqual(folded(undefined), ["Showed the agent: REPL pane text (ctrl+o to expand)"], "a message from an earlier release");
 	// Not yet given to the model, it's told again; once given, not again.
 	const again = await runStart();
 	await f.fire("agent_start");
