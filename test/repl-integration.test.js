@@ -3001,6 +3001,22 @@ test("at a run's start the record report comes before the pane text, within its 
 	assert.match(resultText(await f.send("print(1)")), /d5_later = 3/);
 });
 
+test("a run that starts before a tool result's report reaches the model doesn't have it told twice", { timeout: 90000 }, async (t) => {
+	// Astra's D5 recheck: the run-start look found nothing new, as the tool result held the entry.
+	recordActivity(t);
+	const f = await fixture(t, { startWithTool: true });
+	if (!f) return;
+	const other = await f.otherAgent();
+	await other.send("d5_held = 41");
+	const first = resultText(await f.send("print(42)"));
+	assert.match(first, /```python\nd5_held = 41\n```/);
+	// The run stopped after the tool; the next run's request carries its result.
+	const run = (await f.fire("before_agent_start", { prompt: "continue" })).filter(Boolean).map((result) => result.message.content);
+	assert.doesNotMatch(run.join("\n"), /d5_held/);
+	await given(f, first, ...run);
+	assert.doesNotMatch(resultText(await f.send("print(43)")), /d5_held/);
+});
+
 test("a host without Pi's events marks what it reports when the result returns, unless the call was cancelled", { timeout: 90000 }, async (t) => {
 	recordActivity(t);
 	const f = await fixture(t, { startWithTool: true, withoutEvents: true });

@@ -556,7 +556,7 @@ export function applyReplActivityCommit(state, commit) {
 		let view = state.views.get(session.sessionName);
 		if (!view || !sameRun(view, session.identity)) {
 			if (view && view.seq > commit.seq) continue;
-			view = { ...session.identity, revision: 0, clearedAt: null, droppedEntries: 0, seq: 0, entries: new Map() };
+			view = { ...session.identity, revision: 0, clearedAt: null, droppedEntries: 0, seq: 0, retained: new Set(), entries: new Map() };
 		}
 		const newest = commit.seq >= view.seq;
 		if (newest) {
@@ -567,10 +567,13 @@ export function applyReplActivityCommit(state, commit) {
 			// Entries the newest look no longer found can't come back under the same version.
 			const retained = new Set(session.retained);
 			for (const [id, known] of view.entries) if (!retained.has(id) && known.seq <= commit.seq) view.entries.delete(id);
+			view.retained = retained;
 		}
 		for (const mark of session.marks) {
 			const known = view.entries.get(mark.id);
-			if (known ? known.seq > commit.seq : !newest) continue;
+			// An older report counts for an entry the newest look still found: that look may have
+			// left it out only because this report held it.
+			if (known ? known.seq > commit.seq : !(newest || view.retained.has(mark.id))) continue;
 			view.entries.set(mark.id, { considered: mark.version, disposition: mark.disposition, told: Boolean(known?.told) || mark.disposition !== "omitted", seq: commit.seq });
 		}
 		state.views.delete(session.sessionName);

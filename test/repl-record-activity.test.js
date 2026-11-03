@@ -476,6 +476,29 @@ test("an entry in a report not yet shown to the model isn't put in another, unti
 	assert.match(buildReplActivityReport(other, [observe([{ ...foreign, output: "new" }])], { budget: 8_000 }).text, /\[entry foreign /);
 });
 
+test("a report held back by an earlier one still counts when it reaches the model after a later look", () => {
+	// Astra's D5 recheck: a run's start reported nothing, as a tool result's report not yet shown
+	// held its entry, and that quiet look moved the view on past the tool result's report.
+	let state = createReplActivityState();
+	const foreign = entry("held");
+	const first = buildReplActivityReport(state, [observe([foreign])], { budget: 8_000 });
+	holdReplActivityCommit(state, "tool:1", first.commit);
+	assert.equal(buildReplActivityReport(state, [observe([foreign])], { budget: 8_000 }).text, "");
+	confirmReplActivityDelivered(state, first.text);
+	assert.equal(buildReplActivityReport(state, [observe([foreign])], { budget: 8_000 }).text, "", "held isn't told again");
+	// Nor when the later look reported something else, shown before the earlier report.
+	state = createReplActivityState();
+	const other = entry("other");
+	const earlier = buildReplActivityReport(state, [observe([foreign])], { budget: 8_000 });
+	holdReplActivityCommit(state, "tool:1", earlier.commit);
+	const later = buildReplActivityReport(state, [observe([foreign, other])], { budget: 8_000 });
+	holdReplActivityCommit(state, "run:2", later.commit);
+	assert.doesNotMatch(later.text, /entry held/);
+	confirmReplActivityDelivered(state, later.text);
+	confirmReplActivityDelivered(state, earlier.text);
+	assert.equal(buildReplActivityReport(state, [observe([foreign, other])], { budget: 8_000 }).text, "");
+});
+
 test("a report begun before a reset is empty and changes nothing", () => {
 	// Astra's D5 review, 6.
 	const state = createReplActivityState();
