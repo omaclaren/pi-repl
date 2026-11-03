@@ -41,6 +41,7 @@
     "index.ts",
     "shared",
     "README.md",
+    "docs",
     "CHANGELOG.md",
     "LICENSE",
     "shared-julia-repl.png",

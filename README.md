@@ -1,8 +1,6 @@
 # pi-repl
 
-Minimal [pi](https://github.com/badlogic/pi-mono) extension for collaborative REPL sessions using tmux.
-
-`pi-repl` starts a shared Python, IPython, Julia, R, Haskell (GHCi), Clojure, Ruby (irb), Java (JShell), Octave, MATLAB, gnuplot, C++ or Fortran (LFortran) REPL in tmux that you can attach to from another terminal window. You can work in the REPL directly, or ask pi to send and execute code there.
+A [Pi](https://pi.dev) extension for REPL sessions that you and Pi share. pi-repl starts a Python, IPython, Julia, R, Haskell (GHCi), Clojure, Ruby, Java, Octave, MATLAB or gnuplot REPL, or an experimental C++ (Cling) or Fortran (LFortran) one, in tmux. You attach to it from another terminal and work there as normal, and Pi runs code in the same session, so you both work with the same variables.
 
 <picture>
   <source media="(prefers-color-scheme: dark)" srcset="./shared-julia-repl-dark.png">
@@ -11,146 +9,80 @@ Minimal [pi](https://github.com/badlogic/pi-mono) extension for collaborative RE
 
 *Pi (left) and the same Julia workspace in an attached terminal (right). The second request uses a matrix changed directly in the terminal.*
 
-## Current scope
-
-Currently, `pi-repl` supports **Python/IPython**, **Julia**, **R**, **Haskell (GHCi)**, **Clojure**, **Ruby (irb)**, **Java (JShell)**, **Octave**, **MATLAB**, **gnuplot**, and experimental **C++ (Cling)** and **Fortran (LFortran)**.
-
-With `pi-repl` you can:
-
-- start a shared REPL from pi
-- attach to that REPL from another terminal window
-- work in the REPL yourself as normal
-- ask pi, in natural language, to run code in any supported shared REPL
-- start, attach to, inspect, and stop a shared R REPL
-- start, attach to, inspect, and stop a shared Haskell (GHCi) REPL
-- start, attach to, inspect, and stop a shared Clojure, Ruby, Java, Octave, MATLAB, gnuplot, or C++ REPL
-- share an LFortran session with pi, with you at LFortran's own prompt (experimental; needs LFortran `main`)
-- let pi read the raw shared REPL transcript for extra context when needed
-- tell pi what was typed in the shared REPL since it last saw it, when a run starts and with its next send
-- keep a bounded clean record of compatible-client submissions and captured output, synchronized automatically with a compatible `pi-studio` using the same tmux session
-- show bounded, request-specific submitted code and compact alignment anchors in the raw pane by default, with Summary previews, Off for quiet output, and Full as an explicit opt-in
-- export that clean record as canonical Markdown
-- check which shared REPL sessions are running
-- inspect which Python interpreter and environment the shared Python/IPython REPL is using with `/repl env`
-- stop the shared REPL when you are done
-
-Use `/lab` as a short alias for `/repl`.
+[agent-repl](https://github.com/omaclaren/agent-repl) gives Claude Code, Codex, OpenCode and other agents the same sessions. Its [one-minute demo](https://omaclaren.github.io/agent-repl/#demo) shows Pi, a person and Claude Code sharing a Python session.
 
 ## Install
-
-From npm:
 
 ```bash
 pi install npm:pi-repl
 ```
 
-From GitHub:
+or `pi install https://github.com/omaclaren/pi-repl`, then restart Pi. pi-repl needs tmux and is mainly tested on macOS. On Windows, run Pi, tmux and the interpreters inside WSL.
 
-```bash
-pi install https://github.com/omaclaren/pi-repl
+## Getting started
+
+Start a session from Pi:
+
+```text
+/repl julia
 ```
 
-Restart pi after installing.
+and attach to it from another terminal:
+
+```bash
+tmux attach -t pi-repl-julia
+```
+
+(`/repl attach julia` prints that command.) Then type into the terminal yourself, or ask Pi to use the session, for example "in the shared Julia REPL, find the eigenvalues of [2 1; 1 2]". Pi can also start a session when you ask it to ("start a shared Ruby REPL").
+
+## Runtimes
+
+| Runtime | Name in commands | Needs | tmux session |
+|---------|------------------|-------|--------------|
+| Python | `python` | `python` | `pi-repl-python` |
+| IPython | `ipython` | `ipython` | `pi-repl-python` |
+| Julia | `julia` | `julia` | `pi-repl-julia` |
+| R | `r` or `R` | `R` | `pi-repl-r` |
+| Haskell | `ghci` | `ghci` | `pi-repl-ghci` |
+| Clojure | `clojure` or `clj` | `clojure` | `pi-repl-clojure` |
+| Ruby | `ruby` | `irb` | `pi-repl-ruby` |
+| Java | `java` | a JDK with `jshell` | `pi-repl-java` |
+| Octave | `octave` | `octave-cli` | `pi-repl-octave` |
+| MATLAB | `matlab` | a licensed `matlab` | `pi-repl-matlab` |
+| gnuplot | `gnuplot` | `gnuplot` | `pi-repl-gnuplot` |
+| C++ (experimental) | `cpp` | `cling` | `pi-repl-cpp` |
+| Fortran (experimental) | `lfortran` | `lfortran` built from `main` | `pi-repl-lfortran` |
+
+Sessions start through your normal interactive login shell, in Pi's working directory, so they find the interpreters you use yourself. pi-repl doesn't install or repair them. Python and IPython share one session. The [runtime notes](docs/runtimes.md) say how each runtime takes submitted code and what to expect from it.
+
+### C++ (experimental)
+
+`cpp` runs Cling. Send code as you would type it at Cling's prompt, with a function's opening brace on its declaration line, and load ordinary source files with `#include`. Earlier groups of lines can run before a later one fails, and nothing is rolled back. It has been tested with Cling 1.3 on ARM64 macOS.
+
+### LFortran sessions (experimental)
+
+`lfortran` needs a build of LFortran's `main` branch with its shared session (`lfortran --connect`); no release has it yet. You work at LFortran's own prompt in the session's first window, and Pi's cells go to the same kernel through pi-repl's helper in the second, so you share variables and procedures. When one of Pi's cells reaches a READ, Pi answers with `repl_input`, or you can with `/repl input <text>`. Cells you run at your own prompt aren't recorded, so the agent isn't told of them.
+
+For now, a runtime error in any cell ends the session for everyone, a cell's output arrives when it ends, and a running cell can't be interrupted.
 
 ## Commands
 
-| Command | Description |
-|---------|-------------|
-| `/repl` | Show usage |
-| `/lab` | Alias for `/repl` |
-| `/repl python` | Start the shared Python/IPython session with `python` |
-| `/repl ipython` | Start the shared Python/IPython session with `ipython` |
-| `/repl julia` | Start the shared Julia session with `julia` |
-| `/repl r` | Start the shared R session with `R` |
-| `/repl ghci` | Start the shared Haskell (GHCi) session with `ghci` |
-| `/repl clojure` | Start the shared Clojure session with `clojure` |
-| `/repl ruby` | Start the shared Ruby session with `irb` |
-| `/repl java` | Start the shared Java session with `jshell` |
-| `/repl octave` | Start the shared Octave session with `octave-cli` |
-| `/repl matlab` | Start the shared MATLAB terminal session |
-| `/repl gnuplot` | Start the independent shared gnuplot session |
-| `/repl cpp` | Start a Cling-based C++ REPL (experimental) |
-| `/repl lfortran` | Start the shared LFortran session (experimental; needs LFortran `main`) |
-| `/lab python` | Same as `/repl python` |
-| `/lab ipython` | Same as `/repl ipython` |
-| `/lab julia` | Same as `/repl julia` |
-| `/lab r` | Same as `/repl r` |
-| `/lab ghci` | Same as `/repl ghci` |
-| `/lab clojure` | Same as `/repl clojure` |
-| `/lab ruby` | Same as `/repl ruby` |
-| `/lab java` | Same as `/repl java` |
-| `/lab octave` | Same as `/repl octave` |
-| `/lab matlab` | Same as `/repl matlab` |
-| `/lab gnuplot` | Same as `/repl gnuplot` |
-| `/lab cpp` | Same as `/repl cpp` |
-| `/lab lfortran` | Same as `/repl lfortran` |
-| `/repl echo` | Show the current submitted-code pane-echo mode |
-| `/repl echo off` | Disable submitted-code displays and raw-history anchors for new sends |
-| `/repl echo summary` | Show short submissions in full, truncating after 20 lines or 2,000 source characters, with compact anchors (default) |
-| `/repl echo full` | Show up to 40 lines or 4,000 source characters and anchors in persistent raw history |
-| `/repl status` | Show running shared REPL sessions |
-| `/repl status python` | Show status for the shared Python/IPython session |
-| `/repl status julia` | Show status for the shared Julia session |
-| `/repl status r` | Show status for the shared R session |
-| `/repl status ghci` | Show status for the shared Haskell (GHCi) session |
-| `/repl status clojure` | Show status for the shared Clojure session |
-| `/repl status ruby` | Show status for the shared Ruby session |
-| `/repl status java` | Show status for the shared Java session |
-| `/repl status octave` | Show status for the shared Octave session |
-| `/repl status matlab` | Show status for the shared MATLAB session |
-| `/repl status gnuplot` | Show status for the shared gnuplot session |
-| `/repl status cpp` | Show status for the shared C++ session |
-| `/repl status lfortran` | Show status for the shared LFortran session and the latest cell pi-repl sent |
-| `/repl env` | Show which interpreter and environment the shared Python/IPython REPL is using |
-| `/repl send` | Run the code on the lines below it in the shared Python/IPython session |
-| `/repl send julia` | Run the code on the lines below it in the shared Julia session (likewise for the other runtimes) |
-| `/repl input <text>` | Answer the READ that an LFortran cell from pi-repl is waiting on |
-| `/repl name` | Show the name your `/repl send` and `/repl env` are recorded under |
-| `/repl name <your name>` | Save the name for everyone on this account (`--clear` removes it) |
-| `/repl attach` | Show how to attach from a new terminal window |
-| `/repl attach julia` | Show how to attach to the shared Julia session |
-| `/repl attach r` | Show how to attach to the shared R session |
-| `/repl attach ghci` | Show how to attach to the shared Haskell (GHCi) session |
-| `/repl attach clojure` | Show how to attach to the shared Clojure session |
-| `/repl attach ruby` | Show how to attach to the shared Ruby session |
-| `/repl attach java` | Show how to attach to the shared Java session |
-| `/repl attach octave` | Show how to attach to the shared Octave session |
-| `/repl attach matlab` | Show how to attach to the shared MATLAB session |
-| `/repl attach gnuplot` | Show how to attach to the shared gnuplot session |
-| `/repl attach cpp` | Show how to attach to the shared C++ session |
-| `/repl attach lfortran` | Show how to attach to the shared LFortran session |
-| `/repl export` | Export the clean record when exactly one shared session is running |
-| `/repl export python` | Export the shared Python/IPython clean record as canonical Markdown |
-| `/repl export julia` | Export the shared Julia clean record as canonical Markdown |
-| `/repl export r` | Export the shared R clean record as canonical Markdown |
-| `/repl export ghci` | Export the shared Haskell (GHCi) clean record as canonical Markdown |
-| `/repl export clojure` | Export the shared Clojure clean record as canonical Markdown |
-| `/repl export ruby` | Export the shared Ruby clean record as canonical Markdown |
-| `/repl export java` | Export the shared Java clean record as canonical Markdown |
-| `/repl export octave` | Export the shared Octave clean record as canonical Markdown |
-| `/repl export matlab` | Export the shared MATLAB clean record as canonical Markdown |
-| `/repl export gnuplot` | Export the shared gnuplot clean record as canonical Markdown |
-| `/repl export cpp` | Export the shared C++ clean record as canonical Markdown |
-| `/repl export lfortran` | Export the shared LFortran clean record as canonical Markdown |
-| `/repl stop` | Stop the shared session if only one is running |
-| `/repl stop python` | Stop the shared Python/IPython session |
-| `/repl stop julia` | Stop the shared Julia session |
-| `/repl stop r` | Stop the shared R session |
-| `/repl stop ghci` | Stop the shared Haskell (GHCi) session |
-| `/repl stop clojure` | Stop the shared Clojure session |
-| `/repl stop ruby` | Stop the shared Ruby session |
-| `/repl stop java` | Stop the shared Java session |
-| `/repl stop octave` | Stop the shared Octave session |
-| `/repl stop matlab` | Stop the shared MATLAB session |
-| `/repl stop gnuplot` | Stop the shared gnuplot session |
-| `/repl stop cpp` | Stop the shared C++ session |
-| `/repl stop lfortran` | Stop the shared LFortran session |
+| Command | What it does |
+|---------|--------------|
+| `/repl <runtime>` | Start a session, or reuse the one running |
+| `/repl status [runtime]` | Show the running sessions, or one session |
+| `/repl attach [runtime]` | Show the command to attach from another terminal |
+| `/repl send [runtime]` | Run the code on the lines below it (in Python if no runtime is named) |
+| `/repl input <text>` | Answer the READ an LFortran cell is waiting on |
+| `/repl env` | Show the Python session's interpreter and environment |
+| `/repl echo [off\|summary\|full]` | Show or change how sends appear in the pane |
+| `/repl name [<name>\|--clear]` | Show, save or clear the name your sends are recorded under |
+| `/repl export [runtime]` | Write a session's record as Markdown |
+| `/repl stop [runtime]` | Stop a session |
 
-For R, both `/repl R` and `/repl r` work. The same applies to `/lab`, `/repl status`, `/repl attach`, `/repl export`, and `/repl stop`.
+`/repl` alone shows usage, and `/lab` is an alias. Without a runtime, `attach`, `export` and `stop` use the only running session, and `attach` lists them all when several are running.
 
-For Clojure, `/repl clojure` is canonical and `/repl clj` also works. The same applies to `/lab`, `/repl status`, `/repl attach`, `/repl export`, and `/repl stop`.
-
-`/repl send` runs your own code in a running session, as `repl_send` runs the agent's. Name the runtime on the first line, unless it is Python, and put the code on the lines below it; Shift+Enter starts a new line:
+`/repl send` runs your own code, as Pi's `repl_send` runs the agent's. Shift+Enter starts a new line:
 
 ```
 /repl send julia
@@ -159,332 +91,69 @@ for i in 1:3
 end
 ```
 
-The result goes into the conversation as a message, so it stays in the scrollback and the agent sees it at its next turn, together with any pane text it hadn't seen yet. It doesn't start a turn, or a session. Pi shows you the code and the end of its output; Ctrl+O shows the rest.
+The result goes into the conversation as a message, which the agent sees at its next turn. It doesn't start a turn. If the code is still running after 20 seconds, the command stops waiting and posts the result when the code finishes.
 
-If the code is still running after 20 seconds, the command stops waiting and tells you so. The code goes on, and its result is posted when it finishes, marked "done, after the wait". If you start, resume or fork another conversation first, it isn't posted there; the session's record keeps it. `/repl env` likewise shows its result as a notice when its code finishes.
+Your `/repl send` and `/repl env` are recorded under your name ("Oliver · via Pi"). `/repl name Oliver` saves it in `~/.config/pi-repl/person.json` (under `$XDG_CONFIG_HOME` when that's set), where agent-repl finds it too. `PI_REPL_USER_NAME` overrides it for one process, and without either, sends are recorded as `User`. Names are self-declared, so they suit people who trust each other, not auditing.
 
-Your `/repl send` and `/repl env` are recorded under your name, so the session's record and pi-markdown-preview's REPL page show who sent them ("Oliver · via Pi"). `/repl name Oliver` saves the name in `~/.config/pi-repl/person.json` (under `$XDG_CONFIG_HOME` when that's set), where `agent-repl` finds it too. It's one setting for everyone on the machine account, and `PI_REPL_USER_NAME` overrides it for one process. Without either, sends are recorded as `User`. `/repl name` alone shows the name in use and where it comes from. Names are self-declared, so they suit people who trust each other, not auditing, and earlier entries keep the name they were recorded with.
+## Tools Pi uses
 
-## Tools used by pi
+You can ask in plain language, and Pi picks the tool and its parameters.
 
-`pi-repl` also exposes tools that pi can use internally. In normal use, you can ask pi to start a shared REPL or run code there, or use the `/repl` commands directly.
+| Tool | What it does |
+|------|--------------|
+| `repl_start` | Start or reuse a session for a given runtime, and wait for its prompt |
+| `repl_status` | Show which sessions are running, with their record and history |
+| `repl_send` | Run code in a running session |
+| `repl_input` | Answer the READ an LFortran cell is waiting on |
+| `repl_history` | Read a session's record: a list of its entries, or one in full |
 
-| Tool | Description |
-|------|-------------|
-| `repl_start` | Start or reuse a shared session with an explicit runtime; wait for a normal prompt and return status/attach details |
-| `repl_status` | Inspect the state of supported shared REPL sessions |
-| `repl_send` | Execute code in a running supported shared REPL session |
-| `repl_input` | Answer the READ that an LFortran cell sent by `repl_send` is waiting on |
-| `repl_history` | Read a session's clean record without changing anything: an index of its entries, paged before or after one, or one entry in full by its ID |
+`repl_start` reuses a running session as it is, keeping its variables and working directory. `repl_send` needs the session running and at its prompt, and never starts, restarts or switches one. If code runs past a send's timeout, Pi stops waiting but the code keeps running, and its output is recorded when it finishes. A result is limited to 2,000 lines or 50 KiB; a longer one is saved to a private file. Pi's tools can't stop or restart a session; that's left to you.
 
-Notes:
+## What the agent is told
 
-- `repl_status` is what pi uses to check which shared REPL sessions are currently running
-- while a shared REPL is running, `repl_status` exposes the versioned clean-record ID/path/count/tail and the separate raw session history path
-- pi can use the clean entries when it needs compatible-client code/output boundaries, or read the raw history for context about direct pane interaction
-- the relevant shared session must already be running and at a normal prompt before `repl_send`; it never auto-starts a missing session
-- you can ask pi naturally to run code in Python, IPython, Julia, R, Haskell, Clojure, Ruby, Java, Octave, MATLAB, gnuplot, C++, or Fortran (LFortran); pi chooses the tool parameters internally
-- use `target: octave`, `target: matlab`, `target: gnuplot`, `target: cpp`, or `target: lfortran` for their separate sessions; they never substitute for one another
-- `repl_status` and `repl_send` accept `target: ruby` or `target: irb`, and `target: java` or `target: jshell`; use the canonical `ruby` and `java` names in `/repl` commands and `repl_start`
-- for plain Python, `print(...)` is the safest way to get values back reliably
-- in Haskell (GHCi), use normal interactive syntax such as `let` bindings or `:{ ... :}` blocks for multiline declarations
-- in Clojure, use normal interactive syntax such as `let`, `def`/`defn`, or `do` forms for multiline code
-- tool output includes both the submitted code and the captured output; the complete response is limited to 2,000 lines or 50 KiB, with the full response saved to a private file when truncated
-- `repl_send` accepts `echoMode: off|summary|full` for a single send; otherwise it uses `/repl echo`, initialized from `PI_REPL_ECHO_MODE` or Summary
-- Full echo mode writes bounded submitted source code into persistent raw terminal history; Summary shows short submissions in full and truncates after 20 lines or 2,000 source characters
+For the sessions it has started or sent to, the agent is also told what has happened since it last looked. This comes when a run starts (you send a prompt while the agent is idle) and with each `repl_send` result. It includes pane text the agent hasn't seen, such as what you typed or output that arrived late, and other clients' entries in the shared record: your sends from another Pi conversation, `agent-repl send`, Pi Studio's sends and notes, and other agents' sends, each with who sent it, its code and its output. Pane text is labelled as untrusted terminal text, and entries as data, not instructions. At a run's start, Pi shows you each as one line, and Ctrl+O shows the rest.
 
-### Starting a session through pi
+So pane text, including anything you type there, and other people's code and output reach the agent's model provider, even with a prompt that has nothing to do with the REPL. `PI_REPL_PANE_ACTIVITY` and `PI_REPL_RECORD_ACTIVITY` ([Settings](#settings)) limit this to sends, or turn it off. [How pi-repl works](docs/details.md#what-the-agent-is-told) gives the limits and timing.
 
-Ask, for example, “Start a shared Ruby REPL.” Pi can call:
+## The shared record
 
-```json
-{ "runtime": "ruby", "timeoutMs": 20000 }
-```
+Each session keeps a record of the code sent through pi-repl, agent-repl and Pi Studio: who sent it and how, its status, the code and its output, up to the latest 300 entries. Clients take turns, so one send can't take another's output. Code typed straight into the terminal isn't in the record. It is in the session's raw history, and it reaches the agent as pane text.
 
-`repl_start` requires `runtime`: `python`, `ipython`, `julia`, `r`, `ghci`, `clojure`, `ruby`, `java`, `octave`, `matlab`, `gnuplot`, `cpp`, or `lfortran`. Apart from `lfortran`, which is described [below](#lfortran-sessions-experimental), it shares the `/repl` and `/lab` startup implementation: a detached tmux session, launched from Pi's working directory through your normal interactive login shell. It returns `created`/`reused`, `ready`, the requested and recorded runtimes, session status (including record/history paths), and an `attachCommand`. It does not open a terminal or attach a client automatically.
+`/repl export [runtime]` writes the record as Markdown to a new file in Pi's working directory. To follow it in a browser, with code, output and saved figures as they arrive, use the REPL page of [pi-markdown-preview](https://github.com/omaclaren/pi-markdown-preview) (`/preview-browser --repl`), or of [agent-markdown-preview](https://github.com/omaclaren/agent-markdown-preview) (`agent-markdown-preview --repl`) outside Pi.
 
-An existing session is reused without resetting variables, changing its working directory, replacing its history logger, or sending input. Python and IPython share `pi-repl-python`: requesting the other interpreter preserves the one already running and reports the difference. As with status inspection, legacy sessions can lazily acquire clean-record metadata; existing metadata is preserved.
+The record is kept under `TMPDIR`. A terminal with a different `TMPDIR` from the one that made the record, as an ssh login can have, can't send to the session, and `/repl status` says why.
 
-Startup waits for a recognised normal prompt on the physical cursor row, not merely a running process, an old prompt in scrollback, or a startup banner. No probe code, Enter, Ctrl-C, or prompt-setting changes are sent. The default wait is 20 seconds; `timeoutMs` accepts 1,000–120,000 milliseconds for prompt polling, in addition to bounded tmux setup/inspection calls. If the prompt cannot be confirmed, the tool returns `ready: false` with status and a warning, leaving the session running. Busy sessions, unfinished direct input, and customised prompts can all produce this result; inspect the pane before sending code. Prompt detection is a snapshot, not a guarantee that another person cannot begin typing afterwards.
+## Pane display
 
-Missing tmux, failed creation, early runtime exit, and cancellation are reported as tool errors. Cancellation after creation leaves the session running too; inspect it with `repl_status`. Stopping or restarting remains an explicit user action. `repl_send` does not silently start, restart, or switch a REPL.
+By default, each send shows its code in the pane, between a header and a `done` line, so you can see what was run. Code is shown in full up to 20 lines or 2,000 characters, and shortened beyond that. `/repl echo full` raises the limit to 40 lines or 4,000 characters, and `/repl echo off` leaves the display out, so the pane shows only the short command that loads the code. The display doesn't change what runs, and it's removed from the captured output and the record.
 
-### C++ submissions (experimental)
+## Stopping
 
-`cpp` is **a Cling-based C++ REPL**, with its own `pi-repl-cpp` session. Cling and its matching development headers must already be available through your normal interactive-login-shell command `cling`. No compiler installation, ROOT/Jupyter stack, alternate-install search or runtime substitution is performed. Native testing currently covers Cling 1.3 on ARM64 macOS; other builds and Linux remain unverified.
+Sessions keep running until you stop them, even when Pi exits or reloads. `/repl stop [runtime]` ends a session, discarding its state, and checks that its runtime has exited. It signals only processes it can confirm belong to the session, never by name, and says when it can't confirm something. Raw history and the record stay on disk. [How pi-repl works](docs/details.md#stopping-safely) has the details.
 
-The tested ARM64 Sonoma Homebrew bottle retains a stale build-time resource path, even though ordinary code may still run. A user-configured `cling` launcher can invoke `<Cling prefix>/libexec/bin/cling` with `-resource-dir=<Cling prefix>/libexec/lib/clang/20` (the bottle's installed LLVM 20 resources), forwarding the original arguments. This corrects the startup diagnostic without patching the interpreter. Keep that configuration in your launcher, not in pi-repl; the extension does not repair runtimes or search for another installation.
+## Settings
 
-```cpp
-int count = 41;
-int next_count(int n) {
-  return n + 1;
-}
-printf("%d\n", next_count(count));
-```
+Set these in Pi's environment before starting it.
 
-Submit **native C++ prompt groups**, not arbitrary translation units. Put a function's opening brace on its declaration line, as above: Cling's continuation rules decide how lines are grouped. Load ordinary definition/header files with `#include "my-definitions.hpp"` instead; these may use normal file formatting. Globals, objects, includes, loaded libraries and direct terminal edits persist in the same interpreter. Agent submissions reject Cling dot commands as C++; direct-terminal `.L`, `.q` and other native commands retain their normal behaviour. Use `/repl stop cpp` for managed shutdown.
+| Variable | Values | Effect |
+|----------|--------|--------|
+| `PI_REPL_PANE_ACTIVITY` | `on` (default), `send`, `off` | Give the agent pane text it hasn't seen at run starts and with sends, with sends only, or never |
+| `PI_REPL_RECORD_ACTIVITY` | `on`, `send`, `off` | The same for other clients' record entries; follows `PI_REPL_PANE_ACTIVITY` when unset |
+| `PI_REPL_ECHO_MODE` | `summary` (default), `full`, `off` | The pane display at startup |
+| `PI_REPL_USER_NAME` | a name | Record your sends under this name |
+| `PI_REPL_AGENT_LABEL` | a label | The agent's name in the record when these tools run outside Pi (`Pi` by default) |
 
-Each send uses a private source (`.cpp`), length-framed request (`.req`) and ordinary definition/initializer driver (`.hxx`). One include is sent to the terminal; no completion command follows it into stdin. The in-session helper calls Cling's own `InputValidator` and `Interpreter::process`, catches C++ exceptions, and publishes a private correlated reply only after evaluator return and helper-local destruction. It neither wraps user declarations in its own function nor replays previous cells. The helper's reserved namespace is `pi_repl_cpp_v1`; do not redefine it or undo its declarations.
+## Related tools
 
-Earlier complete groups can execute before a later compile/link error or incomplete group. There is no transaction, rollback or automatic recovery from native undefined behaviour. `cppResult` in tool details reports native return (`0`), failure (`1`), incomplete input (`2`), standard/other C++ exception (`3`/`4`), or source/control I/O failure (`5`). A captured record is an output capture, not proof of successful computation: for example, a PETSc error return may coexist with `cppResult: 0`. Native diagnostics are retained.
+- [Pi Studio](https://github.com/omaclaren/pi-studio) is a browser workspace for Pi. Its REPL view sends to the same sessions and shares the record. With both loaded, the agent is told of each entry once, and each extension also works alone.
+- [pi-markdown-preview](https://github.com/omaclaren/pi-markdown-preview) previews Pi's responses in the browser, and its REPL page follows each session's record.
+- [agent-repl](https://github.com/omaclaren/agent-repl) is pi-repl running outside Pi: an MCP server and an `agent-repl` command for Claude Code, Codex, OpenCode and other agents, using the same sessions and record.
+- [agent-markdown-preview](https://github.com/omaclaren/agent-markdown-preview) is the browser preview for Claude Code, Codex, Pi and OpenCode sessions, with the same REPL page.
+- [pi-interactive-shell](https://github.com/nicobailon/pi-interactive-shell) runs interactive command-line programs in Pi, with an overlay you can take over.
 
-Timeout and cancellation stop waiting, **not execution**. Controls and the send lease remain until a valid reply or the exact session ends; prompts and displayed markers cannot release them. `fgets`/`getline` remain real terminal reads—supply human input deliberately. Exit, crashes and busy Ctrl-C can destroy the workspace; there is no silent restart. If incompatible headers or a damaged helper prevent a reply, inspect the raw diagnostics and explicitly stop the session rather than send more code. Changed control files are left untouched during cleanup. With tmux `remain-on-exit`, a verified dead pane releases the send lease but its tmux session remains present; further sends are refused. The existing stop ownership checks can also refuse an already-dead pane whose runtime owner no longer exists—inspect/remove that retained pane manually rather than weakening ownership checks.
+## Development
 
-Summary/Full previews do not truncate execution; Off suppresses optional displays. Source is limited to 16 MiB per send (oversized input is rejected, never truncated). Control/include paths support Unicode, spaces and quotes, but not control characters/line breaks/NUL, or a path containing both `"` and `>`. The existing Node executable supplies a bounded cursor query for output spacing, including Off mode; streams and destinations are not replaced.
-
-PETSc is optional, not a package dependency. The optional regression uses a matching real-double/int32 PETSc/MPI installation in one process/rank, retaining the same `Mat`, `Vec` and `KSP` objects through direct edits, compilation errors and library errors, then destroying/finalizing explicitly. Match architecture, MPI and scalar/integer configuration; multi-rank submission and collectives are untested. Do not reinitialize MPI after finalization.
-
-### LFortran sessions (experimental)
-
-`lfortran` shares one LFortran session between you and pi. It needs a build of LFortran's `main` branch with the shared session (`lfortran --connect` and `lfortran kernel --managed`), found as `lfortran` by your interactive login shell; no LFortran release has it yet. It has been tested with `main` at `edf73189fc` on ARM64 macOS.
-
-`/repl lfortran`, or `repl_start` with `runtime: "lfortran"`, starts the `pi-repl-lfortran` tmux session. Its first window is LFortran's own prompt, `lfortran --connect`, where you work. The second runs pi-repl's helper, which starts LFortran's Jupyter kernel and sends pi's cells to it over its own connection, so nothing is pasted into your prompt. Your cells and pi's run in the same kernel and share variables and procedures:
-
-```fortran
-integer :: n = 41
-print *, n + 1
-```
-
-Send complete Fortran: declarations, statements, or whole program units. The kernel runs one cell at a time, and pi-repl refuses to send a cell while one it sent is unresolved. Each result gives the cell's status from the kernel and its output. A send's timeout stops waiting, not the cell; `repl_status` with `target: "lfortran"` and the result's execution ID follows it. Your prompt shows pi's cells, marked `[other client]`, when you next press Enter there ([lfortran/lfortran#16303](https://github.com/lfortran/lfortran/issues/16303)).
-
-When one of pi's cells reaches a READ, the result says so. Pi answers it with `repl_input`, and you can answer it from Pi with `/repl input <text>`; the text is sent as given, spaces included. pi-repl doesn't write answers to its files, but they go through Pi's conversation, so don't use them for secrets.
-
-Some limits come from LFortran as it is now:
-
-- A runtime error in any cell, such as an out-of-bounds index or `error stop`, ends the session for everyone.
-- A cell's output arrives when the cell ends, not while it runs ([lfortran/lfortran#16182](https://github.com/lfortran/lfortran/issues/16182)).
-- Nothing can interrupt a running cell ([lfortran/lfortran#16183](https://github.com/lfortran/lfortran/issues/16183)). Ctrl-C at your prompt during a cell ends your prompt but not the session; `/repl status lfortran` gives the command to rejoin.
-
-And some features of the other runtimes aren't there yet:
-
-- Cells you run at your prompt aren't in the clean record, as typing into the other runtimes' panes isn't. So the agent can't be told of them: it isn't shown your prompt's pane, and what it's told of the record can't include them.
-- Echo modes don't apply: your prompt shows each of pi's cells in full.
-- pi-studio lists the session but doesn't send to it. Its Interrupt sends Ctrl-C to your prompt.
-
-The cells sent through pi-repl, the agent's and `/repl send lfortran`'s, are in the session's clean record, as the other runtimes' sends are. Each entry is `sent` until the cell finishes, then `captured`, or `error` if its outcome couldn't be confirmed. A cell that failed keeps its output, with a last line saying so. The agent is told of other clients' cells, such as another conversation's `/repl send lfortran` or `agent-repl send lfortran`, as of the other runtimes' sends ([below](#what-the-agent-is-told-of-the-record)). `/repl status lfortran` shows where the record is, and `/repl export lfortran` writes it as Markdown.
-
-`/repl stop lfortran` ends your prompt, the helper and the kernel, and checks that they have exited, which discards the session's state for everyone. On macOS the check needs an existing `python3`, as gnuplot's stop does.
-
-### Ruby and Java submissions
-
-Ruby requires `irb` on PATH. Submissions evaluate in the active IRB workspace, so variables and definitions are shared between agent sends and code you type directly. The last non-`nil` result is printed. A one-use IRB echo check suppresses only the loader's redundant `nil` result, restoring the original check before returning; manual expressions, manual `nil`, and the configured echo preference behave normally. User-printed `=> nil` text remains output. Source, paths and previews are encoded without prematurely expanding Ruby interpolation.
-
-Java requires a JDK with `jshell` on PATH. Submissions use JShell's native `/open` command: imports, variables, methods and classes remain available across sends and direct terminal input. **Use `System.out.println(...)` for visible results**; `/open` executes bare expressions but does not echo their values. For example:
-
-```java
-int count = 41;
-System.out.println(count + 1);
-```
-
-Java uses one outer driver file to load the source and then signal completion. The source remains in a separate private file so malformed input cannot swallow the driver's completion step, while the pane shows only the initial `/open` command. JShell control paths can contain spaces and quotes, but not line breaks. Submit complete snippets: JShell can reject or discard unfinished input rather than continue it in a later send. Evaluation is not transactional—valid snippets can run even if another snippet fails. JShell commands such as `/reset` and `/exit` change or end the live session; use them deliberately.
-
-Both runtimes support the same private logs, clean records, exports, Summary/Off/Full displays, and timeout/abort lease handling as the existing runtimes. As with the other REPLs, wait for a normal prompt before sending code; do not send while a person is entering an unfinished interactive expression.
-
-### Octave and MATLAB submissions
-
-Octave requires `octave-cli` on PATH and starts with `--quiet --interactive`, turning off Octave's workspace dump on SIGHUP and SIGTERM so that stopping the session leaves no `octave-workspace` file behind. MATLAB requires a licensed installation with `matlab` on PATH; it starts with `-nodesktop -nosplash -sd <Pi working directory>`. These are separate persistent terminal sessions, not connections to an existing MATLAB desktop. Startup can take longer for MATLAB: request `repl_start` with `timeoutMs: 120000` if needed, and check `ready` before sending code.
-
-Code evaluates in the **base workspace**, shared with direct terminal input. Variables, native semicolon/`ans` behaviour, working-directory changes and search-path changes persist. For example, either runtime can run:
-
-```matlab
-A = [2 1; 1 2];
-disp(eig(A));
-```
-
-Send complete snippets. Run existing scripts or call functions on the current path; MATLAB function definitions belong in `.m` files rather than an `eval` submission. Syntax/runtime errors are printed and later sends can recover, but execution is not transactional: earlier effects are not undone. The completion guard lives outside the base workspace, so `clear`, `clear all`, `return` and Ctrl-C do not remove it. Clearing variables and ending the runtime with `exit` or `quit` are still deliberate state-changing actions. An exit may complete its guard before the pane closes, or be reported as a session-ended error.
-
-A private `.m` driver loads the code and records completion without adding helper variables or changing `ans` in the base workspace. Unicode, quoting and line breaks are encoded safely. Both runtimes use the existing records, exports, Summary/Off/Full displays, retained timeout/abort controls, and verified explicit stop. They recognise the ordinary `octave:N>` and `>>` prompts; custom/debugger prompts are not treated as ready. This adds runtime support to `pi-repl`, not new MATLAB/Octave controls to `pi-studio`.
-
-Graphics retain the runtime's normal behaviour and installed backends. Figures are not captured automatically. Export explicitly when needed, for example `print(gcf, 'figure.png', '-dpng')`. Headless Octave graphics depend on an appropriate toolkit; `octave-cli` does not repair a missing or broken Qt installation.
-
-### gnuplot submissions
-
-gnuplot requires `gnuplot` on PATH. `/repl gnuplot` starts it through your normal interactive login shell, with its own `pi-repl-gnuplot` session. It is not a plotting backend for another REPL. Startup files, terminal selection, output destinations and plotting preferences retain their native behaviour; the extension does not add `-persist` or choose a graphics backend.
-
-Variables, functions, data blocks and plotting state are shared with direct terminal input. For example:
-
-```gnuplot
-a = 0.2
-f(x) = exp(-a*x)*sin(5*x)
-plot [0:20] f(x)
-```
-
-Change `a` directly in the attached terminal, then ask Pi to `replot` in gnuplot. Use `print` for console values; a user-selected `set print` destination is respected, so an empty tool result can be normal. Figures are not captured automatically. Export explicitly when wanted, selecting an installed file terminal and closing its output file afterwards. For example, with no output file currently open:
-
-```gnuplot
-set term push
-set term svg size 640,360
-set output 'figure.svg'
-replot
-unset output
-set term pop
-```
-
-Submit complete native scripts. Commands run via `load`, not expression-by-expression emulation. Earlier effects survive a later error; syntax errors, nested load failures and Ctrl-C return control without resetting variables or settings. In a loaded script, `exit`/`quit` returns from that script; **`exit gnuplot` ends the process**. `reset` and `reset session` deliberately change state. Interactive waits such as `pause -1` remain genuine waits for the person at the terminal; do not request them accidentally.
-
-A private `.gp` source and acknowledgment guard run through a short-lived Node pipe producer (`.cjs`). The producer uses pipe closure to detect native error/interrupt unwinding, rather than guessing from a prompt or queuing completion commands into terminal input. It does not introduce gnuplot helper variables or alter `set print`, terminal/output/table settings, or native error status. Display markers go to the terminal's stderr independently of `set print`. Paths support Unicode, quotes and shell metacharacters, but not line breaks or NUL bytes. Source/guard/driver files remain private and retained with the send lease through timeout/abort until completion or the exact session ends.
-
-The normal `gnuplot>` prompt is recognised for startup readiness. Native graphics require a working installed terminal/backend; no backend repair or automatic window capture is performed. This support is in `pi-repl`, not new gnuplot controls in `pi-studio`.
-
-New sessions inherit a random `PI_REPL_GNUPLOT_OWNER` launch marker, recorded separately in tmux as `@pi_repl_gnuplot_owner`. Qt deliberately detaches its helper and can keep windows alive after losing the interpreter connection. The marker lets explicit stop attribute that helper even after detachment, with the usual UID, process-birth and protected-pane checks. It changes no plotting settings, plugin paths, temporary-directory choices or startup files. Existing sessions are never retrofitted or restarted: without valid ownership metadata, stop warns that detached-helper cleanup cannot be verified and does not guess ownership.
-
-On macOS, inspecting detached helpers requires an existing `python3` (isolated, standard-library-only native process inspection); Linux uses `/proc`. No unrelated environment values are returned. `lsof` identifies the helper's open socket files. After verified process exit, cleanup removes only unchanged, same-owner socket inodes with no remaining same-user process references; unavailable inspection or changed/in-use files produce a warning instead of deletion. Nothing is installed automatically.
-
-Custom launchers must preserve the reserved marker. Do not copy it or manually share a marked Qt helper between sessions that need independent stops: the helper belongs to its creating session. External widgets, marker-stripping launchers and other untracked detached processes require manual management. Native `exit gnuplot`/persist behaviour is unchanged; helper cleanup runs only on an explicit `/repl stop`.
-
-## Shared clean record
-
-`pi-repl` remains independently usable and has no dependency on `pi-studio`. When a compatible `pi-studio` uses the same tmux REPL session, both clients automatically discover one session-owned clean record and see each other's submitted code and captured output.
-
-Compatible clients publish a versioned opaque ID in tmux and store the bounded JSON snapshot in a private per-user temporary directory. The record is tied to the exact tmux session ID and creation time, uses atomic locked updates, and holds a shared send lease from pre-send capture through completion capture. If `repl_send` times out or is aborted after submission, that live client keeps the lease until the code finishes, then captures its output from the original pane and records it; its entry stays `sending` until then. Only a verified end of the session or runtime releases it sooner. The result tells the agent the code is still running and not to send it again, and status says which send holds the lease. Caller cancellation does not stop code already running in the REPL. This serializes compatible Studio and `pi-repl` sends so they do not claim each other's output. Agent sends still run without a lease when the session has no usable record; a host's person sends (`sendAndSettle`) refuse instead.
-
-The record's directory is under the temporary directory (`TMPDIR`), which can differ between terminals of one account, such as an ssh login and a desktop terminal. So each session also records which directory holds its record, as a key in tmux (`@pi_repl_record_root_key`), set when its record is first made. A send from a terminal whose record directory is a different one, or has been replaced (by temporary-file cleanup, say), is refused before anything is sent, and status says why. Use the session from a terminal with the same `TMPDIR`, or restart it, which discards its state. A session that an older client made gets its key at its first send from a terminal whose directory holds its record; until then, status says its record directory is not verified. Status and `/repl export` only read: they never set the key or create a record. Older clients ignore the key, so the check holds only among updated clients.
-
-The clean record does **not** infer semantic boundaries for commands typed directly into an attached tmux pane. Direct interaction remains in the raw pane/history mirror. `/repl export [target]` writes the canonical clean-record Markdown to a new no-clobber file in Pi's current working directory; its metadata identifies entry origin, mode, status, runtime, and timestamp and states the direct-input limitation.
-
-Instead, the agent is told what it missed. Each agent keeps its own view of each pane, which only what is delivered to it advances: other clients' sends and your `/repl` commands never hide pane text from it. In Pi, when a run starts (you send a prompt while the agent is idle), a message is added before the model plans, with the pane text the agent has not seen for the sessions it has started or sent to: most recently used first, at most 6,000 characters in all, and checked within 3 seconds in all, naming any pane left out or not checked in time. Pi shows it to you as one line naming each pane and how many lines it showed; Ctrl+O shows the text. It counts as seen once the run starts, and nothing is added when nothing changed. Prompts you send while the agent is working join that run without a new message, so text from then on reaches it with its next send, whose result starts with the pane text the agent has not seen: typing at the prompt, other clients' sends, or late or background output. A session the agent's process creates is seen from its ready prompt on, without the startup banner; for any other session, its first send shows the pane's recent text. The send's loader line, unique to each send, marks where its view ends, so repeated output cannot be mistaken for it; when that line has scrolled out of the 5,000-line capture, or the end is unclear, the report says so and shows recent text instead, or says so alone if there is none. `repl_status` previews the same text without marking it seen. Reports hold at most 40 lines or 4,000 characters, are labelled as untrusted terminal text, are not parsed into code and output, and never enter the clean record.
-
-Because pane text, including anything typed there, then reaches the agent and its model provider, even with a prompt that has nothing to do with the REPL, attach instructions say so. `PI_REPL_PANE_ACTIVITY` in the environment of Pi or the agent's MCP server chooses: `on` (the default) for run starts and sends, `send` for sends only, as before 0.10.0, and `off` for neither, which stops reports while it is set. It does not erase the pane's history: text from that time can still reach the agent in a later report once reports are on again, or in a new agent's first report. A new, resumed, branched or compacted Pi conversation starts without a view, so its first send shows recent pane text.
-
-### What the agent is told of the record
-
-The agent is also told of other clients' entries in the clean records of the sessions it has started or sent to: your `/repl send` from another conversation, `agent-repl send`, Pi Studio's sends and notes, and other agents' sends. Each says who sent it and how (`Ada · via terminal`, or an agent's label), its status, and its prose, code and output. An entry it was told of that changes, such as one whose output was captured after its sender stopped waiting, is told again as an update. Its own sends aren't told back, and neither is a `/repl send` posted into its own conversation; another agent with the same label is still another client, since entries are told apart by ID.
-
-In Pi, the entries come in a message when a run starts, before the pane text and within the same 6,000 characters and 3 seconds (Pi shows it to you as one line, and Ctrl+O shows the entries), and with each `repl_send` result, before its pane text and its own result, within 8,000 characters. A report tells at most 10 entries, newest change first; those left out are listed by ID, for `repl_history`, and aren't offered again unless they change. What a report tells counts only once it is in the request Pi sends the model, so a run that never starts, or a report another extension removed, tells it again; until then, its entries aren't put in another report. With agent-repl's MCP server, it counts once it is in the result as returned, unless the call was cancelled. A report keeps at most 40 lines of each entry's prose, code and output, its first and last. A new, resumed, branched or compacted Pi conversation, or a new MCP server, is told again, within the same bounds. It's best effort: the record keeps at most 300 entries and can be cleared, so an entry can leave it before anyone is told, and a report says when the record was cleared or discarded entries. Code typed straight into a pane isn't recorded, nor are cells run at LFortran's own prompt, so neither can be told this way; for a pane, the pane text covers it. `repl_history` lists a session's entries, or shows one by its ID, without counting as told.
-
-This sends other clients' code, output, notes and names to the agent and its model provider, so attach instructions and status say so. `PI_REPL_RECORD_ACTIVITY` chooses: `on` for run starts and sends, `send` for sends only, and `off` for neither. When it isn't set, it follows `PI_REPL_PANE_ACTIVITY`, so turning pane text off turns this off too. Reports are labelled as data from the shared session, not instructions, whoever they name.
-
-When Pi Studio is loaded in the same Pi, it can leave the `pi-repl-*` sessions its pane shows and its agent uses to pi-repl, over Pi's event bus, so each entry is told once: pi-repl tells them when a run starts, and Studio's tool results carry pi-repl's report, as `repl_send` results do. Each extension also works alone. Pi Studio 0.11.9 and earlier don't share the view, so with them an agent may be told an entry by both.
-
-Existing sessions attach lazily. Unsupported versions and invalid or stale session identities are left untouched, with ordinary `pi-repl` behavior and raw history still available. See [`shared/REPL_SESSION_RECORD_PROTOCOL.md`](./shared/REPL_SESSION_RECORD_PROTOCOL.md) for protocol, safety, retention, and compatibility details.
-
-### Submission display and alignment anchors
-
-Pane echo, enabled in Summary mode by default, places one blank line before the compact begin anchor, separating the runtime loader command from the readable block. Submitted code, the plain `── output ──` divider, output and the completion anchor then follow without added internal padding. All runtimes add one display-only blank line after `done` too, separating the block from the returning prompt. Native prompt spacing is left unchanged. Blank lines printed by user code remain in the raw pane; display spacing does not change submitted code or clean captured output. The header reads `── pi-repl · input · 2 lines · id: 40c4561ef0f6 ──`, followed by plain code with its indentation and no added vertical bars. The same labelled ID appears after `done`. This is a stable 12-character hexadecimal hash derived from the Shared REPL Record entry ID: a correlation label for matching raw history to a recorded send, not a counter, timestamp or execution signal. Older marker formats remain readable. `repl_send` removes the exact header, source preview, divider, and footer from captured output and the clean record, while they remain in raw pane history.
-
-Use `/repl echo off|summary|full` to change the default for the current Pi process, or set `PI_REPL_ECHO_MODE` before startup. A per-send `echoMode` overrides that default without changing it. **Summary** is the startup default: it shows short submissions in full, truncates after 20 lines or 2,000 source characters, and puts a plain output divider before runtime output. **Off** disables the optional display and alignment anchors for quiet output, although the REPL can still echo its unavoidable temporary-file control command. **Full** is an explicit opt-in that raises the bounds to 40 lines or 4,000 source characters. Line limits count source lines, not soft-wrapped terminal rows, and affect only the preview: submitted code still executes in full. Terminal, line-separator, and bidirectional control characters are escaped in all visible previews.
-
-GHCi, Ruby, Java, Octave, MATLAB, gnuplot and C++ use a read-only tmux cursor-column query, with a short timeout, to avoid adding an empty row before `done` while still separating it from output that has no trailing newline. If that query is unavailable, they fall back to the safe newline guard. Output streams and interactive echo settings are not replaced.
-
-Both Summary and Full persist the displayed source in raw terminal history. Off suppresses this extra copy, not the submitted code already retained in tool results and the clean record. Explicit `PI_REPL_ECHO_MODE=off` settings are still honoured.
-
-Runtime wrappers use request-unique paths such as `/tmp/pi-rc-<user-key>/<submission-id>-<random-token>.py`. The 12-character prefix matches the `id:` in the input and completion markers. Related source, guard, driver and `.done` files share that prefix; each source-file allocation still has its own independent 16-hex-character random token. The prefix is retained in Off mode too, without adding any display markers. Transient tmux paste-buffer files keep their unprefixed random names.
-
-The per-user root is current-user-owned mode `0700`, source files are created exclusively with mode `0600`, and files are removed after capture or by the timeout/abort watcher once execution settles. Random allocation tokens and exclusive creation—not the short submission ID—prevent overwrites across clients, processes, tmux servers and runtimes. Cleanup also accepts older unprefixed filenames; file names and presence do not establish record identity or execution status.
-
-GHCi shows only the initial `:script` command. Three private scripts separate user source, an intermediate guard, and the outer completion driver. An unfinished `:{ … :}` block can stop a single nested driver; the guard absorbs that script failure so the outer driver still reaches completion. User source is not repaired or rewritten, queued user commands still finish first, and all three files remain private and retained until execution settles. GHCi control paths cannot contain line breaks.
-
-Ruby's one-use echo check preserves an existing singleton `echo?` method as well as ordinary IRB settings. If an unusual customised or frozen context refuses the hook, the wrapper keeps normal IRB behaviour rather than failing the submission.
-
-These anchors are presentation and alignment evidence only. They do not make direct attached-pane input authoritative and never promote inferred raw history into protocol-v1 entries.
-
-## Shared sessions
-
-The default shared tmux session names are:
-
-- `pi-repl-python` for Python/IPython
-- `pi-repl-julia` for Julia
-- `pi-repl-r` for R
-- `pi-repl-ghci` for Haskell (GHCi)
-- `pi-repl-clojure` for Clojure
-- `pi-repl-ruby` for Ruby/irb
-- `pi-repl-java` for Java/JShell
-- `pi-repl-octave` for Octave
-- `pi-repl-matlab` for MATLAB
-- `pi-repl-gnuplot` for gnuplot
-- `pi-repl-cpp` for C++ (Cling)
-
-Nonzero tmux `base-index` and `pane-base-index` settings are supported. `pi-repl` selects the lowest-indexed pane in the lowest-indexed window, then pins that pane's stable ID for each send so switching active windows cannot redirect its output capture.
-
-The Python/IPython session can currently be launched in either:
-
-- `python` mode
-- `ipython` mode
-
-## Stopping safely
-
-`/repl stop [target]` and `/lab stop [target]` verify shutdown, rather than assuming that closing tmux also terminates its runtimes. The command snapshots the selected session's pane processes and descendants, checks local owner/start-time/terminal identities, and guards the final tmux operation against session replacement or changed pane topology. Linked windows are refused because another session still uses them.
-
-After closing the selected session, it waits briefly for normal exit, sends TERM to confirmed survivors, and uses KILL only if those same owned processes still survive. Each signal rechecks process identity and protects live panes, Pi itself, and the tmux server. It never kills by runtime name or signals an entire process group. Runtime exit is reported only after verification; uncertain ownership of identified processes, inspection failures or survivors produce an error requiring manual inspection. Untracked-helper and socket-cleanup limits are reported explicitly as warnings, not as fully verified cleanup. Dead/detached panes whose ownership cannot be established are refused before shutdown.
-
-This is an explicit, state-discarding stop: save anything needed first. It sends no runtime exit command, Ctrl-C or other input into the pane, and leaves raw logs and clean records on disk. Other sessions are not stopped. No process cleanup runs automatically on startup, send, Pi reload or Pi exit. The checks require local Unix process inspection (macOS/Linux); missing inspection support fails closed. It is not a general orphan collector: apart from gnuplot's session-marked interpreter/Qt helpers, processes already detached before inspection, or descendants that cannot be safely attributed after their parent exits, may require manual cleanup.
-
-## Attaching
-
-After running `/repl attach`, open a new terminal window and run the tmux command shown by pi. For example:
-
-```bash
-tmux attach -t pi-repl-python
-```
-
-## Example workflow
-
-```text
-/repl ipython
-/repl env
-/repl echo summary
-/repl status
-/repl attach
-
-/repl julia
-/repl status julia
-/repl attach julia
-
-/repl R
-/repl status r
-/repl attach r
-
-/repl ghci
-/repl status ghci
-/repl attach ghci
-
-/repl clojure
-/repl status clojure
-/repl attach clojure
-
-/repl ruby
-/repl status ruby
-/repl attach ruby
-
-/repl java
-/repl status java
-/repl attach java
-
-/repl gnuplot
-/repl status gnuplot
-/repl attach gnuplot
-
-/repl export python
-```
-
-Example requests once the REPL is running:
-
-- `run print(sys.executable) in the shared Python REPL`
-- `inspect the current globals in the shared Python REPL`
-- `in the shared Julia REPL, load LinearAlgebra`
-- `now find the eigenvalues of [2 1; 1 2] in the shared Julia REPL`
-- `in the shared R REPL, run mean(c(1, 2, 3, 4))`
-- `in the shared Haskell REPL, run map (+1) [1,2,3]`
-- `in the shared Clojure REPL, run (map inc [1 2 3])`
-- `in the shared Ruby REPL, run (1..3).map { |x| x + 1 }`
-- `in the shared Java REPL, run System.out.println(1 + 2);`
-- `in the shared gnuplot REPL, replot using the current parameter values`
-
-## Notes
-
-- `tmux` is required.
-- Mainly tested on macOS. On Windows, use WSL, with Pi, tmux and the interpreters all running inside it.
-- While a shared REPL is running, `pi-repl` keeps both the compatible-client clean record and a raw transcript log of the tmux pane output for that session.
-- The raw transcript is plain text and may include prompts, echoed input, request-specific display anchors, output, direct pane interaction, and errors; it is not parsed into clean entries.
-- Newly started sessions use unique mode-`0600` raw logs in the current-user-owned mode-`0700` directory `<os temporary directory>/pi-repl-history-<uid>/`. Restarting a session or using another tmux server does not truncate a previous log. Symlinked, foreign-owned, or permissive history roots are refused.
-- Existing sessions and legacy `/tmp/pi-repl/*.history.log` files are left untouched. The new storage applies when you next start a REPL session; restarting a REPL discards its in-memory variables, so do this only when finished with that session. Logs are not automatically deleted.
-- `/repl env` is currently implemented for Python/IPython only.
-- `repl_send` submissions are labelled `Pi` in the clean record and its exports. A host that runs these tools outside Pi can set `PI_REPL_AGENT_LABEL` to name its agent instead.
-
-## Development and local checks
-
-Development checks use Pi 0.85.x, its current `typebox` API, and Node.js 22.19 or later. TypeScript stays on 5.9 for this maintenance update.
+Development uses Pi 1.5 and Node.js 22.19 or later.
 
 ```bash
 npm ci
@@ -492,38 +161,18 @@ npm run typecheck
 npm test
 ```
 
-`npm test` runs unit tests plus local Python/tmux integration tests. Integration tests use dedicated tmux servers with empty configuration, temporary homes and private test files. Test sockets live in short, private temporary directories, not the user's tmux socket directory. Teardown verifies that both the servers and their owned runtime processes exit; it does not treat a vanished tmux session as sufficient. Tests do not attach to or send code to your existing REPLs. Tests requiring tmux or Python skip when those executables are unavailable; no CI service is required.
-
-To exercise all installed runtimes, or just a selected subset:
+The tests use their own tmux servers, temporary homes and private files, never your REPLs, and check that every runtime they start has exited. Runtimes other than Python are tested when you select them, and missing ones are skipped:
 
 ```bash
 PI_REPL_TEST_RUNTIMES=all npm test
 PI_REPL_TEST_RUNTIMES=julia,r npm run test:integration
-PI_REPL_TEST_RUNTIMES=ruby,java npm run test:integration
-PI_REPL_TEST_RUNTIMES=octave,matlab npm run test:integration
-PI_REPL_TEST_RUNTIMES=gnuplot npm run test:integration
-PI_REPL_TEST_RUNTIMES=cpp npm run test:integration
-# Optional matching real-double/int32 PETSc installation (never installed by tests):
-PI_REPL_TEST_RUNTIMES=cpp PI_REPL_TEST_PETSC_PREFIX=/your/petsc/prefix npm run test:integration
 ```
 
-The integration tests cover command/tool startup across runtimes, concurrent starts, state-preserving reuse, readiness timeout on unfinished direct input, nonzero indexes, pane selection, session restarts, raw-log permissions, clean records and exports, concurrent sends, timeout/abort leases, and runtime wrappers. Portable startup tests also cover explicit runtime validation, failures, cancellation, custom/continuation prompts, and bounded status output. Ruby/Java checks also cover shared direct input, interpolation, Unicode and quoted control paths, persistent declarations, malformed input and error recovery. Octave/MATLAB checks cover base-workspace and direct-input persistence, `ans`, scripts/functions, cwd/path changes, Unicode, syntax/runtime errors, clearing, return, interruption, exit, retained controls and figure-file export where a non-windowed backend is available. MATLAB tests need a working licence; they isolate preferences and startup files without changing the installed licence. Optional runtime tests are opt-in and skip missing executables. Julia tests resolve the existing juliaup-selected binary before isolating the test home.
-
-gnuplot checks cover direct edits, functions/data blocks, literal control paths, native settings and print/table/output destinations, errors and nested scripts, Ctrl-C, genuine input waits, retained leases, native exit, text/SVG plotting and verified stop. Optional Qt offscreen tests verify detached-helper and socket cleanup before test teardown, preservation of another server's graphics/state, and conservative legacy-session warnings. Missing plugins are reported as skips, not repaired. Test-only flags isolate gnuplot startup files and select a text terminal; production startup leaves these choices to the user.
-
-Test launchers record PID/owner/start-time identities before executing a runtime. The test harness tracks server descendants and pane process groups across session replacement, then individually revalidates survivors before TERM/KILL cleanup. It never kills by executable name or signals a whole process group. The teardown hook is registered before launch, runs after setup failures too, verifies no owned runtime is still running, and removes its private socket directory only after successful cleanup. Regression tests cover ignored hangup/TERM, orphaned children, PID reuse, failed setup, and preservation of unrelated sessions. Production `/repl stop` tests independently verify runtime exit before test teardown, across all supported runtimes, including a busy GHCi session, resistant child processes, linked windows and same-name replacement races. Gnuplot fixtures register an additional private-cwd/birth-identity observer before launch: it can rescue detached Qt helpers after failures without relying on the production marker reader. Process names only filter candidates; they never establish ownership by themselves.
-
-`PI_REPL_CONTROL_ROOT` optionally overrides the private runtime-control directory; it must be current-user-owned mode `0700`. Tests set it to their temporary directory so even stale-file cleanup stays isolated. This does not change the shared-record protocol or Studio's control-file location.
-
-Before testing the checkout interactively, replace the npm package source with the absolute local repo path and restart Pi. Avoid loading both copies. Restart Pi after changing imported shared JavaScript helpers too: `/reload` can retain those modules in the current Pi/Jiti loader. Leave tmux REPLs running to preserve their state.
+To try a checkout in Pi, replace the npm install with the local path (`pi remove npm:pi-repl`, then `pi install /path/to/pi-repl`) and restart Pi. Restart it again after changing the shared JavaScript, since `/reload` can keep the old modules. [How pi-repl works](docs/details.md#tests) has more on the tests.
 
 ## Acknowledgements
 
 Ruby and Java support builds on [Ifiht's contribution in PR #2](https://github.com/omaclaren/pi-repl/pull/2), adapted to the current execution, display and recording machinery.
-
-## Related extensions
-
-[`pi-interactive-shell`](https://github.com/nicobailon/pi-interactive-shell) offers related but distinct functionality for interactive CLI sessions in pi, including overlay-based interaction and user take-over. `pi-repl` is focused specifically on shared tmux-backed REPL sessions.
 
 ## License
 

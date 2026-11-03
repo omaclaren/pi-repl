@@ -4,6 +4,9 @@ All notable changes to `pi-repl` are documented here.
 
 ## [Unreleased]
 
+### Changed
+- A shorter README, with links to Pi Studio, pi-markdown-preview, agent-repl and agent-markdown-preview. Runtime notes are in `docs/runtimes.md`, and the details of starting, the record, what the agent is told, the pane display and stopping in `docs/details.md`; both are in the package.
+
 ## [0.12.1] — 2026-11-03
 
 ### Added
