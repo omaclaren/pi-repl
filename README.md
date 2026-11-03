@@ -9,7 +9,7 @@ A [Pi](https://pi.dev) extension for REPL sessions that you and Pi share. pi-rep
 
 *Pi (left) and the same Julia workspace in an attached terminal (right). The second request uses a matrix changed directly in the terminal.*
 
-[agent-repl](https://github.com/omaclaren/agent-repl) gives Claude Code, Codex, OpenCode and other agents the same sessions. Its [one-minute demo](https://omaclaren.github.io/agent-repl/#demo) shows Pi, a person and Claude Code sharing a Python session.
+To follow a session in the browser, use the REPL page of [pi-markdown-preview](https://github.com/omaclaren/pi-markdown-preview) (`/preview-browser --repl`) or [agent-markdown-preview](https://github.com/omaclaren/agent-markdown-preview) (`agent-markdown-preview --repl`). It shows who sent each submission, its code and output, and any plots it saved, as they arrive. [agent-repl](https://github.com/omaclaren/agent-repl) gives Claude Code, Codex, OpenCode and other agents the same sessions, and its [one-minute demo](https://omaclaren.github.io/agent-repl/#demo) shows Pi, a person and Claude Code sharing a Python session, with the browser page showing their code and plots.
 
 ## Install
 
@@ -119,7 +119,7 @@ So pane text, including anything you type there, and other people's code and out
 
 Each session keeps a record of the code sent through pi-repl, agent-repl and Pi Studio: who sent it and how, its status, the code and its output, up to the latest 300 entries. Clients take turns, so one send can't take another's output. Code typed straight into the terminal isn't in the record. It is in the session's raw history, and it reaches the agent as pane text.
 
-`/repl export [runtime]` writes the record as Markdown to a new file in Pi's working directory. To follow it in a browser, with code, output and saved figures as they arrive, use the REPL page of [pi-markdown-preview](https://github.com/omaclaren/pi-markdown-preview) (`/preview-browser --repl`), or of [agent-markdown-preview](https://github.com/omaclaren/agent-markdown-preview) (`agent-markdown-preview --repl`) outside Pi.
+The browser REPL pages [above](#pi-repl) show the record as it grows, and `/repl export [runtime]` writes it as Markdown to a new file in Pi's working directory.
 
 The record is kept under `TMPDIR`. A terminal with a different `TMPDIR` from the one that made the record, as an ssh login can have, can't send to the session, and `/repl status` says why.
 
