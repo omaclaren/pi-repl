@@ -3057,6 +3057,17 @@ test("Pi Studio's report request gets what a repl_send result carries, once, for
 	assert.equal(await report({ own }), "");
 	await given(f, own.text);
 	assert.equal(await report(), "");
+	// Even when another entry waits and no report fits Studio's budget (Astra's review).
+	await other.send("d5_waiting = 6");
+	await other.send("d5_tight_own = 7");
+	const tightEntry = readReplSessionRecord(recordId).entries.at(-1);
+	const tightOwn = { sessionName: "pi-repl-python", id: tightEntry.id, text: `Studio's result for ${tightEntry.id}`, shown: [tightEntry.status] };
+	assert.equal(await report({ budget: 100, own: tightOwn }), "");
+	await given(f, tightOwn.text);
+	const waiting = await report();
+	assert.match(waiting, /d5_waiting = 6/);
+	assert.doesNotMatch(waiting, /d5_tight_own/);
+	await given(f, waiting);
 	// It follows PI_REPL_RECORD_ACTIVITY as a result does: send reports, off doesn't.
 	process.env.PI_REPL_RECORD_ACTIVITY = "send";
 	await other.send("d5_send_mode = 4");

@@ -499,6 +499,23 @@ test("a report held back by an earlier one still counts when it reaches the mode
 	assert.equal(buildReplActivityReport(state, [observe([foreign, other])], { budget: 8_000 }).text, "");
 });
 
+test("the agent's own send counts by its result even when no report fits", () => {
+	// Astra's review of Studio's report request: a budget no report fits dropped the own mark too.
+	for (const [budget, foreignIds] of [[100, ["small"]], [600, ["a", "b", "c", "d"].map((letter) => letter.repeat(240))]]) {
+		const state = createReplActivityState();
+		const foreign = foreignIds.map((id) => entry(id));
+		const mine = entry("mine");
+		const own = [{ sessionName: "pi-studio-repl-python", id: "mine", version: replEntryVersion(mine), text: "my own result", final: false }];
+		const tight = buildReplActivityReport(state, [observe([...foreign, mine])], { budget, own });
+		assert.equal(tight.text, "");
+		holdReplActivityCommit(state, "k", tight.commit);
+		confirmReplActivityDelivered(state, "my own result");
+		const full = buildReplActivityReport(state, [observe([...foreign, mine])], { budget: 8_000 });
+		assert.doesNotMatch(full.text, /\[entry mine /, `budget ${budget}`);
+		for (const id of foreignIds) assert.ok(full.text.includes(`[entry ${id} `), "nothing else was marked");
+	}
+});
+
 test("a report begun before a reset is empty and changes nothing", () => {
 	// Astra's D5 review, 6.
 	const state = createReplActivityState();

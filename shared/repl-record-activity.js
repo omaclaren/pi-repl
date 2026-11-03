@@ -355,7 +355,8 @@ const sessionBlock = (session) => [session.heading, ...session.notes].join("\n\n
  * tag, so an identical heading or note from an earlier report doesn't stand in for this one.
  *
  * When there's nothing to tell, the report is empty and its marks are applied at once, unless
- * they include the agent's own send.
+ * they include the agent's own send. When no report fits, it's empty too, and only the agent's
+ * own send is marked, once its result reaches the model.
  * @param {ReturnType<typeof createReplActivityState>} state
  * @param {Array<any>} observations
  * `generation`, when given, is the state's when the observations were begun: a reset since
@@ -392,7 +393,9 @@ export function buildReplActivityReport(state, observations, { budget, maxEntrie
 		applyReplActivityCommit(state, commit);
 		return empty;
 	}
-	if (budget < MIN_REPORT_BUDGET) return empty;
+	// When no report fits, nothing is told, but the agent's own send still counts by its result.
+	const nothingFits = () => (own.length ? { ...empty, commit: { generation: state.generation, seq, tag: null, sessions: [], own: ownMarks } } : empty);
+	if (budget < MIN_REPORT_BUDGET) return nothingFits();
 
 	const covered = [];
 	const uncovered = [];
@@ -439,7 +442,7 @@ export function buildReplActivityReport(state, observations, { budget, maxEntrie
 		chosen.pop();
 		composed = compose();
 	}
-	if (composed.text.length > budget) return empty;
+	if (composed.text.length > budget) return nothingFits();
 	const { omitted, note, text } = composed;
 	const commit = {
 		generation: state.generation,
