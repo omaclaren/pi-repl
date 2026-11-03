@@ -2931,7 +2931,7 @@ test("an agent is told of other clients' record entries with its sends, once, an
 	assert.match(resultText(await f.tools.get("repl_history").execute(randomUUID(), { runtime: "julia" }, undefined, undefined, f.ctx)), /^pi-repl-julia isn't running, or has no shared record yet\.$/);
 	// What goes to the agent is said where the person looks, and in the agent's guidelines.
 	assert.match((await f.status()).content[0].text, /\nOther clients' entries in the shared record, with their code, output, notes and names, go to the agent and its model provider when a run starts and with its sends; PI_REPL_RECORD_ACTIVITY=send keeps them to sends, and =off stops them\./);
-	assert.ok(f.tools.get("repl_send").promptGuidelines.some((line) => /^pi-repl tells you of new entries .* when a run starts and in repl_send results\. .*LFortran's own prompt, isn't recorded/.test(line)));
+	assert.ok(f.tools.get("repl_send").promptGuidelines.some((line) => /^Run starts and results also tell you of other clients' new or changed entries .*'captured' means/.test(line)));
 });
 
 test("at a run's start the record report comes before the pane text, within its budget; Studio's pane and agent bring sessions in", { timeout: 90000 }, async (t) => {
@@ -3030,7 +3030,7 @@ test("a host without Pi's events marks what it reports when the result returns, 
 	recordActivity(t);
 	const f = await fixture(t, { startWithTool: true, withoutEvents: true });
 	if (!f) return;
-	assert.ok(f.tools.get("repl_send").promptGuidelines.some((line) => /^pi-repl tells you of new entries .*, in repl_send results\./.test(line) && !/when a run starts/.test(line)));
+	assert.ok(f.tools.get("repl_send").promptGuidelines.some((line) => /^Results also tell you of other clients' new or changed entries/.test(line)));
 	const other = await f.otherAgent();
 	await other.send("d5_mcp = 1");
 	// Cancelled while the record is read, after the code ran: the result doesn't reach the model.
