@@ -9,7 +9,9 @@ A [Pi](https://pi.dev) extension for REPL sessions that you and Pi share. pi-rep
 
 *Pi (left) and the same Julia workspace in an attached terminal (right). The second request uses a matrix changed directly in the terminal.*
 
-To follow a session in the browser, use the REPL page of [pi-markdown-preview](https://github.com/omaclaren/pi-markdown-preview) (`/preview-browser --repl`) or [agent-markdown-preview](https://github.com/omaclaren/agent-markdown-preview) (`agent-markdown-preview --repl`). It shows who sent each submission, its code and output, and any plots it saved, as they arrive. [agent-repl](https://github.com/omaclaren/agent-repl) gives Claude Code, Codex, OpenCode and other agents the same sessions, and its [one-minute demo](https://omaclaren.github.io/agent-repl/#demo) shows Pi, a person and Claude Code sharing a Python session, with the browser page showing their code and plots.
+To follow a session in the browser, use the REPL page of [pi-markdown-preview](https://github.com/omaclaren/pi-markdown-preview) (`/preview-browser --repl`) or [agent-markdown-preview](https://github.com/omaclaren/agent-markdown-preview) (`agent-markdown-preview --repl`). It shows who sent each submission, its code and output, and any plots it saved, as they arrive. [Pi Studio](https://github.com/omaclaren/pi-studio), a browser workspace for Pi, also shows the sessions in its REPL view and can send code to them.
+
+[agent-repl](https://github.com/omaclaren/agent-repl) gives Claude Code, Codex, OpenCode and other agents the same sessions, and its [one-minute demo](https://omaclaren.github.io/agent-repl/#demo) shows Pi, a person and Claude Code sharing a Python session, with the browser page showing their code and plots.
 
 ## Install
 
