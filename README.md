@@ -355,7 +355,7 @@ In Pi, the entries come in a message when a run starts, before the pane text and
 
 This sends other clients' code, output, notes and names to the agent and its model provider, so attach instructions and status say so. `PI_REPL_RECORD_ACTIVITY` chooses: `on` for run starts and sends, `send` for sends only, and `off` for neither. When it isn't set, it follows `PI_REPL_PANE_ACTIVITY`, so turning pane text off turns this off too. Reports are labelled as data from the shared session, not instructions, whoever they name.
 
-When Pi Studio is loaded in the same Pi, it can leave the `pi-repl-*` sessions its pane shows and its agent uses to pi-repl, over Pi's event bus, so each entry is told once. Pi Studio 0.11.9 and earlier don't, so with them an agent may be told an entry by both.
+When Pi Studio is loaded in the same Pi, it can leave the `pi-repl-*` sessions its pane shows and its agent uses to pi-repl, over Pi's event bus, so each entry is told once: pi-repl tells them when a run starts, and Studio's tool results carry pi-repl's report, as `repl_send` results do. Each extension also works alone. Pi Studio 0.11.9 and earlier don't share the view, so with them an agent may be told an entry by both.
 
 Existing sessions attach lazily. Unsupported versions and invalid or stale session identities are left untouched, with ordinary `pi-repl` behavior and raw history still available. See [`shared/REPL_SESSION_RECORD_PROTOCOL.md`](./shared/REPL_SESSION_RECORD_PROTOCOL.md) for protocol, safety, retention, and compatibility details.
 

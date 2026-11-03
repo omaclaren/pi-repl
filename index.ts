@@ -1152,7 +1152,7 @@ function ownEntryText(id: string): string {
  * when off, when there is nothing to tell, or after a reset while the record was read; a
  * failure to look leaves the result as it is.
  */
-async function recordActivityForResult(pi: ExtensionAPI, cwd: string, key: string, own?: OwnRecordEntry): Promise<string> {
+async function recordActivityForResult(pi: ExtensionAPI, cwd: string, key: string, own?: OwnRecordEntry, budget = REPL_ACTIVITY_RESULT_BUDGET): Promise<string> {
 	if (recordActivityMode() === "off") return "";
 	const host = recordActivityFor(pi);
 	try {
@@ -1164,7 +1164,7 @@ async function recordActivityForResult(pi: ExtensionAPI, cwd: string, key: strin
 		const ownEntry = own && observedOwn?.ok ? observedOwn.record.entries.find((entry) => entry.id === own.id) : undefined;
 		const version = ownEntry && (own?.final || own?.shown?.includes(ownEntry.status)) ? replEntryVersion(ownEntry) : "";
 		const report = buildReplActivityReport(host.state, observations, {
-			budget: REPL_ACTIVITY_RESULT_BUDGET,
+			budget,
 			retrieval: RECORD_ACTIVITY_RETRIEVAL,
 			generation,
 			own: own ? [{ sessionName: own.sessionName, id: own.id, version, text: own.text ?? ownEntryText(own.id), final: own.final }] : [],
@@ -1259,11 +1259,12 @@ function payloadTexts(payload: unknown): string[] {
 /**
  * Pi Studio's part in the view of `pi-repl-*` sessions (REPL_ACTIVITY_CHANNEL): a probe is
  * answered at once, so Studio leaves those sessions to this view; then the sessions its agent
- * used, its pane's session, and its agent's own sends to them.
+ * used, its pane's session, and its agent's own sends to them; and, for each of its tool's
+ * results, a report of those sessions, answered once, as repl_send's result has.
  */
-function takeStudioRecordActivity(host: RecordActivityHost, data: unknown): void {
+function takeStudioRecordActivity(pi: ExtensionAPI, host: RecordActivityHost, data: unknown): void {
 	if (!data || typeof data !== "object") return;
-	const message = data as { kind?: unknown; sessionName?: unknown; reply?: unknown; id?: unknown; version?: unknown; text?: unknown };
+	const message = data as { kind?: unknown; sessionName?: unknown; reply?: unknown; id?: unknown; version?: unknown; text?: unknown; cwd?: unknown; budget?: unknown; own?: unknown };
 	const name = typeof message.sessionName === "string" && PI_REPL_SESSION_NAME.test(message.sessionName) ? message.sessionName : undefined;
 	if (message.kind === "probe") {
 		if (typeof message.reply === "function") message.reply({ protocol: REPL_ACTIVITY_PROTOCOL });
@@ -1274,7 +1275,36 @@ function takeStudioRecordActivity(host: RecordActivityHost, data: unknown): void
 	} else if (message.kind === "own") {
 		if (!name || typeof message.id !== "string" || typeof message.version !== "string" || typeof message.text !== "string" || !message.text) return;
 		holdReplActivityCommit(host.state, `studio:${randomUUID()}`, ownReplActivityCommit(host.state, [{ sessionName: name, id: message.id, version: message.version, text: message.text }]));
+	} else if (message.kind === "report") {
+		if (typeof message.reply !== "function") return;
+		const reply = message.reply as (text: string) => void;
+		let answered = false;
+		const answer = (text: string) => {
+			if (answered) return;
+			answered = true;
+			try { reply(text); } catch { /* Studio's to handle */ }
+		};
+		recordActivityForStudio(pi, message).then(answer, () => answer(""));
 	}
+}
+
+/**
+ * Pi Studio's report request: for its tool's result, what a repl_send result carries, over the
+ * sessions in this view (those Studio said its agent used, and its pane). Its own send counts by
+ * its result's text, as repl_send's does. Anything malformed is told nothing.
+ */
+async function recordActivityForStudio(pi: ExtensionAPI, message: { cwd?: unknown; budget?: unknown; own?: unknown }): Promise<string> {
+	if (typeof message.cwd !== "string" || !message.cwd || typeof message.budget !== "number" || !Number.isFinite(message.budget)) return "";
+	let own: OwnRecordEntry | undefined;
+	if (message.own !== undefined) {
+		const mark = message.own as { sessionName?: unknown; id?: unknown; text?: unknown; shown?: unknown; final?: unknown } | null;
+		if (!mark || typeof mark.sessionName !== "string" || !PI_REPL_SESSION_NAME.test(mark.sessionName)
+			|| typeof mark.id !== "string" || !mark.id || typeof mark.text !== "string" || !mark.text
+			|| !Array.isArray(mark.shown) || !mark.shown.every((status) => typeof status === "string")
+			|| (mark.final !== undefined && typeof mark.final !== "boolean")) return "";
+		own = { sessionName: mark.sessionName, id: mark.id, text: mark.text, shown: mark.shown, final: mark.final === true };
+	}
+	return recordActivityForResult(pi, message.cwd, `studio:${randomUUID()}`, own, Math.min(message.budget, REPL_ACTIVITY_RESULT_BUDGET));
 }
 
 /** One line when folded; Pi shows the report as any message when expanded (Ctrl+O). */
@@ -4553,7 +4583,7 @@ export default function (pi: ExtensionAPI) {
 	pi.on?.("session_tree", resetRecordActivity(false));
 	pi.on?.("session_compact", resetRecordActivity(false));
 	// Pi Studio, loaded too, leaves its agent's pi-repl-* sessions to this view (repl-record-activity.js).
-	pi.events?.on?.(REPL_ACTIVITY_CHANNEL, (data) => takeStudioRecordActivity(recordHost, data));
+	pi.events?.on?.(REPL_ACTIVITY_CHANNEL, (data) => takeStudioRecordActivity(pi, recordHost, data));
 	pi.registerMessageRenderer?.(RECORD_ACTIVITY_MESSAGE, renderRecordActivityMessage);
 	pi.registerMessageRenderer?.(PANE_ACTIVITY_MESSAGE, renderPaneActivityMessage);
 	if (typeof pi.on === "function") {

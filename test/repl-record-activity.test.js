@@ -454,7 +454,7 @@ test("repl_history pages a record's index by creation, and shows one entry in fu
 test("pi-repl's channel for Studio is versioned", async () => {
 	const { REPL_ACTIVITY_CHANNEL, REPL_ACTIVITY_PROTOCOL } = await import("../shared/repl-record-activity.js");
 	assert.equal(REPL_ACTIVITY_CHANNEL, "pi-repl:record-activity:v1");
-	assert.equal(REPL_ACTIVITY_PROTOCOL, 1);
+	assert.equal(REPL_ACTIVITY_PROTOCOL, 2);
 });
 
 test("an entry in a report not yet shown to the model isn't put in another, until the next look at what the model is given", () => {

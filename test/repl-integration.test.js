@@ -129,19 +129,22 @@ async function fixture(t, { index = 0, runtime = "python", controlName, startWit
 	let execOverride;
 	const handlers = new Map();
 	// Pi's event bus, shared by the extensions of one Pi session, as Pi's createEventBus.
-	const bus = new EventEmitter();
-	const pi = {
-		registerTool: (tool) => tools.set(tool.name, tool),
-		registerCommand: (name, definition) => commands.set(name, definition),
-		on: (event, handler) => handlers.set(event, [...(handlers.get(event) ?? []), handler]),
-		events: {
+	const eventBus = () => {
+		const bus = new EventEmitter();
+		return {
 			emit: (channel, data) => { bus.emit(channel, data); },
 			on: (channel, handler) => {
 				const safe = async (data) => { try { await handler(data); } catch {} };
 				bus.on(channel, safe);
 				return () => bus.off(channel, safe);
 			},
-		},
+		};
+	};
+	const pi = {
+		registerTool: (tool) => tools.set(tool.name, tool),
+		registerCommand: (name, definition) => commands.set(name, definition),
+		on: (event, handler) => handlers.set(event, [...(handlers.get(event) ?? []), handler]),
+		events: eventBus(),
 		sendMessage: (message, options) => messages.push({ message, options }),
 		registerMessageRenderer: (customType, renderer) => renderers.set(customType, renderer),
 		async exec(command, args, options) {
@@ -199,6 +202,8 @@ async function fixture(t, { index = 0, runtime = "python", controlName, startWit
 		const registerOther = sameFactory ? register : (await import(`../index.ts?fixture=${randomUUID()}`)).default;
 		registerOther({
 			...pi,
+			// Another process has its own Pi, so its own event bus.
+			...(sameFactory || !pi.events ? {} : { events: eventBus() }),
 			registerTool: (tool) => otherTools.set(tool.name, tool),
 			registerCommand() {},
 			on: (event, handler) => otherHandlers.set(event, [...(otherHandlers.get(event) ?? []), handler]),
@@ -2973,7 +2978,7 @@ test("at a run's start the record report comes before the pane text, within its 
 	assert.deepEqual(await recordOnly(), []);
 	let info;
 	f.pi.events.emit(REPL_ACTIVITY_CHANNEL, { kind: "probe", reply: (value) => { info = value; } });
-	assert.deepEqual(info, { protocol: 1 }, "answered at once");
+	assert.deepEqual(info, { protocol: 2 }, "answered at once");
 	f.pi.events.emit(REPL_ACTIVITY_CHANNEL, { kind: "used", sessionName: "pi-studio-repl-python" });
 	f.pi.events.emit(REPL_ACTIVITY_CHANNEL, { kind: "pane", sessionName: "pi-repl-python" });
 	const [fromPane] = await recordOnly();
@@ -3008,6 +3013,66 @@ test("at a run's start the record report comes before the pane text, within its 
 	process.env.PI_REPL_RECORD_ACTIVITY = "send";
 	assert.deepEqual(await recordOnly(), []);
 	assert.match(resultText(await f.send("print(1)")), /d5_later = 3/);
+});
+
+test("Pi Studio's report request gets what a repl_send result carries, once, for the sessions Studio's agent uses", { timeout: 90000 }, async (t) => {
+	// Studio's c118: with pi-repl holding the view, Studio's results carry pi-repl's report.
+	recordActivity(t);
+	const f = await fixture(t, { startWithTool: true });
+	if (!f) return;
+	const { recordId } = (await f.status()).details.python;
+	const report = (fields = {}) => new Promise((resolve) => {
+		f.pi.events.emit(REPL_ACTIVITY_CHANNEL, { kind: "report", cwd: f.cwd, budget: 8_000, ...fields, reply: resolve });
+	});
+	// A new conversation has used nothing: the report covers what Studio says its agent uses.
+	await f.fire("session_start", { reason: "new" });
+	const other = await f.otherAgent();
+	await other.send("d5_report = 1");
+	assert.equal(await report(), "");
+	f.pi.events.emit(REPL_ACTIVITY_CHANNEL, { kind: "used", sessionName: "pi-repl-python" });
+	const first = await report();
+	assert.ok(told(first));
+	assert.match(first, /pi-repl-python \(Python\/IPython\), recent entries:[\s\S]*```python\nd5_report = 1\n```/);
+	// Held until the model is given it; a reply Studio dropped is offered again after that look.
+	assert.equal(await report(), "");
+	await given(f, "a request without it");
+	const again = await report();
+	assert.match(again, /d5_report = 1/);
+	await given(f, again);
+	assert.equal(await report(), "");
+	// Malformed requests are told nothing, and change nothing.
+	await other.send("d5_later = 2");
+	assert.equal(await report({ cwd: 1 }), "");
+	assert.equal(await report({ budget: "8000" }), "");
+	assert.equal(await report({ budget: 100 }), "", "below a report's minimum");
+	assert.equal(await report({ own: { sessionName: "pi-studio-repl-python", id: "x", text: "x", shown: [] } }), "", "Studio's own sessions are its own");
+	assert.equal(await report({ own: { sessionName: "pi-repl-python", id: "x", text: "x" } }), "");
+	const later = await report();
+	assert.match(later, /d5_later = 2/);
+	await given(f, later);
+	// Studio's agent's own send counts by Studio's result, at the status it showed.
+	await other.send("d5_studio_own = 3");
+	const ownEntry = readReplSessionRecord(recordId).entries.at(-1);
+	const own = { sessionName: "pi-repl-python", id: ownEntry.id, text: `Studio's result for ${ownEntry.id}`, shown: [ownEntry.status] };
+	assert.equal(await report({ own }), "");
+	await given(f, own.text);
+	assert.equal(await report(), "");
+	// It follows PI_REPL_RECORD_ACTIVITY as a result does: send reports, off doesn't.
+	process.env.PI_REPL_RECORD_ACTIVITY = "send";
+	await other.send("d5_send_mode = 4");
+	const sendMode = await report();
+	assert.match(sendMode, /d5_send_mode = 4/);
+	await given(f, sendMode);
+	process.env.PI_REPL_RECORD_ACTIVITY = "off";
+	await other.send("d5_off = 5");
+	assert.equal(await report(), "");
+	// A reply that throws is Studio's; it's answered once all the same.
+	process.env.PI_REPL_RECORD_ACTIVITY = "on";
+	let answers = 0;
+	await new Promise((resolve) => {
+		f.pi.events.emit(REPL_ACTIVITY_CHANNEL, { kind: "report", cwd: f.cwd, budget: 8_000, reply: () => { answers += 1; resolve(); throw new Error("Studio's"); } });
+	});
+	assert.equal(answers, 1);
 });
 
 test("a run that starts before a tool result's report reaches the model doesn't have it told twice", { timeout: 90000 }, async (t) => {
