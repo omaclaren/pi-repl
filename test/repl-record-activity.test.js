@@ -456,3 +456,90 @@ test("pi-repl's channel for Studio is versioned", async () => {
 	assert.equal(REPL_ACTIVITY_CHANNEL, "pi-repl:record-activity:v1");
 	assert.equal(REPL_ACTIVITY_PROTOCOL, 1);
 });
+
+test("an entry in a report not yet shown to the model isn't put in another, until the next look at what the model is given", () => {
+	// Astra's D5 review, 4: two results before the next model request, as in one codemode script.
+	const state = createReplActivityState();
+	const foreign = entry("foreign");
+	const first = buildReplActivityReport(state, [observe([foreign])], { budget: 8_000 });
+	holdReplActivityCommit(state, "tool:1", first.commit);
+	assert.match(first.text, /\[entry foreign /);
+	const second = buildReplActivityReport(state, [observe([foreign])], { budget: 8_000 });
+	holdReplActivityCommit(state, "tool:2", second.commit);
+	assert.doesNotMatch(second.text, /entry foreign/);
+	// The first isn't shown (another extension removed it): after that look, it's offered again.
+	confirmReplActivityDelivered(state, "neither report");
+	assert.match(buildReplActivityReport(state, [observe([foreign])], { budget: 8_000 }).text, /\[entry foreign /);
+	// A changed version isn't held back by the report that held the old one.
+	const other = createReplActivityState();
+	holdReplActivityCommit(other, "tool:1", buildReplActivityReport(other, [observe([foreign])], { budget: 8_000 }).commit);
+	assert.match(buildReplActivityReport(other, [observe([{ ...foreign, output: "new" }])], { budget: 8_000 }).text, /\[entry foreign /);
+});
+
+test("a report begun before a reset is empty and changes nothing", () => {
+	// Astra's D5 review, 6.
+	const state = createReplActivityState();
+	const generation = state.generation;
+	resetReplActivityState(state, { newConversation: false });
+	const report = buildReplActivityReport(state, [observe([entry("r1")])], { budget: 8_000, generation });
+	assert.deepEqual([report.text, report.commit], ["", null]);
+	assert.equal(state.views.size, 0);
+	assert.match(buildReplActivityReport(state, [observe([entry("r2")])], { budget: 8_000, generation: state.generation }).text, /entry r2/);
+});
+
+test("own sends are kept per session, so many in one session don't evict another's", () => {
+	// Astra's D5 review, 7.
+	const state = createReplActivityState();
+	const mine = entry("py-own");
+	const own = (sessionName, id, version) => {
+		holdReplActivityCommit(state, `tool:${id}`, ownReplActivityCommit(state, [{ sessionName, id, version, text: `own ${id}.` }]));
+		confirmReplActivityDelivered(state, `own ${id}.`);
+	};
+	own("pi-studio-repl-python", "py-own", replEntryVersion(mine));
+	for (let index = 0; index < 400; index += 1) own("pi-repl-julia", `jl-${index}`, "v");
+	assert.equal(buildReplActivityReport(state, [observe([mine])], { budget: 8_000 }).text, "");
+});
+
+test("a host that sees each result as it returns looks only for that result's report, and drops what isn't there", () => {
+	// Astra's D5 review, 5: a result cut to its bounds after the report was made.
+	const state = createReplActivityState();
+	const [kept, cut] = [entry("kept"), entry("cut")];
+	const first = buildReplActivityReport(state, [observe([kept, cut])], { budget: 8_000 });
+	holdReplActivityCommit(state, "tool:1", first.commit);
+	const later = buildReplActivityReport(state, [observe([kept, cut, entry("another")])], { budget: 8_000 });
+	holdReplActivityCommit(state, "tool:2", later.commit);
+	assert.match(later.text, /\[entry another /);
+	const returned = first.text.slice(0, first.text.indexOf("[entry cut"));
+	confirmReplActivityDelivered(state, returned, "tool:1");
+	assert.ok(state.pending.has("tool:2"), "another call's report is left alone");
+	state.pending.delete("tool:1");
+	state.pending.delete("tool:2");
+	const next = buildReplActivityReport(state, [observe([kept, cut])], { budget: 8_000 });
+	assert.ok(next.text, "nothing of the first held back once it's dropped");
+	assert.match(next.text, /\[entry cut /);
+	assert.doesNotMatch(next.text, /\[entry kept /);
+});
+
+test("repl_history keeps within its budget with the longest IDs", () => {
+	// Astra's D5 review, 8.
+	const long = (index) => `${String(index).padStart(3, "0")}${"i".repeat(237)}`;
+	const observed = observe(Array.from({ length: 100 }, (_, index) => entry(long(index))), { record: { droppedEntries: 5, clearedAt: Date.now() } });
+	for (const options of [{ limit: 100 }, { limit: 100, before: long(99) }, { limit: 100, after: long(0) }, { entryId: long(50) }]) {
+		const page = replRecordHistory({ ...observed, unverified: true }, options);
+		assert.ok(page.length <= 8_000, `${JSON.stringify(Object.keys(options))}: ${page.length}`);
+		assert.match(page, options.entryId ? /\[entry 050i/ : /Entries \d+–\d+ of 100/);
+	}
+	assert.ok(replRecordHistory(observed, { limit: 100, budget: 1_500 }).length <= 1_500);
+});
+
+test("a report's entries keep the first and last lines of a long part, so a report never reaches a result's line bound", () => {
+	// Astra's D5 review, 5: a newline-heavy entry before another.
+	const state = createReplActivityState();
+	const report = buildReplActivityReport(state, Array.from({ length: 1 }, () => observe(Array.from({ length: 10 }, (_, index) => entry(`lines${index}`, { code: `${"#\n".repeat(400)}x = ${index}`, output: "o\n".repeat(400) })))), { budget: 8_000 });
+	assert.equal(report.told + report.omitted, 10);
+	assert.ok(report.text.split("\n").length < 1_000, `${report.text.split("\n").length} lines`);
+	assert.match(report.text, /#\n… 362 lines cut here …\n#[\s\S]*x = 9\n```/);
+	assert.ok(report.commit.sessions[0].marks.some((mark) => mark.disposition === "clipped"));
+	// repl_history shows an entry whole, as far as its budget allows.
+	assert.doesNotMatch(replRecordHistory(observe([entry("whole", { code: "#\n".repeat(100) })]), { entryId: "whole" }), /lines cut here/);
+});

@@ -14,6 +14,9 @@ export const FAKE_LFORTRAN = fileURLToPath(new URL("./fake-lfortran.js", import.
 // the tests' records go to a private one, removed when the test process ends.
 const temporary = mkdtempSync(join(tmpdir(), "pi-repl-lfortran-tests-"));
 process.env.TMPDIR = temporary;
+// A person's sends from this process read the person setting: this run's own, never the account's.
+process.env.XDG_CONFIG_HOME = join(temporary, "config");
+delete process.env.PI_REPL_USER_NAME;
 process.on("exit", () => rmSync(temporary, { recursive: true, force: true }));
 export const REAL_LFORTRAN = process.env.PI_REPL_LFORTRAN;
 export const tmuxAvailable = process.platform !== "win32" && spawnSync("tmux", ["-V"]).status === 0;

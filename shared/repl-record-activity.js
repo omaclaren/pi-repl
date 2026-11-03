@@ -17,10 +17,16 @@ export const REPL_ACTIVITY_RUN_START_BUDGET = 6_000;
 export const REPL_ACTIVITY_RESULT_BUDGET = 8_000;
 /** Entries in one report, and IDs listed of those left out. */
 export const REPL_ACTIVITY_MAX_ENTRIES = 10;
+/**
+ * Lines of an entry's prose, code or output in a report, so that a report's lines stay well
+ * within a tool result's own bound (pi-repl's is 2,000), whatever the entries hold.
+ */
+export const REPL_ACTIVITY_PART_LINES = 40;
 const MAX_LISTED_IDS = 10;
 const MAX_VIEWS = 32;
 const MAX_PENDING = 64;
-const MAX_OWN = 300;
+// Own sends kept per session: more than its record holds (300), so one evicted has left the record.
+const MAX_OWN_PER_SESSION = 400;
 const MAX_NAME_CHARS = 80;
 
 /**
@@ -133,8 +139,9 @@ export async function readReplRecordInert(path, expected) {
  * One conversation's views of the sessions it has been told about, keyed by session name. Each
  * view is of one session run (record ID, tmux session ID and creation time) and holds, per entry,
  * the last version considered and what became of it. `own` holds the agent's own sends, by
- * entry ID, in the version its result showed. `pending` holds reports and own sends not yet
- * shown to the model; `generation` changes on a reset, so a report from before it changes nothing.
+ * session name then entry ID, in the version its result showed. `pending` holds reports and own
+ * sends not yet shown to the model; `generation` changes on a reset, so a report from before it
+ * changes nothing.
  */
 export function createReplActivityState() {
 	return { generation: 0, seq: 0, views: new Map(), forgotten: new Set(), used: new Set(), own: new Map(), pending: new Map() };
@@ -192,18 +199,34 @@ export function clipReplText(text, max) {
 	return { text: `${head}${marker(cut)}${tail}`, cut };
 }
 
-/** An entry as the agent is told it: its line, then prose, code and output in fenced blocks. */
-export function formatReplActivityEntry(entry, { updated = false, runtime = "", max = Infinity } = {}) {
+/** Text cut to `max` lines, keeping its first and last, with the count cut in the middle. */
+export function clipReplLines(text, max) {
+	const lines = String(text).split("\n");
+	if (lines.length <= max) return { text: String(text), cut: 0 };
+	const head = lines.slice(0, Math.ceil((max - 1) / 2));
+	const tail = lines.slice(lines.length - Math.floor((max - 1) / 2));
+	const cut = lines.length - head.length - tail.length;
+	return { text: [...head, `… ${cut} lines cut here …`, ...tail].join("\n"), cut };
+}
+
+/**
+ * An entry as the agent is told it: its line, then prose, code and output in fenced blocks,
+ * each at most `maxLines` lines, and all of it at most `max` characters.
+ */
+export function formatReplActivityEntry(entry, { updated = false, runtime = "", max = Infinity, maxLines = Infinity } = {}) {
 	const line = `[${updated ? "updated · " : ""}entry ${entry.id} · ${describeReplEntrySender(entry)} · ${entry.status} · ${clock(entry.completedAt ?? entry.updatedAt ?? entry.createdAt)}]`;
 	const parts = [
 		{ key: "prose", text: entry.prose || "", language: "text", recorded: entry.proseOmittedChars },
 		{ key: "code", text: entry.code || "", language: FENCE_LANGUAGE[entry.runtime] || FENCE_LANGUAGE[runtime] || "", recorded: entry.codeOmittedChars },
 		{ key: "output", text: entry.output || "", language: "text", recorded: entry.outputOmittedChars },
-	].filter((part) => part.text);
+	].filter((part) => part.text).map((part) => {
+		const lines = clipReplLines(part.text, maxLines);
+		return { ...part, text: lines.text, linesCut: lines.cut };
+	});
 	const recordNotes = parts.filter((part) => part.recorded > 0).map((part) => `(The record had already cut ${part.recorded} characters of ${part.key}.)`);
 	const build = (texts) => [line, ...parts.map((part, index) => fence(texts[index], part.language)), ...recordNotes].join("\n");
 	const full = build(parts.map((part) => part.text));
-	if (full.length <= max) return { text: full, clipped: false };
+	if (full.length <= max) return { text: full, clipped: parts.some((part) => part.linesCut > 0) };
 	// Share what's left among the parts by their size, keeping each part's start and end.
 	const frame = build(parts.map(() => "")).length + parts.length * 40;
 	const room = max - frame;
@@ -251,8 +274,22 @@ function pendingOwnIds(state) {
 	return ids;
 }
 
+/**
+ * Entries in reports not yet shown to the model, by session, ID and version: a later report
+ * leaves them out until the next look at what the model is given, after which they're offered
+ * again if they weren't there.
+ */
+function reservedVersions(state) {
+	const reserved = new Set();
+	for (const commit of state.pending.values()) {
+		if (commit.generation !== state.generation || !commit.reserving) continue;
+		for (const session of commit.sessions) for (const mark of session.marks) reserved.add(`${session.sessionName}\0${mark.id}\0${mark.version}`);
+	}
+	return reserved;
+}
+
 /** A session as a report sees it: its heading, gap notes, view and the entries to offer. */
-function describeObservedSession(state, observed, exclude) {
+function describeObservedSession(state, observed, exclude, reserved = new Set()) {
 	const name = oneLine(observed.sessionName, 120);
 	if (!observed.ok) {
 		const note = observed.problem
@@ -288,8 +325,10 @@ function describeObservedSession(state, observed, exclude) {
 		// The agent's own send, as its result showed it. A result that showed how it ended stands for
 		// every version, including those written after it (LFortran's helper writes from its own
 		// process, so its `sent` and settled versions can land after the result).
-		const own = state.own.get(entry.id);
-		if (own?.sessionName === observed.sessionName && (own.final || own.version === version)) continue;
+		const own = state.own.get(observed.sessionName)?.get(entry.id);
+		if (own && (own.final || own.version === version)) continue;
+		// Held by a report not yet shown to the model: offered again only if that one isn't.
+		if (reserved.has(`${observed.sessionName}\0${entry.id}\0${version}`)) continue;
 		session.candidates.push({ entry, version, session, updated: Boolean(known?.told || own) });
 	}
 	// A record from a session with no record-directory key yet says so with its entries, not on
@@ -319,15 +358,19 @@ const sessionBlock = (session) => [session.heading, ...session.notes].join("\n\n
  * they include the agent's own send.
  * @param {ReturnType<typeof createReplActivityState>} state
  * @param {Array<any>} observations
- * @param {{ budget: number, maxEntries?: number, exclude?: Set<string>, own?: ReplOwnEntry[], retrieval?: string }} options
+ * `generation`, when given, is the state's when the observations were begun: a reset since
+ * makes the report empty, changing nothing.
+ * @param {{ budget: number, maxEntries?: number, exclude?: Set<string>, own?: ReplOwnEntry[], retrieval?: string, generation?: number }} options
  */
-export function buildReplActivityReport(state, observations, { budget, maxEntries = REPL_ACTIVITY_MAX_ENTRIES, exclude = new Set(), own = [], retrieval = "" }) {
+export function buildReplActivityReport(state, observations, { budget, maxEntries = REPL_ACTIVITY_MAX_ENTRIES, exclude = new Set(), own = [], retrieval = "", generation = state.generation }) {
+	const empty = { text: "", commit: null, told: 0, omitted: 0, sessions: [] };
+	if (generation !== state.generation) return empty;
 	const seq = ++state.seq;
 	const tag = `[report ${randomUUID().slice(0, 8)}]`;
 	const headingLine = `${REPL_ACTIVITY_HEADING} ${tag}`;
-	const empty = { text: "", commit: null, told: 0, omitted: 0, sessions: [] };
 	const skip = new Set([...exclude, ...own.map((mark) => mark.id), ...pendingOwnIds(state)]);
-	const sessions = observations.map((observed) => describeObservedSession(state, observed, skip));
+	const reserved = reservedVersions(state);
+	const sessions = observations.map((observed) => describeObservedSession(state, observed, skip, reserved));
 	const omittedNoteFor = (ids) => omittedNote(ids, retrieval);
 	const commitFor = (session, text = "", marks = []) => ({
 		sessionName: session.observed.sessionName,
@@ -374,7 +417,7 @@ export function buildReplActivityReport(state, observations, { budget, maxEntrie
 	for (let index = 0; index < candidates.length && chosen.length < maxEntries; index += 1) {
 		const candidate = candidates[index];
 		const left = budget - frame - used - omittedNoteFor(candidates.slice(index + 1).map((other) => other.entry.id)).length - 4;
-		const formatted = formatReplActivityEntry(candidate.entry, { updated: candidate.updated, runtime: candidate.session.observed.runtime, max: left });
+		const formatted = formatReplActivityEntry(candidate.entry, { updated: candidate.updated, runtime: candidate.session.observed.runtime, max: left, maxLines: REPL_ACTIVITY_PART_LINES });
 		if (!formatted) break;
 		chosen.push({ ...candidate, ...formatted });
 		used += formatted.text.length + 2;
@@ -402,6 +445,7 @@ export function buildReplActivityReport(state, observations, { budget, maxEntrie
 		generation: state.generation,
 		seq,
 		tag,
+		reserving: true,
 		own: ownMarks,
 		sessions: [
 			...quiet,
@@ -439,15 +483,19 @@ export function ownReplActivityCommit(state, own) {
  * another extension removed or rewrote stays pending, so comes round again. Parts never seen
  * stay pending until a reset or the pending bound. An own send is looked for once: its result
  * is in what the model is given next, so one that isn't there never reached it, and its entry
- * is offered as any other's.
+ * is offered as any other's. With `only`, just the report or own send held under that key is
+ * looked for: a host that sees each result as it returns, without Pi's events. Otherwise, after
+ * the look, reports still waiting no longer hold their entries back from later reports.
  * @param {ReturnType<typeof createReplActivityState>} state
  * @param {string | string[]} delivered
+ * @param {string} [only]
  */
-export function confirmReplActivityDelivered(state, delivered) {
+export function confirmReplActivityDelivered(state, delivered, only) {
 	let confirmed = 0;
 	const messages = Array.isArray(delivered) ? delivered : [delivered];
 	const everywhere = messages.join("\n");
 	for (const [key, commit] of [...state.pending].sort((a, b) => a[1].seq - b[1].seq)) {
+		if (only !== undefined && key !== only) continue;
 		const scope = commit.tag ? messages.filter((message) => message.includes(commit.tag)).join("\n") : "";
 		const inReport = (text) => !text || scope.includes(text);
 		const found = (mark) => !mark.text || scope.includes(mark.text);
@@ -481,6 +529,7 @@ export function confirmReplActivityDelivered(state, delivered) {
 		if (later.length) commit.sessions = later;
 		else state.pending.delete(key);
 	}
+	if (only === undefined) for (const commit of state.pending.values()) commit.reserving = false;
 	return confirmed;
 }
 
@@ -492,11 +541,17 @@ export function confirmReplActivityDelivered(state, delivered) {
 export function applyReplActivityCommit(state, commit) {
 	if (!commit || commit.generation !== state.generation) return false;
 	for (const mark of commit.own ?? []) {
-		if ((state.own.get(mark.id)?.seq ?? -1) > commit.seq) continue;
-		state.own.delete(mark.id);
-		state.own.set(mark.id, { sessionName: mark.sessionName, version: mark.version, final: Boolean(mark.final), seq: commit.seq });
+		let own = state.own.get(mark.sessionName);
+		if ((own?.get(mark.id)?.seq ?? -1) > commit.seq) continue;
+		if (!own) state.own.set(mark.sessionName, (own = new Map()));
+		own.delete(mark.id);
+		own.set(mark.id, { version: mark.version, final: Boolean(mark.final), seq: commit.seq });
+		while (own.size > MAX_OWN_PER_SESSION) own.delete(own.keys().next().value);
+		// The sessions most recently marked last, as views are, and as many.
+		state.own.delete(mark.sessionName);
+		state.own.set(mark.sessionName, own);
 	}
-	while (state.own.size > MAX_OWN) state.own.delete(state.own.keys().next().value);
+	while (state.own.size > MAX_VIEWS) state.own.delete(state.own.keys().next().value);
 	for (const session of commit.sessions) {
 		let view = state.views.get(session.sessionName);
 		if (!view || !sameRun(view, session.identity)) {
@@ -620,30 +675,27 @@ export function replRecordHistory(observed, { entryId, after, before, limit = 20
 		else [start, end] = [Math.max(0, at - count), at];
 	}
 	if (start >= end) return `${head}\n\nNo entries ${after !== undefined ? "after" : "before"} ${oneLine(anchor, 240)}.`;
-	// The entries nearest the anchor, or the latest, while they fit with the closing lines.
+	// The entries nearest the anchor, or the latest, as many as fit with everything else.
 	const forward = after !== undefined;
-	const lines = [];
-	let used = head.length + 400;
-	for (let index = forward ? start : end - 1; forward ? index < end : index >= start; index += forward ? 1 : -1) {
-		const line = indexLine(entries[index]);
-		if (used + line.length + 1 > budget) break;
-		used += line.length + 1;
-		if (forward) lines.push(line);
-		else lines.unshift(line);
+	const compose = (first, last) => {
+		const paging = [first > 0 ? `before=${entries[first].id}` : "", last < entries.length ? `after=${entries[last - 1].id}` : ""].filter(Boolean);
+		const left = end - start - (last - first);
+		return [
+			head,
+			`Entries ${first + 1}–${last} of ${entries.length}, oldest first:`,
+			entries.slice(first, last).map(indexLine).join("\n"),
+			[
+				`entryId shows one in full.${paging.length ? ` For more, ask with ${paging.join(" or ")}, and lifetime=${current}.` : ""}`,
+				...(left ? [`${left} more in this range didn't fit.`] : []),
+			].join(" "),
+		].join("\n\n");
+	};
+	let [first, last] = [start, end];
+	let text = compose(first, last);
+	while (text.length > budget && last - first > 1) {
+		if (forward) last -= 1;
+		else first += 1;
+		text = compose(first, last);
 	}
-	const first = forward ? start : end - lines.length;
-	const last = first + lines.length;
-	const paging = [
-		first > 0 ? `before=${entries[first].id}` : "",
-		last < entries.length ? `after=${entries[last - 1].id}` : "",
-	].filter(Boolean);
-	return [
-		head,
-		`Entries ${first + 1}–${last} of ${entries.length}, oldest first:`,
-		lines.join("\n"),
-		[
-			`entryId shows one in full.${paging.length ? ` For more, ask with ${paging.join(" or ")}, and lifetime=${current}.` : ""}`,
-			...(last - first < end - start ? [`${end - start - (last - first)} more in this range didn't fit.`] : []),
-		].join(" "),
-	].join("\n\n");
+	return text.length <= budget ? text : `${head}\n\nThe index doesn't fit in this result; ask for one entry by entryId.`.slice(0, budget);
 }

@@ -1,6 +1,22 @@
-import test from "node:test";
+import test, { after } from "node:test";
 import assert from "node:assert/strict";
+import { mkdtempSync, rmSync } from "node:fs";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
 import register from "../index.ts";
+
+// /repl send reads the person setting before it sends: this run's own, never the account's.
+const config = mkdtempSync(join(tmpdir(), "pi-repl-runtimes-config-"));
+const originalPerson = { XDG_CONFIG_HOME: process.env.XDG_CONFIG_HOME, PI_REPL_USER_NAME: process.env.PI_REPL_USER_NAME };
+process.env.XDG_CONFIG_HOME = config;
+delete process.env.PI_REPL_USER_NAME;
+after(() => {
+	for (const [key, value] of Object.entries(originalPerson)) {
+		if (value === undefined) delete process.env[key];
+		else process.env[key] = value;
+	}
+	rmSync(config, { recursive: true, force: true });
+});
 
 function fixture() {
 	const tools = new Map();

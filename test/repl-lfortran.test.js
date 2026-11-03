@@ -79,8 +79,8 @@ async function piFixture(t, options = {}) {
 		tool,
 		repl,
 		fire,
-		// What the model is given next, as Pi's context_with_system shows it.
-		given: (...texts) => fire("context_with_system", { messages: texts.map((text) => ({ role: "toolResult", content: [{ type: "text", text }] })) }),
+		// What the model is given next: a provider request holding these texts, as Pi's before_provider_request shows it.
+		given: (...texts) => fire("before_provider_request", { payload: { model: "test", messages: texts.map((text) => ({ role: "user", content: [{ type: "text", text }] })) } }),
 	};
 }
 
@@ -378,6 +378,17 @@ test("the agent is told of other clients' LFortran cells, the helper's later set
 	await f.given(answered);
 	await until(() => entries().filter((entry) => entry.code === "read").every((entry) => entry.status === "captured"), { what: "the agent's READ entry" });
 	assert.equal(await runStart(), undefined, "its own READ isn't told back either");
+	// Each result of a cell is known by its own text: if only the earlier one is given to the model,
+	// the cell's end, which the later one showed, is told (Astra's D5 review, 2).
+	const readingAgain = text(await f.send("read"));
+	await f.given(readingAgain);
+	const answeredAgain = text(await f.input(TOKEN.exec(readingAgain)[1], "6"));
+	assert.match(answeredAgain, /got 6/);
+	await f.given(readingAgain);
+	await until(() => entries().filter((entry) => entry.code === "read").every((entry) => entry.status === "captured"), { what: "the second READ's entry" });
+	const toldEnd = await runStart();
+	assert.match(toldEnd?.content ?? "", /\[updated · entry pi-repl:tool:[^\]]* · Pi · captured · [^\]]*\]\n```fortran\nread\n```\n```text\ngot 6\n```/);
+	await f.given(toldEnd.content);
 	// What's typed at LFortran's own prompt isn't recorded, so it can't be told.
 	const [person] = await f.windows();
 	await f.tmux(["send-keys", "-t", person[2], "-l", "print:typed at the prompt"]);

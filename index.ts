@@ -52,7 +52,6 @@ import {
 	REPL_ACTIVITY_PROTOCOL,
 	REPL_ACTIVITY_RESULT_BUDGET,
 	REPL_ACTIVITY_RUN_START_BUDGET,
-	applyReplActivityCommit,
 	buildReplActivityReport,
 	confirmReplActivityDelivered,
 	createReplActivityState,
@@ -994,17 +993,15 @@ async function previewPaneActivity(pi: ExtensionAPI, info: SessionInfo, cwd: str
  * sessions it has used, other clients' entries and changes to entries it was told of, at the
  * start of a run (in Pi) and in repl_send's results. The rules are repl-record-activity.js's;
  * this reads tmux and the record, read-only, and Pi's events. In Pi, what a report marks counts
- * only once its text is seen in what the model is given; elsewhere (agent-repl), once its
- * result is returned uncancelled. When Pi Studio is loaded too, it leaves its agent's
- * `pi-repl-*` sessions to this view, over Pi's event bus.
+ * only once its text is seen in the provider request (before_provider_request, the last look
+ * Pi gives extensions); elsewhere (agent-repl), once it is in the result as returned,
+ * uncancelled. When Pi Studio is loaded too, it leaves its agent's `pi-repl-*` sessions to
+ * this view, over Pi's event bus.
  */
 type RecordActivityHost = {
 	state: ReturnType<typeof createReplActivityState>;
 	// Whether Pi's events show what reaches the model; without them a result counts when returned.
 	confirms: boolean;
-	// Whether Pi has sent context_with_system; an older Pi has only context, read at a run's end.
-	withSystem: boolean;
-	lastContext?: string[];
 	// The session Pi Studio's REPL pane shows, as Studio last said; kept across resets.
 	studioPane: string | null;
 	// This agent's LFortran cells by execution ID, to their entries, for repl_input's results.
@@ -1022,7 +1019,7 @@ const PI_REPL_SESSION_NAME = /^pi-repl-[a-z0-9][a-z0-9-]{0,80}$/;
 function recordActivityFor(pi: ExtensionAPI): RecordActivityHost {
 	let host = recordActivityHosts.get(pi);
 	if (!host) {
-		host = { state: createReplActivityState(), confirms: typeof pi.on === "function", withSystem: false, studioPane: null, lfortranCells: new Map() };
+		host = { state: createReplActivityState(), confirms: typeof pi.on === "function", studioPane: null, lfortranCells: new Map() };
 		recordActivityHosts.set(pi, host);
 	}
 	return host;
@@ -1098,17 +1095,21 @@ function noteRecordSessionUsed(pi: ExtensionAPI, sessionName: string | undefined
 }
 
 /**
- * What a report marks: in Pi, held until its text is seen in what the model is given; elsewhere
- * marked now, unless the call was cancelled, when its result doesn't reach the model.
+ * A result's report once the result is final: in Pi it waits for the provider request; without
+ * Pi's events, what of it is in the result as returned counts now, unless the call was
+ * cancelled, when the result doesn't reach the model.
  */
-function deliverRecordActivity(host: RecordActivityHost, key: string, commit: Parameters<typeof applyReplActivityCommit>[1] | null, signal?: AbortSignal): void {
-	if (!commit) return;
-	if (host.confirms) holdReplActivityCommit(host.state, key, commit);
-	else if (!signal?.aborted) applyReplActivityCommit(host.state, commit);
+function finishRecordActivity(pi: ExtensionAPI, key: string | undefined, text: string, signal?: AbortSignal): void {
+	const host = recordActivityFor(pi);
+	if (!key || host.confirms) return;
+	if (!signal?.aborted) confirmReplActivityDelivered(host.state, [text], key);
+	// Nothing else can deliver what isn't there, so it's offered again.
+	host.state.pending.delete(key);
 }
 
 // `text` is how its result is known in what the model is given; by default, its entry's ID.
-type OwnRecordEntry = { sessionName: string; id: string; final: boolean; text?: string };
+// `shown` is the status the result showed, for a result that didn't show how the send ended.
+type OwnRecordEntry = { sessionName: string; id: string; final: boolean; text?: string; shown?: string[] };
 
 /** The text by which an own send's result is known in what the model is given. */
 function ownEntryText(id: string): string {
@@ -1116,26 +1117,32 @@ function ownEntryText(id: string): string {
 }
 
 /**
- * The report for a repl_send result: entries of the sessions this agent has used that it hasn't
- * been told, its own send aside. Its own send is marked as told in the version its result
- * shows, once the result is seen; `final` when the result showed how it ended. Empty when off
- * or when there is nothing to tell; a failure to look leaves the result as it is.
+ * The report for a repl_send or repl_input result: entries of the sessions this agent has used
+ * that it hasn't been told, its own send aside, held under `key` until finishRecordActivity
+ * has the final result. Its own send is marked as told in the version its result showed, once
+ * the result is seen: `final` when the result showed how it ended, else the record's version
+ * only while it still has the status the result showed (it may have settled since). Empty
+ * when off, when there is nothing to tell, or after a reset while the record was read; a
+ * failure to look leaves the result as it is.
  */
-async function recordActivityForResult(pi: ExtensionAPI, cwd: string, toolCallId: string, own?: OwnRecordEntry, signal?: AbortSignal): Promise<string> {
+async function recordActivityForResult(pi: ExtensionAPI, cwd: string, key: string, own?: OwnRecordEntry): Promise<string> {
 	if (recordActivityMode() === "off") return "";
 	const host = recordActivityFor(pi);
 	try {
 		const names = recordActivitySessionNames(host);
 		if (!names.length) return "";
+		const generation = host.state.generation;
 		const observations = await observeRecordActivity(pi, names, cwd, RECORD_ACTIVITY_DEADLINE_MS);
 		const observedOwn = own ? observations.find((observed) => observed.ok && observed.sessionName === own.sessionName) : undefined;
 		const ownEntry = own && observedOwn?.ok ? observedOwn.record.entries.find((entry) => entry.id === own.id) : undefined;
+		const version = ownEntry && (own?.final || own?.shown?.includes(ownEntry.status)) ? replEntryVersion(ownEntry) : "";
 		const report = buildReplActivityReport(host.state, observations, {
 			budget: REPL_ACTIVITY_RESULT_BUDGET,
 			retrieval: RECORD_ACTIVITY_RETRIEVAL,
-			own: own ? [{ sessionName: own.sessionName, id: own.id, version: ownEntry ? replEntryVersion(ownEntry) : "", text: own.text ?? ownEntryText(own.id), final: own.final }] : [],
+			generation,
+			own: own ? [{ sessionName: own.sessionName, id: own.id, version, text: own.text ?? ownEntryText(own.id), final: own.final }] : [],
 		});
-		deliverRecordActivity(host, `tool:${toolCallId}`, report.commit, signal);
+		if (report.commit) holdReplActivityCommit(host.state, key, report.commit);
 		return report.text;
 	} catch {
 		return "";
@@ -1161,13 +1168,16 @@ function noteLfortranCell(pi: ExtensionAPI, entryId: string, details: { executio
  * known by the result's execution line. The helper writes its entry from its own process, so a
  * version can land after the result; a result that showed how the cell ended stands for them all.
  */
-async function recordActivityForLfortran(pi: ExtensionAPI, cwd: string, toolCallId: string, entryId: string, details: { executionId?: unknown; state?: unknown }, signal?: AbortSignal): Promise<string> {
+async function recordActivityForLfortran(pi: ExtensionAPI, cwd: string, key: string, entryId: string, details: { executionId?: unknown; state?: unknown }, resultText: string): Promise<string> {
 	if (recordActivityMode() === "off") return "";
 	const executionId = noteLfortranCell(pi, entryId, details);
 	noteRecordSessionUsed(pi, LFORTRAN_SESSION_NAME);
-	return recordActivityForResult(pi, cwd, toolCallId, {
-		sessionName: LFORTRAN_SESSION_NAME, id: entryId, final: LFORTRAN_SETTLED.has(String(details.state)), ...(executionId ? { text: `Execution: ${executionId}` } : {}),
-	}, signal);
+	// Known by its own state lines: every result of a cell has the same execution line.
+	const at = executionId ? resultText.indexOf(`Execution: ${executionId}`) : -1;
+	return recordActivityForResult(pi, cwd, key, {
+		sessionName: LFORTRAN_SESSION_NAME, id: entryId, final: LFORTRAN_SETTLED.has(String(details.state)), shown: ["sent"],
+		...(at >= 0 ? { text: resultText.slice(0, at + `Execution: ${executionId}`.length) } : {}),
+	});
 }
 
 /** A person's own send in Pi's conversation (/repl send), told by the message that posted its result. */
@@ -1175,7 +1185,7 @@ function noteOwnRecordEntry(pi: ExtensionAPI, own: OwnRecordEntry, text: string 
 	if (recordActivityMode() === "off" || !text) return;
 	const host = recordActivityFor(pi);
 	host.state.used.add(own.sessionName);
-	deliverRecordActivity(host, `own:${own.id}`, ownReplActivityCommit(host.state, [{ sessionName: own.sessionName, id: own.id, version: "", text, final: own.final }]));
+	holdReplActivityCommit(host.state, `own:${randomUUID()}`, ownReplActivityCommit(host.state, [{ sessionName: own.sessionName, id: own.id, version: "", text, final: own.final }]));
 }
 
 /**
@@ -1185,27 +1195,38 @@ function noteOwnRecordEntry(pi: ExtensionAPI, own: OwnRecordEntry, text: string 
 async function prepareRecordActivityAtRunStart(pi: ExtensionAPI, cwd: string): Promise<{ customType: string; content: string; display: boolean; details: Record<string, unknown> } | undefined> {
 	const host = recordActivityFor(pi);
 	host.promptStart = undefined;
+	// An earlier run's report that never reached the model: this one is told in its place.
+	for (const key of [...host.state.pending.keys()]) if (key.startsWith("run:")) host.state.pending.delete(key);
 	if (recordActivityMode() !== "on") return undefined;
 	const names = recordActivitySessionNames(host);
 	if (!names.length) return undefined;
 	const deadline = Date.now() + PROMPT_START_DEADLINE_MS;
 	const paneRoom = paneActivityMode() === "on" && paneViewsFor(pi).size > 0 ? PROMPT_START_INTRO.length + PROMPT_START_NOTES_CHARS + 4 : 0;
+	const generation = host.state.generation;
 	const observations = await observeRecordActivity(pi, names, cwd, Math.min(RECORD_ACTIVITY_DEADLINE_MS, PROMPT_START_DEADLINE_MS - 500));
-	const report = buildReplActivityReport(host.state, observations, { budget: REPL_ACTIVITY_RUN_START_BUDGET - paneRoom, retrieval: RECORD_ACTIVITY_RETRIEVAL });
+	const report = buildReplActivityReport(host.state, observations, { budget: REPL_ACTIVITY_RUN_START_BUDGET - paneRoom, retrieval: RECORD_ACTIVITY_RETRIEVAL, generation });
 	host.promptStart = { chars: report.text.length, deadline };
 	if (!report.text) return undefined;
-	deliverRecordActivity(host, `run:${randomUUID()}`, report.commit);
+	if (report.commit) holdReplActivityCommit(host.state, `run:${randomUUID()}`, report.commit);
 	return { customType: RECORD_ACTIVITY_MESSAGE, content: report.text, display: true, details: { told: report.told, omitted: report.omitted, sessions: report.sessions } };
 }
 
-/** The text of each message the model is given, as a report looks for its own. */
-function contextMessageTexts(messages: unknown[]): string[] {
-	return messages.map((message) => {
-		const content = (message as { content?: unknown })?.content;
-		if (typeof content === "string") return content;
-		if (!Array.isArray(content)) return "";
-		return content.map((part) => (part && typeof part === "object" && typeof (part as { text?: unknown }).text === "string" ? (part as { text: string }).text : "")).join("\n");
-	});
+/**
+ * The text of a provider request, as a report looks for its own: every string in the payload,
+ * whatever the provider's shape, each a part of one message at most.
+ */
+function payloadTexts(payload: unknown): string[] {
+	const texts: string[] = [];
+	const seen = new Set<object>();
+	const walk = (value: unknown): void => {
+		if (typeof value === "string") texts.push(value);
+		else if (value && typeof value === "object" && !seen.has(value)) {
+			seen.add(value);
+			for (const item of Array.isArray(value) ? value : Object.values(value)) walk(item);
+		}
+	};
+	walk(payload);
+	return texts;
 }
 
 /**
@@ -1225,7 +1246,7 @@ function takeStudioRecordActivity(host: RecordActivityHost, data: unknown): void
 		if (name || message.sessionName === null) host.studioPane = name ?? null;
 	} else if (message.kind === "own") {
 		if (!name || typeof message.id !== "string" || typeof message.version !== "string" || typeof message.text !== "string" || !message.text) return;
-		deliverRecordActivity(host, `studio:${message.id}`, ownReplActivityCommit(host.state, [{ sessionName: name, id: message.id, version: message.version, text: message.text }]));
+		holdReplActivityCommit(host.state, `studio:${randomUUID()}`, ownReplActivityCommit(host.state, [{ sessionName: name, id: message.id, version: message.version, text: message.text }]));
 	}
 }
 
@@ -3332,15 +3353,21 @@ async function executeReplSend(
 		if (recording && error instanceof PendingReplSendError) {
 			const { sessionName, recordEntryId } = error.details;
 			noteRecordSessionUsed(pi, sessionName);
-			const activity = await recordActivityForResult(pi, ctx.cwd, toolCallId, recordEntryId ? { sessionName, id: recordEntryId, final: false } : undefined, signal);
+			// The notice shows the send pending: its entry is `sending` until its owner settles it.
+			const key = `tool:${toolCallId}`;
+			const activity = await recordActivityForResult(pi, ctx.cwd, key, recordEntryId ? { sessionName, id: recordEntryId, final: false, shown: ["sending", "sent"] } : undefined);
 			if (activity) error.message = `${activity}\n\n${error.message}`;
+			finishRecordActivity(pi, key, error.message, signal);
 		}
 		throw error;
 	}
 	const { sessionName, recordEntryId } = execution.details;
 	if (recording) noteRecordSessionUsed(pi, sessionName);
-	const recordActivity = recording ? await recordActivityForResult(pi, ctx.cwd, toolCallId, recordEntryId ? { sessionName, id: recordEntryId, final: true } : undefined, signal) : undefined;
+	const key = `tool:${toolCallId}`;
+	const recordActivity = recording ? await recordActivityForResult(pi, ctx.cwd, key, recordEntryId ? { sessionName, id: recordEntryId, final: true } : undefined) : undefined;
 	const formatted = formatReplSendResult(execution.output, { ...execution.details, recordActivity });
+	// What of the report survived the result's own bounds.
+	if (recording) finishRecordActivity(pi, key, formatted.text, signal);
 
 	return {
 		content: [{ type: "text", text: formatted.text }],
@@ -4494,7 +4521,6 @@ export default function (pi: ExtensionAPI) {
 		resetReplActivityState(recordHost.state, { newConversation });
 		if (newConversation) recordHost.lfortranCells.clear();
 		recordHost.promptStart = undefined;
-		recordHost.lastContext = undefined;
 	};
 	pi.on?.("session_start", resetRecordActivity(true));
 	pi.on?.("session_tree", resetRecordActivity(false));
@@ -4509,21 +4535,12 @@ export default function (pi: ExtensionAPI) {
 			const message = await prepareRecordActivityAtRunStart(pi, ctx.cwd).catch(() => undefined);
 			return message ? { message } : undefined;
 		});
-		// What a report marks counts once its text is in what the model is given: the final
-		// messages, after every extension's context handlers.
-		pi.on("context_with_system", (event) => {
-			recordHost.withSystem = true;
-			if (recordHost.state.pending.size) confirmReplActivityDelivered(recordHost.state, contextMessageTexts(event.messages));
+		// What a report marks counts once its text is in the provider request: after every
+		// extension's context and context_with_system handlers, and the last look Pi gives
+		// extensions (a before_provider_request handler that runs after this one could still change it).
+		pi.on("before_provider_request", (event) => {
+			if (recordHost.state.pending.size) confirmReplActivityDelivered(recordHost.state, payloadTexts(event.payload));
 			return undefined;
-		});
-		// A Pi without context_with_system: what the run's last model call was given, at its end.
-		pi.on("context", (event) => {
-			if (!recordHost.withSystem && recordHost.state.pending.size) recordHost.lastContext = contextMessageTexts(event.messages);
-			return undefined;
-		});
-		pi.on("agent_end", () => {
-			if (!recordHost.withSystem && recordHost.lastContext) confirmReplActivityDelivered(recordHost.state, recordHost.lastContext);
-			recordHost.lastContext = undefined;
 		});
 		// Before the model plans, tell it what its panes showed since it last saw
 		// them. The views advance only once the run starts with the message, so
@@ -4733,8 +4750,10 @@ export default function (pi: ExtensionAPI) {
 					label: getToolSubmissionLabel(), ownerKey: lfortranOwnerKey(ctx), mode: "agent", requestId,
 				});
 				// The helper writes the cell's entry from its own process, maybe after this result.
-				const activity = await recordActivityForLfortran(pi, ctx.cwd, toolCallId, `pi-repl:${recordEntryKey(requestId)}`, result.details, signal);
+				const key = `tool:${toolCallId}`;
+				const activity = await recordActivityForLfortran(pi, ctx.cwd, key, `pi-repl:${recordEntryKey(requestId)}`, result.details, result.text);
 				const bounded = boundToolText(activity ? `${activity}\n\n${result.text}` : result.text);
+				finishRecordActivity(pi, key, bounded.text, signal);
 				return { content: [{ type: "text", text: bounded.text }], details: { ...result.details, ...(bounded.truncation ? { truncation: bounded.truncation, fullOutputPath: bounded.fullOutputPath } : {}) } };
 			}
 			return executeReplSend(pi, send, ctx, signal, toolCallId);
@@ -4786,8 +4805,10 @@ export default function (pi: ExtensionAPI) {
 			const result = await answerLfortranInput({ tmux: lfortranTmux(pi, ctx.cwd), token: params.token, text: params.text, timeoutMs: clampReplSendTimeout(params.timeoutMs), signal });
 			// The cell is this agent's, sent by its repl_send: the result shows how it went on.
 			const entryId = typeof result.details.executionId === "string" ? recordActivityFor(pi).lfortranCells.get(result.details.executionId) : undefined;
-			const activity = entryId ? await recordActivityForLfortran(pi, ctx.cwd, toolCallId, entryId, result.details, signal) : "";
+			const key = `tool:${toolCallId}`;
+			const activity = entryId ? await recordActivityForLfortran(pi, ctx.cwd, key, entryId, result.details, result.text) : "";
 			const bounded = boundToolText(activity ? `${activity}\n\n${result.text}` : result.text);
+			finishRecordActivity(pi, key, bounded.text, signal);
 			return { content: [{ type: "text", text: bounded.text }], details: { ...result.details, ...(bounded.truncation ? { truncation: bounded.truncation } : {}) } };
 		},
 	});

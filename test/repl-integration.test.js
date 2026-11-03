@@ -2835,9 +2835,12 @@ function recordActivity(t, mode = "on") {
 	t.after(() => { process.env.PI_REPL_RECORD_ACTIVITY = "off"; });
 }
 const resultText = (result) => result.content[0].text;
-// What the model is given next, as Pi's context_with_system shows it.
-const given = (f, ...texts) => f.fire("context_with_system", { messages: texts.map((text) => ({ role: "toolResult", content: [{ type: "text", text }] })) });
+// What the model is given next: a provider request holding these texts, as Pi's before_provider_request shows it.
+const given = (f, ...texts) => f.fire("before_provider_request", { payload: { model: "test", messages: texts.map((text) => ({ role: "user", content: [{ type: "text", text }] })) } });
 const told = (text) => text.startsWith(REPL_ACTIVITY_HEADING);
+// The record read that every report starts with.
+const LIFETIME_READ = "#{session_name}\t#{session_id}\t#{session_created}";
+const readsRecord = (command, args) => command === "tmux" && args[0] === "list-panes" && args.at(-1) === LIFETIME_READ;
 // A send whose result the model is then given, as Pi gives it every tool result.
 async function sendGiven(f, code, options) {
 	const text = resultText(await f.send(code, options));
@@ -2870,7 +2873,7 @@ test("an agent is told of other clients' record entries with its sends, once, an
 	const posted = f.messages.at(-1).message;
 	const meanwhile = resultText(await f.send("print(4)"));
 	assert.ok(!told(meanwhile), "nor while its message is on its way");
-	await f.fire("context_with_system", { messages: [{ role: "custom", customType: posted.customType, content: posted.content }, { role: "toolResult", content: [{ type: "text", text: meanwhile }] }] });
+	await given(f, posted.content, meanwhile);
 	const afterPerson = await sendGiven(f, "print(d5_person)");
 	assert.ok(!told(afterPerson), afterPerson);
 	// A send that outlasts its wait: its pending notice comes after what else there is to tell, and its capture
@@ -2888,6 +2891,37 @@ test("an agent is told of other clients' record entries with its sends, once, an
 	assert.equal(readReplSessionRecord(recordId).entries.find((entry) => entry.id === lateId).status, "captured");
 	const after = resultText(await f.send("print(6)"));
 	assert.match(after, new RegExp(`\\[updated · entry ${lateId} · Pi · captured · [^\\]]*\\]\n\`\`\`python\nimport time\ntime\\.sleep\\(2\\)\nprint\\('slept'\\)\n\`\`\`\n\`\`\`text\nslept\n\`\`\``));
+	// Settled while the record was read for its pending notice: the notice showed it pending, so its
+	// capture is still told (Astra's D5 review, 1).
+	let settleDuringRead = true;
+	f.onExec(async (command, args) => {
+		if (!settleDuringRead || !readsRecord(command, args)) return undefined;
+		settleDuringRead = false;
+		await f.module.drainSettlingSends();
+		return undefined;
+	});
+	let pendingAgain = "";
+	await assert.rejects(f.send("import time\ntime.sleep(1.5)\nprint('settled meanwhile')", { timeoutMs: 1000 }), (error) => {
+		pendingAgain = error.message;
+		return true;
+	});
+	f.onExec(undefined);
+	const settledId = /entry (pi-repl:tool:[0-9a-f-]{36})\)/.exec(pendingAgain)[1];
+	assert.equal(readReplSessionRecord(recordId).entries.find((entry) => entry.id === settledId).status, "captured", "it settled while the record was read");
+	await given(f, pendingAgain);
+	assert.match(await sendGiven(f, "print(9)"), new RegExp(`\\[updated · entry ${settledId} · Pi · captured[^\\]]*\\]\n\`\`\`python[\\s\\S]*\`\`\`text\nsettled meanwhile\n\`\`\``));
+	// Two results before the next model request: an entry goes in the first only (4). If that report is
+	// then removed before the request, by another extension say, the entry is offered again (3).
+	await other.send("d5_twice = 7");
+	const firstOfTwo = resultText(await f.send("print(7)"));
+	const secondOfTwo = resultText(await f.send("print(8)"));
+	assert.match(firstOfTwo, /```python\nd5_twice = 7\n```/);
+	assert.doesNotMatch(secondOfTwo, /d5_twice/);
+	await given(f, firstOfTwo.slice(firstOfTwo.indexOf("\n\nRecorded as entry ") + 2), secondOfTwo);
+	const offeredAgain = await sendGiven(f, "print(10)");
+	assert.match(offeredAgain, /\[entry pi-repl:tool:[^\]]*\]\n```python\nd5_twice = 7\n```/);
+	assert.doesNotMatch(offeredAgain, /print\((7|8)\)/, "its own sends, delivered without the report, aren't told back");
+	assert.ok(!told(await sendGiven(f, "print(11)")), "once delivered, not again");
 	// repl_history lists them all, and shows one in full, without counting as told.
 	const history = resultText(await f.tools.get("repl_history").execute(randomUUID(), { runtime: "python" }, undefined, undefined, f.ctx));
 	assert.match(history, new RegExp(`^pi-repl-python's record, lifetime ${recordId}/\\$\\d+/\\d+ \\(`));
@@ -2920,7 +2954,7 @@ test("at a run's start the record report comes before the pane text, within its 
 	// Not yet given to the model, it's told again; once given, not again.
 	const again = await runStart();
 	await f.fire("agent_start");
-	await f.fire("context_with_system", { messages: again.map((message) => ({ role: "custom", content: message.content })) });
+	await given(f, ...again.map((message) => message.content));
 	assert.deepEqual(await recordOnly(), []);
 	// A compaction keeps the sessions it used, and tells them again.
 	await f.fire("session_compact");
@@ -2936,7 +2970,7 @@ test("at a run's start the record report comes before the pane text, within its 
 	const [fromPane] = await recordOnly();
 	assert.match(fromPane.content, /pi-repl-python \(Python\/IPython\), recent entries:[\s\S]*d5_run = 1/);
 	assert.doesNotMatch(fromPane.content, /pi-studio-repl/, "Studio's own sessions stay Studio's");
-	await f.fire("context_with_system", { messages: [{ role: "custom", content: fromPane.content }] });
+	await given(f, fromPane.content);
 	// Studio's agent's own send counts by its result, not as another client's.
 	await other.send("d5_studio = 2");
 	const studioEntry = readReplSessionRecord(recordId).entries.at(-1);
@@ -2949,6 +2983,18 @@ test("at a run's start the record report comes before the pane text, within its 
 	assert.deepEqual(await recordOnly(), []);
 	f.pi.events.emit(REPL_ACTIVITY_CHANNEL, { kind: "used", sessionName: "pi-repl-python" });
 	assert.match((await recordOnly())[0].content, /d5_later = 3/);
+	// A reset while the record is read drops that report; the reset conversation is told afterwards
+	// (Astra's D5 review, 6).
+	let resetDuringRead = true;
+	f.onExec(async (command, args) => {
+		if (!resetDuringRead || !readsRecord(command, args)) return undefined;
+		resetDuringRead = false;
+		await f.fire("session_compact");
+		return undefined;
+	});
+	assert.deepEqual(await recordOnly(), []);
+	f.onExec(undefined);
+	assert.match((await recordOnly())[0].content, /recent entries after a context reset:[\s\S]*d5_later = 3/);
 	// PI_REPL_RECORD_ACTIVITY=send keeps it to sends.
 	process.env.PI_REPL_RECORD_ACTIVITY = "send";
 	assert.deepEqual(await recordOnly(), []);
@@ -2965,7 +3011,7 @@ test("a host without Pi's events marks what it reports when the result returns, 
 	// Cancelled while the record is read, after the code ran: the result doesn't reach the model.
 	const controller = new AbortController();
 	f.onExec(async (command, args) => {
-		if (command === "tmux" && args[0] === "list-panes" && args.at(-1) === "#{session_name}\t#{session_id}\t#{session_created}") controller.abort();
+		if (readsRecord(command, args)) controller.abort();
 	});
 	assert.match(resultText(await f.send("print(1)", {}, controller.signal)), /d5_mcp = 1/);
 	f.onExec(undefined);
@@ -2973,4 +3019,12 @@ test("a host without Pi's events marks what it reports when the result returns, 
 	assert.ok(!told(resultText(await f.send("print(3)"))), "and then not again");
 	// Its own send, which another agent is told of, isn't told back to it.
 	assert.match(resultText(await other.send("print(4)")), /```python\nprint\(3\)\n```/);
+	// A newline-heavy entry before another: the report keeps its parts' first and last lines, so
+	// the result's own line bound never cuts the report, and both are told once (Astra's D5 review, 5).
+	await other.send(`${"#\n".repeat(2500)}d5_head = 1`);
+	await other.send("d5_tail = 2");
+	const heavy = resultText(await f.send("print(5)"));
+	assert.doesNotMatch(heavy, /REPL response truncated/);
+	assert.match(heavy, /#\n… \d+ lines cut here …\n#[\s\S]*d5_head = 1\n```[\s\S]*```python\nd5_tail = 2\n```/);
+	assert.ok(!told(resultText(await f.send("print(6)"))));
 });
