@@ -2495,6 +2495,42 @@ function extractPaneDelta(before: string, after: string): string {
 	return afterLines.slice(index).join("\n");
 }
 
+/**
+ * Remove this submission's loader echo when the runtime's line editor wrapped it
+ * itself, so tmux's -J can't rejoin the rows: IPython 8 starts each further row
+ * with "...:", IPython 9 with "⋮", and Python 3.13's REPL ends each full row with
+ * "\". Whitespace is ignored, since the editors indent and pad these rows. The
+ * loader names a private file with a random token, so only this submission's
+ * echo matches. Pi Studio's cleanup does the same.
+ */
+function removeWrappedLoaderEcho(lines: string[], submissionLine: string, isPrompt: (line: string) => boolean): boolean {
+	const first = lines[0] ?? "";
+	// A wrapped echo starts on a row no wider than a terminal.
+	if (!submissionLine || first.length > 2048) return false;
+	const start = first.indexOf(submissionLine.slice(0, 12));
+	if (start < 0) return false;
+	const prefix = first.slice(0, start).trim();
+	if (prefix && !isPrompt(prefix)) return false;
+	const compact = (text: string) => text.replace(/\s+/g, "");
+	const want = compact(submissionLine);
+	// Add a row's text, without a "\" wrap mark where the loader has none.
+	const extend = (joined: string, row: string): string | undefined => {
+		const piece = compact(row);
+		if (want.startsWith(joined + piece)) return joined + piece;
+		if (piece.endsWith("\\") && want.startsWith(joined + piece.slice(0, -1))) return joined + piece.slice(0, -1);
+		return undefined;
+	};
+	let joined = extend("", first.slice(start));
+	let rows = 1;
+	while (joined !== undefined && joined !== want && rows < Math.min(lines.length, 8)) {
+		joined = extend(joined, lines[rows].replace(/^\s*(?:\.\.\.:?|⋮)/, ""));
+		rows += 1;
+	}
+	if (joined !== want) return false;
+	lines.splice(0, rows);
+	return true;
+}
+
 export function cleanupReplDelta(delta: string, submissionLine: string, previewComment?: string, completionLine?: string, display?: ReplSubmissionDisplay): string {
 	const isCppSubmission = submissionLine.startsWith("#include ");
 	const isMLanguageSubmission = submissionLine.startsWith("eval(fileread(");
@@ -2524,7 +2560,10 @@ export function cleanupReplDelta(delta: string, submissionLine: string, previewC
 			continue;
 		}
 		const end = echoEnd(lines[0], submissionLine);
-		if (end < 0) break;
+		if (end < 0) {
+			removeWrappedLoaderEcho(lines, submissionLine, isPrompt);
+			break;
+		}
 		// Some input editors join output/header to the loader echo. Preserve
 		// the remainder, including its spaces, and consume at most ONE echo:
 		// printing that same command again is legitimate user output.

@@ -82,6 +82,35 @@ test("remove a supplied preview comment before the loader, not arbitrary comment
 	assert.equal(cleanupReplDelta(raw, loader, preview), preview);
 });
 
+// Rows captured from 40-column tmux panes with capture-pane -J. These front ends
+// draw the wrap themselves, so tmux can't rejoin the rows.
+const wrappedLoader = 'exec(open("pi-rc-x/0b42110025e9-269441756caca499.py").read(),globals())';
+const wrappedEchoes = [
+	["IPython 9", "In [2]:", ['In [1]: exec(open("pi-rc-x/0b42110025e9-', '      ⋮ 269441756caca499.py").read(),glo', "      ⋮ bals())"]],
+	["IPython 8", "In [2]:", ['In [1]: exec(open("pi-rc-x/0b42110025e9-', '   ...: 269441756caca499.py").read(),glo', "   ...: bals())"]],
+	["Python 3.14", ">>>", ['>>> exec(open("pi-rc-x/0b42110025e9-269\\', '441756caca499.py").read(),globals())']],
+];
+
+for (const [frontEnd, prompt, echo] of wrappedEchoes) {
+	test(`${frontEnd}: remove a loader echo the front end wrapped itself`, () => {
+		assert.equal(cleanupReplDelta([...echo, "hello from cell", `${prompt} `].join("\n"), wrappedLoader), "hello from cell");
+		for (const mode of ["off", "summary", "full"]) {
+			const display = displayFor(mode);
+			const raw = [...echo, ...display.prefixLines, "hello from cell", ...display.suffixLines, `${prompt} `].join("\n");
+			assert.equal(cleanupReplDelta(raw, wrappedLoader, undefined, undefined, display), "hello from cell");
+		}
+	});
+
+	test(`${frontEnd}: keep a wrapped echo that isn't this submission's`, () => {
+		const other = wrappedLoader.replace("0b42110025e9", "1c53221136fa");
+		const raw = [...echo, "hello from cell", `${prompt} `].join("\n");
+		assert.equal(cleanupReplDelta(raw, other), [...echo, "hello from cell"].join("\n"));
+		// Only the first wrapped echo is scaffolding; printing the same rows again is output.
+		const twice = [...echo, ...echo, `${prompt} `].join("\n");
+		assert.equal(cleanupReplDelta(twice, wrappedLoader), echo.join("\n"));
+	});
+}
+
 test("legacy display and incomplete display prefixes still preserve diagnostics", () => {
 	const display = displayFor("summary");
 	const output = 'Error: source("/tmp/pi-repl-data/file.R")';
