@@ -4,8 +4,13 @@ All notable changes to `pi-repl` are documented here.
 
 ## [Unreleased]
 
+## [0.12.2] — 2026-11-11
+
 ### Changed
 - A shorter README, with links to Pi Studio, pi-markdown-preview, agent-repl and agent-markdown-preview. Runtime notes are in `docs/runtimes.md`, and the details of starting, the record, what the agent is told, the pane display and stopping in `docs/details.md`; both are in the package.
+
+### Fixed
+- A Python cell's output no longer starts with the `exec(open(…))` line pi-repl types to run it when IPython or Python's own REPL wraps that line across rows, as they do in a pane narrower than the line. IPython 8 starts each further row with `...:`, IPython 9 with `⋮`, and Python 3.13 and later end each full row with `\`. pi-repl removed the line only when it fitted on one row. Pi Studio 0.11.15 makes the same fix.
 
 ## [0.12.1] — 2026-11-03
 
