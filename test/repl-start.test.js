@@ -1,6 +1,6 @@
 import { after, test } from "node:test";
 import assert from "node:assert/strict";
-import { mkdtempSync, rmSync } from "node:fs";
+import { mkdtempSync, readFileSync, rmSync, statSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { DEFAULT_MAX_BYTES, DEFAULT_MAX_LINES } from "@earendil-works/pi-coding-agent";
@@ -24,7 +24,7 @@ const runtimes = [
 	["julia", "julia", "julia>"], ["r", "R", ">"], ["ghci", "ghci", "ghci>"],
 	["clojure", "clojure", "user=>"], ["ruby", "irb", "irb(main):001:0>"], ["java", "jshell", "jshell>"],
 	["octave", "octave-cli --quiet --interactive --persist --eval 'sighup_dumps_octave_core(false); sigterm_dumps_octave_core(false);'", "octave:1>"], ["matlab", "matlab -nodesktop -nosplash", ">>"],
-	["gnuplot", "gnuplot", "gnuplot>"], ["cpp", "cling", "[cling]$"],
+	["gnuplot", "gnuplot", "gnuplot>"], ["cpp", "cling", "[cling]$"], ["rust", "evcxr", ">>"],
 ];
 
 function fixture({ runtime = "python", exists = false, prompt = ">>>", ...options } = {}) {
@@ -112,7 +112,17 @@ for (const [runtime, executable, prompt] of runtimes) {
 			assert.match(marker, /^[a-f0-9]{32}$/);
 			assert.ok(launch.args.includes(`PI_REPL_GNUPLOT_OWNER=${marker}`));
 		} else assert.equal(launch.args.includes("-e"), false);
-		assert.match(launch.args.at(-1), new RegExp(runtime === "matlab" ? ` -i -l -c '${literal(executable)} -sd ` : ` -i -l -c ${literal(shellWord(executable))}$`));
+		if (runtime === "rust") {
+			// evcxr runs from a launch script, with a private settings folder in the temporary folder.
+			const dir = f.metadata.get("@pi_repl_rust_config");
+			assert.equal(dir.startsWith(join(root, "pi-repl-rust-")), true);
+			assert.equal(statSync(dir).mode & 0o777, 0o700);
+			assert.equal(f.metadata.get("@pi_repl_send_path"), "pi-repl");
+			assert.match(launch.args.at(-1), new RegExp(` -i -l -c ${literal(shellWord(`exec /bin/sh ${shellWord(join(dir, "pi-repl-launch.sh"))}`))}$`));
+			const script = readFileSync(join(dir, "pi-repl-launch.sh"), "utf8");
+			assert.match(script, /for f in init\.evcxr prelude\.rs history\.txt; do/);
+			assert.match(script, /EVCXR_CONFIG_DIR="\$dir" exec evcxr\n$/);
+		} else assert.match(launch.args.at(-1), new RegExp(runtime === "matlab" ? ` -i -l -c '${literal(executable)} -sd ` : ` -i -l -c ${literal(shellWord(executable))}$`));
 		const pipe = f.calls.find((call) => call.args[0] === "pipe-pane");
 		assert.ok(pipe.args.includes("%9"));
 		assert.ok(pipe.args.at(-1).includes(f.state.sessionName));

@@ -53,7 +53,9 @@ test("repl_send emits bounded pane echoes with clean-record-derived anchors", ()
 	assert.match(source, /repl_send shows bounded submitted code and alignment anchors in the raw pane by default \(Summary\)/);
 	assert.match(source, /Full mode writes bounded submitted source code into persistent raw terminal history/);
 	assert.match(source, /"capture-pane", "-J", "-p"/);
-	assert.match(source, /captureContext\.prepared\.display/);
+	// A timed-out send's latest output is cleaned as a finished one's is, with its display.
+	assert.match(source, /cleanupSubmissionOutput\(captureContext\.prepared, captureContext\.beforeCapture, latestCapture\)/);
+	assert.match(source, /prepared\.previewComment, prepared\.completionLine, prepared\.display\)/);
 });
 
 test("/repl export writes the canonical record without clobbering a file", () => {

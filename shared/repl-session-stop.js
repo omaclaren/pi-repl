@@ -167,7 +167,7 @@ export class SessionStopProcesses {
 	}
 }
 
-export const PI_REPL_STOP_SESSION_NAME = /^pi-repl-(python|julia|r|ghci|clojure|ruby|java|octave|matlab|gnuplot|cpp)$/;
+export const PI_REPL_STOP_SESSION_NAME = /^pi-repl-(python|julia|r|ghci|clojure|ruby|java|octave|matlab|gnuplot|cpp|rust)$/;
 
 /**
  * After kill-session: waits `graceMs`, then sends SIGTERM and, within

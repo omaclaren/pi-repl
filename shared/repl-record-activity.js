@@ -177,7 +177,7 @@ function fence(text, language = "") {
 	return `${marks}${language}\n${text}\n${marks}`;
 }
 
-const FENCE_LANGUAGE = { python: "python", ipython: "python", julia: "julia", r: "r", ghci: "haskell", clojure: "clojure", ruby: "ruby", java: "java", octave: "matlab", matlab: "matlab", gnuplot: "gnuplot", cpp: "cpp", lfortran: "fortran", shell: "sh" };
+const FENCE_LANGUAGE = { python: "python", ipython: "python", julia: "julia", r: "r", ghci: "haskell", clojure: "clojure", ruby: "ruby", java: "java", octave: "matlab", matlab: "matlab", gnuplot: "gnuplot", cpp: "cpp", rust: "rust", lfortran: "fortran", shell: "sh" };
 
 function clock(time) {
 	const date = new Date(time);

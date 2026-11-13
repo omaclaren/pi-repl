@@ -55,7 +55,7 @@ async function eventually(check, timeout = 15000) {
 
 async function fixture(t, { index = 0, runtime = "python", controlName, startWithTool = false, concurrentStart = false, withoutEvents = false } = {}) {
 	if (!available) { t.skip("tmux is required for local integration tests"); return null; }
-	const command = runtime === "r" ? "R" : runtime === "python" ? "python3" : runtime === "ruby" ? "irb" : runtime === "java" ? "jshell" : runtime === "octave" ? "octave-cli" : runtime === "cpp" ? "cling" : runtime;
+	const command = runtime === "r" ? "R" : runtime === "python" ? "python3" : runtime === "ruby" ? "irb" : runtime === "java" ? "jshell" : runtime === "octave" ? "octave-cli" : runtime === "cpp" ? "cling" : runtime === "rust" ? "evcxr" : runtime;
 	let executable = binary(command);
 	if (!executable) { t.skip(`${command} is not installed`); return null; }
 	if (runtime === "julia") {
@@ -77,9 +77,9 @@ async function fixture(t, { index = 0, runtime = "python", controlName, startWit
 		python: "-I -q -i", ipython: "--no-banner --no-confirm-exit --simple-prompt --HistoryManager.enabled=False",
 		julia: "--startup-file=no --history-file=no -i", r: "--vanilla --quiet", ghci: "-ignore-dot-ghci -v0", clojure: "",
 		ruby: "-f --noreadline", java: `-J-Duser.home=${quote(home)} -J-Djava.util.prefs.userRoot=${quote(join(home, "java-prefs"))}`,
-		octave: "--no-init-file --no-history --no-line-editing", matlab: "", gnuplot: "-d", cpp: "",
+		octave: "--no-init-file --no-history --no-line-editing", matlab: "", gnuplot: "-d", cpp: "", rust: "",
 	}[runtime];
-	const launcher = runtime === "r" ? "R" : runtime === "ruby" ? "irb" : runtime === "java" ? "jshell" : runtime === "octave" ? "octave-cli" : runtime === "cpp" ? "cling" : runtime;
+	const launcher = runtime === "r" ? "R" : runtime === "ruby" ? "irb" : runtime === "java" ? "jshell" : runtime === "octave" ? "octave-cli" : runtime === "cpp" ? "cling" : runtime === "rust" ? "evcxr" : runtime;
 	// A distinct socket/server and empty config: never target the user's tmux.
 	const config = join(cwd, "tmux.conf");
 	writeFileSync(config, `set -g base-index ${index}\nset -g pane-base-index ${index}\nset -g history-limit 10000\nset -g default-shell /bin/sh\n`);
@@ -98,6 +98,12 @@ async function fixture(t, { index = 0, runtime = "python", controlName, startWit
 		env.OPENBLAS_NUM_THREADS = '1';
 		env.OMP_NUM_THREADS = '1';
 		delete env.PETSC_OPTIONS;
+	}
+	if (runtime === "rust") {
+		// evcxr compiles each cell with the account's own toolchain, found from the real home.
+		env.CARGO_HOME = process.env.CARGO_HOME || join(process.env.HOME, ".cargo");
+		env.RUSTUP_HOME = process.env.RUSTUP_HOME || join(process.env.HOME, ".rustup");
+		delete env.EVCXR_CONFIG_DIR;
 	}
 	if (runtime === "gnuplot") {
 		env.GNUTERM = "dumb";
@@ -238,7 +244,7 @@ async function fixture(t, { index = 0, runtime = "python", controlName, startWit
 		await repl(runtime);
 	}
 	assert.equal(notifications.some((n) => n.level === "error" || n.level === "warning"), false, JSON.stringify(notifications));
-	const prompt = { python: />>>/, ipython: /In \[\d+\]:/, julia: /julia>/, r: /(^|\n)>/, ghci: /ghci>/, clojure: /user=>/, ruby: /irb\(.*\).*?>/, java: /jshell>/, octave: /octave:\d+>/, matlab: /(^|\n)>>/, gnuplot: /gnuplot>/, cpp: /\[cling\]\$/ }[runtime];
+	const prompt = { python: />>>/, ipython: /In \[\d+\]:/, julia: /julia>/, r: /(^|\n)>/, ghci: /ghci>/, clojure: /user=>/, ruby: /irb\(.*\).*?>/, java: /jshell>/, octave: /octave:\d+>/, matlab: /(^|\n)>>/, gnuplot: /gnuplot>/, cpp: /\[cling\]\$/, rust: /(^|\n)>>/ }[runtime];
 	let startupOutput = "";
 	try {
 		await eventually(async () => {
@@ -295,6 +301,76 @@ async function assertVerifiedStop(f) {
 	assert.ok(readFileSync(status.historyPath, "utf8").startsWith(history));
 	assert.equal(readReplSessionRecord(status.recordId).entries.length, status.recordEntryCount);
 }
+
+// Types into the pane a key at a time, as a person does: evcxr 0.22.0 stalls on input that arrives in one write.
+async function typeSlowly(f, pane, text) {
+	for (const ch of text) {
+		// A lone ";" argument is tmux's command separator.
+		await f.tmux("send-keys", "-t", pane, ...(ch === ";" ? ["-H", "3b"] : ["-l", ch]));
+		await new Promise((resolve) => setTimeout(resolve, 25));
+	}
+}
+
+async function rustPromptIdle(f, pane) {
+	const y = await f.tmux("display-message", "-p", "-t", pane, "#{cursor_y}");
+	return (await f.tmux("capture-pane", "-p", "-t", pane, "-S", y, "-E", y)).trimEnd() === ">>";
+}
+
+test("rust shares evcxr's variables with the pane, sends only at an empty prompt, and stops verified", {
+	timeout: 300000, skip: !(optionalRuntimes.has("all") || optionalRuntimes.has("rust")),
+}, async (t) => {
+	const f = await fixture(t, { runtime: "rust", startWithTool: true });
+	if (!f) return;
+	const pane = `${f.sessionName}:^`;
+	const output = (result) => result.content[0].text.split("Output:\n")[1];
+	const settled = async () => { await eventually(() => rustPromptIdle(f, pane), 120000); await new Promise((resolve) => setTimeout(resolve, 300)); };
+	const config = await f.tmux("show-options", "-v", "-t", `=${f.sessionName}:`, "@pi_repl_rust_config");
+	assert.ok(existsSync(join(config, "pi-repl-launch.sh")));
+	assert.equal(await f.tmux("show-options", "-v", "-t", `=${f.sessionName}:`, "@pi_repl_send_path"), "pi-repl");
+
+	let result = await f.send("let seed = 41;\nseed + 1", { timeoutMs: 120000 });
+	assert.equal(output(result), "42");
+	assert.match(await f.tmux("capture-pane", "-p", "-J", "-t", pane, "-S", "-200"), /^>> \/\/ pi-repl [a-f0-9]{12}$/m);
+
+	// A cell the person types in the pane shares the agent's variables.
+	await typeSlowly(f, pane, "let typed = seed * 2;");
+	await f.tmux("send-keys", "-t", pane, "C-m");
+	await settled();
+	assert.equal(output(await f.send("typed")), "82");
+
+	// While the person's cell runs, nothing is pasted.
+	await typeSlowly(f, pane, "std::thread::sleep(std::time::Duration::from_secs(6))");
+	await f.tmux("send-keys", "-t", pane, "C-m");
+	await new Promise((resolve) => setTimeout(resolve, 1500));
+	let count = f.calls.length;
+	await assert.rejects(f.send("seed"), /Nothing was sent: evcxr isn't waiting at an empty prompt; a cell is still running\./);
+	assert.ok(f.calls.slice(count).every((call) => !["paste-buffer", "send-keys", "load-buffer"].includes(call.args[0])));
+	await settled();
+
+	// Nor while something is typed at the prompt.
+	await typeSlowly(f, pane, "let half = 1");
+	count = f.calls.length;
+	await assert.rejects(f.send("seed"), /Nothing was sent: evcxr isn't waiting at an empty prompt; something is typed at the prompt \(\"let half = 1\"\)\./);
+	assert.ok(f.calls.slice(count).every((call) => !["paste-buffer", "send-keys", "load-buffer"].includes(call.args[0])));
+	await f.tmux("send-keys", "-t", pane, "C-u");
+	await settled();
+
+	// An unfinished cell is passed to rustc, which reports it, and the session goes on.
+	result = await f.send("fn unfinished() {\n    1", { timeoutMs: 60000 });
+	assert.match(output(result), /unclosed delimiter/);
+	assert.match(output(result), /\[pi-repl: evcxr took this cell as unfinished/);
+	assert.match(output(await f.send('let bad: i32 = "s";', { timeoutMs: 60000 })), /mismatched types/);
+	assert.match(output(await f.send('panic!("boom {}", seed)', { timeoutMs: 60000 })), /boom 41/);
+	assert.equal(output(await f.send("seed")), "41");
+
+	// The echo is matched exactly, and completion found after it: a bare >> line, string spaces and tabs.
+	assert.equal(output(await f.send("let n = 8\n>>\n1;\nn", { timeoutMs: 60000 })), "4");
+	assert.equal(output(await f.send('let spaced = "a  b";\nspaced.len()', { timeoutMs: 60000 })), "4");
+	assert.equal(output(await f.send("fn tabbed() -> i32 {\n\tlet v = 2;\n\tv * 3\n}\ntabbed()", { timeoutMs: 60000 })), "6");
+
+	await assertVerifiedStop(f);
+	assert.equal(existsSync(config), false, "stop removes the session's evcxr settings folder");
+});
 
 test("cpp adapter preserves native state, errors, stdin boundaries and verified stop", {
 	timeout: 60000, skip: !(optionalRuntimes.has("all") || optionalRuntimes.has("cpp")),

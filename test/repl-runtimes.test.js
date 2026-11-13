@@ -108,12 +108,12 @@ test("help and schemas advertise Ruby, Java, exports and existing echo controls"
 	const f = fixture();
 	await f.command("");
 	const help = f.notifications.at(-1).message;
-	for (const name of ["ruby", "java", "octave", "matlab", "gnuplot", "cpp"]) {
+	for (const name of ["ruby", "java", "octave", "matlab", "gnuplot", "cpp", "rust"]) {
 		assert.match(help, new RegExp(`/repl ${name}`));
 		assert.match(f.tools.get("repl_send").parameters.properties.target.description, new RegExp(name));
 	}
 	assert.match(help, /\/repl echo \[off\|summary\|full\]/);
-	assert.match(help, /\/repl export \[python\|julia\|r\|ghci\|clojure\|ruby\|java\|octave\|matlab\|gnuplot\|cpp\]/);
+	assert.match(help, /\/repl export \[python\|julia\|r\|ghci\|clojure\|ruby\|java\|octave\|matlab\|gnuplot\|cpp\|rust\]/);
 });
 
 test("/repl send takes its target from the first line and the code from the lines below", async () => {

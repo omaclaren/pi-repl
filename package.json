@@ -33,6 +33,8 @@
     "gnuplot",
     "cpp",
     "cling",
+    "rust",
+    "evcxr",
     "fortran",
     "lfortran",
     "jupyter"

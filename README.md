@@ -1,6 +1,6 @@
 # pi-repl
 
-A [Pi](https://pi.dev) extension for REPL sessions that you and Pi share. pi-repl starts a Python, IPython, Julia, R, Haskell (GHCi), Clojure, Ruby, Java, Octave, MATLAB or gnuplot REPL, or an experimental C++ (Cling) or Fortran (LFortran) one, in tmux. You attach to it from another terminal and work there as normal, and Pi runs code in the same session, so you both work with the same variables.
+A [Pi](https://pi.dev) extension for REPL sessions that you and Pi share. pi-repl starts a Python, IPython, Julia, R, Haskell (GHCi), Clojure, Ruby, Java, Octave, MATLAB or gnuplot REPL, or an experimental C++ (Cling), Rust (evcxr) or Fortran (LFortran) one, in tmux. You attach to it from another terminal and work there as normal, and Pi runs code in the same session, so you both work with the same variables.
 
 <picture>
   <source media="(prefers-color-scheme: dark)" srcset="./shared-julia-repl-dark.png">
@@ -53,6 +53,7 @@ tmux attach -t pi-repl-julia
 | MATLAB | `matlab` | a licensed `matlab` | `pi-repl-matlab` |
 | gnuplot | `gnuplot` | `gnuplot` | `pi-repl-gnuplot` |
 | C++ (experimental) | `cpp` | `cling` | `pi-repl-cpp` |
+| Rust (experimental) | `rust` | `evcxr` | `pi-repl-rust` |
 | Fortran (experimental) | `lfortran` | `lfortran` built from `main` | `pi-repl-lfortran` |
 
 Sessions start through your normal interactive login shell, in Pi's working directory, so they find the interpreters you use yourself. pi-repl doesn't install or repair them. Python and IPython share one session. The [runtime notes](docs/runtimes.md) say how each runtime takes submitted code and what to expect from it.
@@ -60,6 +61,10 @@ Sessions start through your normal interactive login shell, in Pi's working dire
 ### C++ (experimental)
 
 `cpp` runs Cling. Send code as you would type it at Cling's prompt, with a function's opening brace on its declaration line, and load ordinary source files with `#include`. Earlier groups of lines can run before a later one fails, and nothing is rolled back. It has been tested with Cling 1.3 on ARM64 macOS.
+
+### Rust (experimental)
+
+`rust` runs evcxr's own REPL (`cargo install evcxr_repl`). pi-repl pastes each of Pi's cells whole at evcxr's prompt, under a `// pi-repl <id>` comment line, and only when evcxr is waiting with nothing typed: while a cell runs, or once you have started typing, nothing is sent and Pi is told why. In evcxr 0.22.0, input that arrives while a cell runs can be lost, so don't type then; the fix is in evcxr's `main`, for its next release. It has been tested with evcxr 0.22.0 and evcxr's `main` on ARM64 macOS.
 
 ### LFortran sessions (experimental)
 

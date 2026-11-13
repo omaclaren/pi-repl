@@ -111,6 +111,34 @@ Summary/Full previews do not truncate execution; Off suppresses optional display
 
 PETSc is optional, not a package dependency. The optional regression uses a matching real-double/int32 PETSc/MPI installation in one process/rank, retaining the same `Mat`, `Vec` and `KSP` objects through direct edits, compilation errors and library errors, then destroying/finalizing explicitly. Match architecture, MPI and scalar/integer configuration; multi-rank submission and collectives are untested. Do not reinitialize MPI after finalization.
 
+## Rust (experimental)
+
+`rust` is evcxr's own REPL, `evcxr` (from `cargo install evcxr_repl`), with its own `pi-repl-rust` session. evcxr compiles each cell with your Rust toolchain, so a cell takes a second or so, and the first one longer. It has been tested with evcxr 0.22.0 and with evcxr's `main` at 656cd7a, on ARM64 macOS; Linux is untested.
+
+```rust
+let count = 41;
+fn next_count(n: i32) -> i32 {
+    n + 1
+}
+next_count(count)
+```
+
+evcxr can't load a cell from a file and keep its variables, so pi-repl pastes each of Pi's cells whole at evcxr's prompt, bracketed, under a `// pi-repl <id>` comment line that marks it as Pi's. It sends only when evcxr is waiting at an empty prompt: the pane's terminal is in raw mode, which evcxr's line editor sets only while it waits for input, and the cursor's row is the prompt with nothing typed. Otherwise nothing is sent, and the result says whether a cell is running or something is typed. pi-repl presses Enter once the pane shows exactly the cell; if someone typed at the prompt as the paste landed, it leaves the paste unrun in the prompt's input and says so. A cell has finished when the terminal is back in raw mode with a prompt at the cursor. Nothing else is typed into the pane.
+
+evcxr commands such as `:dep` and `:vars`, and `!` shell commands, work in a cell. A cell evcxr takes as unfinished, such as `fn f() {` without its closing brace, would leave evcxr waiting for the rest of it. pi-repl then presses Enter twice more, which makes evcxr pass the cell to rustc as it is, and rustc reports what's wrong; the result's last line says pi-repl did this.
+
+Some limits come from evcxr:
+
+- In evcxr 0.22.0, input that arrives while a cell runs, typing included, can be lost or leave the prompt one input behind. Don't type while a cell runs. The fix is on evcxr's `main` ([evcxr#526](https://github.com/evcxr/evcxr/pull/526), with rustyline 19) for its next release.
+- Output from `print!` without a newline, or from a thread still running when its cell ends, can appear under a later cell.
+- A cell that reads stdin waits for input typed in the pane.
+- Ctrl-C during a cell, or `std::process::exit`, ends evcxr's worker process and loses the session's variables; evcxr carries on with an empty workspace, and nothing is replayed. A panic keeps them.
+- Ctrl-C at an empty prompt arms evcxr's exit, and a second Ctrl-C in a row ends evcxr. pi-repl never sends Ctrl-C, and the session's `@pi_repl_send_path` keeps Pi Studio from pasting into it or sending it Ctrl-C.
+
+evcxr runs with a private settings folder (`EVCXR_CONFIG_DIR`) in the temporary folder. When the session starts, it copies your `init.evcxr`, `prelude.rs` and `history.txt` into the folder, from `EVCXR_CONFIG_DIR` if you set it and from evcxr's usual folder otherwise, so your startup files apply and your history is there to recall. What is run in the session, Pi's cells included, is saved to the folder's history, not yours. `/repl stop rust` removes the folder; if evcxr exits on its own, the folder is left in the temporary folder.
+
+Pi's cells are in the session's clean record, as the other runtimes' sends are, each with the output evcxr printed before its next prompt. Echo modes don't apply, since the pane shows each of Pi's cells in full.
+
 ## LFortran sessions (experimental)
 
 `lfortran` shares one LFortran session between you and pi. It needs a build of LFortran's `main` branch with the shared session (`lfortran --connect` and `lfortran kernel --managed`), found as `lfortran` by your interactive login shell; no LFortran release has it yet. It has been tested with `main` at `edf73189fc` on ARM64 macOS.

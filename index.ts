@@ -11,7 +11,7 @@ import { StringEnum } from "@earendil-works/pi-ai";
 import { Box, Text, stripTerminalSequences } from "@earendil-works/pi-tui";
 import { Type } from "typebox";
 import { randomUUID } from "node:crypto";
-import { existsSync, mkdtempSync, writeFileSync } from "node:fs";
+import { existsSync, mkdtempSync, readFileSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import {
@@ -64,10 +64,11 @@ import {
 	resetReplActivityState,
 } from "./shared/repl-record-activity.js";
 import { stopVerifiedReplSession } from "./shared/repl-session-stop.js";
-import { LFORTRAN_SESSION_NAME } from "./shared/repl-jupyter-session.js";
+import { JUPYTER_OPTIONS, LFORTRAN_SESSION_NAME } from "./shared/repl-jupyter-session.js";
 import { mStringLiteral, buildMLanguageControlSource, buildMLanguageDriverSource } from "./shared/repl-m-language.js";
 import { buildGnuplotSubmissionLine, buildGnuplotGuardSource, buildGnuplotDriverSource } from "./shared/repl-gnuplot.js";
 import { cppInclude, buildCppDriverSource, buildCppRequest, createCppControlCleanup, prepareCppSubmission, readCppCompletion } from "./shared/repl-cpp.js";
+import { RUST_CONFIG_OPTION, RUST_PROMPT, RUST_SEND_PATH, createRustLaunch, isRustPromptRow, prepareRustCell, removeRustConfigDir, rowsFromRustEcho, rustCellMarker, rustCellOutput, rustCellProgress, rustPasteState, rustWatchStep, sttyReadArgs, sttyShowsRawMode } from "./shared/repl-rust.js";
 import { GNUPLOT_OWNER_ENV, GNUPLOT_OWNER_OPTION } from "./shared/repl-gnuplot-processes.js";
 import { LFORTRAN_GUIDELINES, answerLfortranInput, exportLfortranRecord, lfortranStatus, sendLfortranCode, startLfortranRuntime, stopLfortranSession } from "./shared/repl-lfortran.js";
 import { clearPersonName, formatPersonNameStatus, personRequestId, resolvePersonName, savePersonName } from "./shared/repl-person.js";
@@ -75,7 +76,7 @@ import { clearPersonName, formatPersonNameStatus, personRequestId, resolvePerson
 // For a host's own person commands, such as agent-repl's `name`, `send` and `env`.
 export { clearPersonName, formatPersonNameStatus, personRequestId, resolvePersonName, savePersonName };
 
-const SUPPORTED_RUNTIMES = ["julia", "python", "ipython", "r", "ghci", "clojure", "clj", "ruby", "java", "octave", "matlab", "gnuplot", "cpp", "bun"] as const;
+const SUPPORTED_RUNTIMES = ["julia", "python", "ipython", "r", "ghci", "clojure", "clj", "ruby", "java", "octave", "matlab", "gnuplot", "cpp", "rust", "bun"] as const;
 const DEFAULT_PYTHON_SESSION = "pi-repl-python";
 const DEFAULT_JULIA_SESSION = "pi-repl-julia";
 const DEFAULT_R_SESSION = "pi-repl-r";
@@ -87,6 +88,7 @@ const DEFAULT_OCTAVE_SESSION = "pi-repl-octave";
 const DEFAULT_MATLAB_SESSION = "pi-repl-matlab";
 const DEFAULT_GNUPLOT_SESSION = "pi-repl-gnuplot";
 const DEFAULT_CPP_SESSION = "pi-repl-cpp";
+const DEFAULT_RUST_SESSION = "pi-repl-rust";
 const DEFAULT_CAPTURE_LINES = 20;
 const DEFAULT_STARTUP_WAIT_MS = 20_000;
 const MAX_STARTUP_WAIT_MS = 120_000;
@@ -243,7 +245,7 @@ const REPL_HISTORY_OPTION = "@pi_repl_history_path";
 type SupportedRuntime = (typeof SUPPORTED_RUNTIMES)[number];
 type PythonRuntime = "python" | "ipython";
 type ClojureRuntime = "clojure" | "clj";
-type ManagedRuntime = PythonRuntime | "julia" | "r" | "ghci" | ClojureRuntime | "ruby" | "java" | "octave" | "matlab" | "gnuplot" | "cpp";
+type ManagedRuntime = PythonRuntime | "julia" | "r" | "ghci" | ClojureRuntime | "ruby" | "java" | "octave" | "matlab" | "gnuplot" | "cpp" | "rust";
 type ImplementedRuntime = Exclude<ManagedRuntime, "clj">;
 type SessionSelector = Exclude<ImplementedRuntime, "ipython">;
 type ReplSubmissionEchoMode = "off" | "summary" | "full";
@@ -329,10 +331,10 @@ type ReplSendDetails = {
 };
 
 const REPL_SEND_PARAMS = Type.Object({
-	code: Type.String({ description: "Python, IPython, Julia, R, GHCi, Clojure, Ruby, Java, Octave, MATLAB, gnuplot, C++ or Fortran (LFortran) code to execute in the shared REPL session." }),
+	code: Type.String({ description: "Python, IPython, Julia, R, GHCi, Clojure, Ruby, Java, Octave, MATLAB, gnuplot, C++, Rust or Fortran (LFortran) code to execute in the shared REPL session." }),
 	target: Type.Optional(
 		Type.String({
-			description: "Optional target REPL: python, julia, r, ghci, clojure, ruby, java, octave, matlab, gnuplot, cpp, or lfortran. If omitted, repl_send uses the shared Python/IPython session.",
+			description: "Optional target REPL: python, julia, r, ghci, clojure, ruby, java, octave, matlab, gnuplot, cpp, rust, or lfortran. If omitted, repl_send uses the shared Python/IPython session.",
 		}),
 	),
 	timeoutMs: Type.Optional(
@@ -362,7 +364,7 @@ function getToolSubmissionLabel(): string {
 	return process.env.PI_REPL_AGENT_LABEL?.trim() || "Pi";
 }
 
-const REPL_START_RUNTIMES = ["python", "ipython", "julia", "r", "ghci", "clojure", "ruby", "java", "octave", "matlab", "gnuplot", "cpp"] as const;
+const REPL_START_RUNTIMES = ["python", "ipython", "julia", "r", "ghci", "clojure", "ruby", "java", "octave", "matlab", "gnuplot", "cpp", "rust"] as const;
 // LFortran's shared session runs through its own helper, not by pasting into a pane, so it isn't one of REPL_START_RUNTIMES.
 const REPL_START_TOOL_RUNTIMES = [...REPL_START_RUNTIMES, "lfortran"] as const;
 const REPL_START_PARAMS = Type.Object({
@@ -379,7 +381,7 @@ const REPL_START_PARAMS = Type.Object({
 const REPL_STATUS_PARAMS = Type.Object({
 	target: Type.Optional(
 		Type.String({
-			description: "Optional session target: python, julia, r, ghci, ruby, java, clojure, octave, matlab, gnuplot, cpp, or lfortran. If omitted, report all shared REPL sessions.",
+			description: "Optional session target: python, julia, r, ghci, ruby, java, clojure, octave, matlab, gnuplot, cpp, rust, or lfortran. If omitted, report all shared REPL sessions.",
 		}),
 	),
 	execution: Type.Optional(
@@ -449,7 +451,7 @@ function toSessionSelector(runtime: ManagedRuntime): SessionSelector {
 	if (runtime === "clojure" || runtime === "clj") return "clojure";
 	if (runtime === "ruby") return "ruby";
 	if (runtime === "java") return "java";
-	if (runtime === "octave" || runtime === "matlab" || runtime === "gnuplot" || runtime === "cpp") return runtime;
+	if (runtime === "octave" || runtime === "matlab" || runtime === "gnuplot" || runtime === "cpp" || runtime === "rust") return runtime;
 	return "python";
 }
 
@@ -464,6 +466,7 @@ function getSessionNameForSelector(selector: SessionSelector): string {
 	if (selector === "matlab") return DEFAULT_MATLAB_SESSION;
 	if (selector === "gnuplot") return DEFAULT_GNUPLOT_SESSION;
 	if (selector === "cpp") return DEFAULT_CPP_SESSION;
+	if (selector === "rust") return DEFAULT_RUST_SESSION;
 	return DEFAULT_PYTHON_SESSION;
 }
 
@@ -499,19 +502,20 @@ function formatUsage(): string {
 		"  /repl matlab",
 		"  /repl gnuplot",
 		"  /repl cpp",
+		"  /repl rust",
 		"  /repl lfortran",
 		"  /repl input <text>",
 		"  /repl send [runtime], with the code on the lines below it",
 		"  /repl echo [off|summary|full]",
 		"  /repl name [your name|--clear]",
-		"  /repl status [python|julia|r|ghci|clojure|ruby|java|octave|matlab|gnuplot|cpp]",
+		"  /repl status [python|julia|r|ghci|clojure|ruby|java|octave|matlab|gnuplot|cpp|rust]",
 		"  /repl env [python]",
-		"  /repl attach [python|julia|r|ghci|clojure|ruby|java|octave|matlab|gnuplot|cpp]",
-		"  /repl export [python|julia|r|ghci|clojure|ruby|java|octave|matlab|gnuplot|cpp]",
-		"  /repl stop [python|julia|r|ghci|clojure|ruby|java|octave|matlab|gnuplot|cpp]",
+		"  /repl attach [python|julia|r|ghci|clojure|ruby|java|octave|matlab|gnuplot|cpp|rust]",
+		"  /repl export [python|julia|r|ghci|clojure|ruby|java|octave|matlab|gnuplot|cpp|rust]",
+		"  /repl stop [python|julia|r|ghci|clojure|ruby|java|octave|matlab|gnuplot|cpp|rust]",
 		"  /repl status lfortran, /repl attach lfortran, /repl export lfortran, /repl stop lfortran",
 		"",
-		"Supported runtimes right now: python, ipython, julia, r, ghci, clojure, ruby, java, octave, matlab, gnuplot, cpp",
+		"Supported runtimes right now: python, ipython, julia, r, ghci, clojure, ruby, java, octave, matlab, gnuplot, cpp, rust",
 		"For R, both /repl R and /repl r work. The same applies to /lab, /repl status, /repl attach, /repl export, and /repl stop.",
 		"For Clojure, /repl clojure is canonical and /repl clj also works. The same applies to /lab, /repl status, /repl attach, /repl export, and /repl stop.",
 		"For Ruby, /repl ruby starts irb. For Java, /repl java starts jshell.",
@@ -527,6 +531,7 @@ function formatUsage(): string {
 		"  - /repl octave and /repl matlab manage separate terminal sessions; they never substitute for each other",
 		"  - /repl gnuplot manages the independent pi-repl-gnuplot session, retaining native plotting settings",
 		"  - /repl cpp starts an experimental Cling-based C++ REPL; send C++ prompt groups, not dot commands",
+		"  - /repl rust starts an experimental Rust REPL (evcxr); pi-repl pastes each cell at evcxr's prompt, and sends only when it is waiting with nothing typed",
 		"  - /repl lfortran starts LFortran's shared session (experimental; needs LFortran main): LFortran's own prompt in the first window, and pi-repl's helper for the kernel in the second",
 		"  - /repl input <text> answers the READ an LFortran cell waits on with the text as given; the READ's token may come before the text",
 		"  - /repl send [runtime] sends the code on the lines below it to that running session (Python by default), as repl_send does; its result goes into the conversation, where the agent sees it too. Shift+Enter starts a new line",
@@ -745,12 +750,13 @@ function buildRuntimeLaunchCommand(runtime: ManagedRuntime): string {
 	if (runtime === "octave") return "octave-cli --quiet --interactive --persist --eval 'sighup_dumps_octave_core(false); sigterm_dumps_octave_core(false);'";
 	if (runtime === "matlab") return "matlab -nodesktop -nosplash";
 	if (runtime === "cpp") return "cling";
+	if (runtime === "rust") return "evcxr";
 	return runtime;
 }
 
-function buildDefaultShellRuntimeCommand(runtime: ManagedRuntime, cwd?: string): { shell: string; command: string } {
+function buildDefaultShellRuntimeCommand(runtime: ManagedRuntime, cwd?: string, launchCommand?: string): { shell: string; command: string } {
 	const shell = process.env.SHELL?.trim() || "/bin/sh";
-	const runtimeCommand = buildRuntimeLaunchCommand(runtime) + (runtime === "matlab" && cwd ? ` -sd ${shellQuote(cwd)}` : "");
+	const runtimeCommand = launchCommand ?? buildRuntimeLaunchCommand(runtime) + (runtime === "matlab" && cwd ? ` -sd ${shellQuote(cwd)}` : "");
 	return {
 		shell,
 		command: `${shellQuote(shell)} -i -l -c ${shellQuote(runtimeCommand)}`,
@@ -1724,6 +1730,7 @@ function getSessionDisplayName(selector: SessionSelector, info?: SessionInfo | n
 	if (selector === "matlab") return "MATLAB";
 	if (selector === "gnuplot") return "gnuplot";
 	if (selector === "cpp") return "C++ (Cling)";
+	if (selector === "rust") return "Rust (evcxr)";
 	if (info?.runtime === "ipython") return "Python/IPython";
 	return "Python/IPython";
 }
@@ -1747,7 +1754,7 @@ async function listRunningSharedSessions(
 	if (rubyInfo) sessions.push({ selector: "ruby", info: rubyInfo });
 	const javaInfo = await readSessionInfo(pi, DEFAULT_JAVA_SESSION, cwd);
 	if (javaInfo) sessions.push({ selector: "java", info: javaInfo });
-	for (const selector of ["octave", "matlab", "gnuplot", "cpp"] as const) {
+	for (const selector of ["octave", "matlab", "gnuplot", "cpp", "rust"] as const) {
 		const info = await readSessionInfo(pi, getSessionNameForSelector(selector), cwd);
 		if (info) sessions.push({ selector, info });
 	}
@@ -1772,6 +1779,7 @@ const REPL_PROMPTS: Record<ImplementedRuntime, RegExp> = {
 	matlab: /(?:^|\n)>>[ \t]*$/,
 	gnuplot: /(?:^|\n)gnuplot>[ \t]*$/,
 	cpp: /(?:^|\n)\[cling\]\$[ \t]*$/,
+	rust: RUST_PROMPT,
 };
 
 /** Whether a whole pane line is the runtime's prompt with nothing typed at it. */
@@ -1867,6 +1875,7 @@ function getReplControlExtension(runtime: ImplementedRuntime): string {
 	if (runtime === "octave" || runtime === "matlab") return "m";
 	if (runtime === "gnuplot") return "gp";
 	if (runtime === "cpp") return "cpp";
+	if (runtime === "rust") return "rs";
 	return "py";
 }
 
@@ -2221,7 +2230,7 @@ function buildReplControlSource(runtime: ImplementedRuntime, code: string, doneF
 	if (runtime === "java") return buildJavaControlSource(code, doneFile, display);
 	if (runtime === "octave" || runtime === "matlab") return buildMLanguageControlSource(code, display);
 	if (runtime === "gnuplot") return code + "\n";
-	if (runtime === "cpp") return code;
+	if (runtime === "cpp" || runtime === "rust") return code;
 	return buildPythonControlSource(runtime, code, doneFile, display);
 }
 
@@ -2312,20 +2321,29 @@ function prepareReplControlFiles(
 	runtime: ImplementedRuntime,
 	code: string,
 	details: { submissionId: string; echoMode: ReplSubmissionEchoMode },
-): { controlPaths: ReplControlPaths; guardPaths?: ReplControlPaths; driverPaths?: ReplControlPaths; submissionLine: string; completionLine?: string; previewComment?: string; submissionText: string; display: ReplSubmissionDisplay; cppCompletion?: ReturnType<typeof prepareCppSubmission>["completion"]; cppCleanup?: () => void } {
+): { controlPaths: ReplControlPaths; guardPaths?: ReplControlPaths; driverPaths?: ReplControlPaths; submissionLine: string; completionLine?: string; previewComment?: string; submissionText: string; display: ReplSubmissionDisplay; cppCompletion?: ReturnType<typeof prepareCppSubmission>["completion"]; cppCleanup?: () => void; rustCell?: string } {
 	if (runtime === "cpp" && code.includes("\0")) throw new Error("C++ source cannot contain NUL bytes; no code was sent.");
 	const display = createReplSubmissionDisplay({
 		entryId: details.submissionId,
 		origin: "pi-repl",
 		code,
-		mode: details.echoMode,
+		// A Rust cell is pasted whole, so the pane shows all of it in any echo mode.
+		mode: runtime === "rust" ? "off" : details.echoMode,
 	});
+	// Checked before any file is made: a cell that can't be pasted sends nothing.
+	const rustCell = runtime === "rust" ? prepareRustCell(code, display.anchorId) : undefined;
 	const controlOptions = { ...REPL_CONTROL_OPTIONS, anchorId: display.anchorId };
 	const controlPaths: ReplControlPaths = createPrivateReplControlFiles({
 		...controlOptions,
 		extension: getReplControlExtension(runtime),
-		buildSource: ({ doneFile }: ReplControlPaths) => buildReplControlSource(runtime, code, doneFile, display),
+		buildSource: ({ doneFile }: ReplControlPaths) => rustCell ?? buildReplControlSource(runtime, code, doneFile, display),
 	});
+	if (rustCell) {
+		// The marker line is the cell's unique first row in the pane, so it anchors the
+		// agent's view there as a loader line does. No completion command is typed.
+		const marker = rustCellMarker(display.anchorId);
+		return { controlPaths, submissionLine: marker, display, rustCell, submissionText: rustCell };
+	}
 	let guardPaths: ReplControlPaths | undefined;
 	let driverPaths: ReplControlPaths | undefined;
 	try {
@@ -2418,6 +2436,8 @@ async function pasteTextToTmuxPane(
 	onPasted?: () => void,
 	bracketed = false,
 	signal?: AbortSignal,
+	// Rust presses Enter itself, once the pane shows the whole paste.
+	enter = true,
 ): Promise<void> {
 	const bufferName = `pi-repl-${randomUUID()}`;
 	const target = await getPaneTarget(pi, sessionTarget, cwd);
@@ -2445,15 +2465,171 @@ async function pasteTextToTmuxPane(
 		}
 		onPasted?.();
 
-		const enterResult = await execTmux(pi, ["send-keys", "-t", target, "C-m"], cwd, 5_000);
-		if (enterResult.code !== 0) {
-			const reason = enterResult.stderr.trim() || enterResult.stdout.trim() || `exit code ${enterResult.code}`;
-			throw new Error(`Failed to send Enter to tmux pane: ${reason}`);
-		}
+		if (enter) await pressEnter(pi, target, cwd);
 	} finally {
 		cleanupPrivateReplControlFiles(controlPaths);
 		await execTmux(pi, ["delete-buffer", "-b", bufferName], cwd, 2_000).catch(() => undefined);
 	}
+}
+
+async function pressEnter(pi: ExtensionAPI, target: string, cwd: string): Promise<void> {
+	const enterResult = await execTmux(pi, ["send-keys", "-t", target, "C-m"], cwd, 5_000);
+	if (enterResult.code !== 0) {
+		const reason = enterResult.stderr.trim() || enterResult.stdout.trim() || `exit code ${enterResult.code}`;
+		throw new Error(`Failed to send Enter to tmux pane: ${reason}`);
+	}
+}
+
+/** The pane's cursor row, as text; undefined if it can't be read. */
+async function readCursorRow(pi: ExtensionAPI, paneTarget: string, cwd: string): Promise<string | undefined> {
+	const cursor = await execTmux(pi, ["display-message", "-p", "-t", paneTarget, "#{cursor_y}"], cwd, 3_000);
+	const row = cursor.stdout.trim();
+	if (cursor.code !== 0 || !/^\d+$/.test(row)) return undefined;
+	const line = await execTmux(pi, ["capture-pane", "-p", "-J", "-t", paneTarget, "-S", row, "-E", row], cwd, 3_000);
+	return line.code === 0 ? line.stdout.replace(/\n+$/, "") : undefined;
+}
+
+/** Whether a terminal is in raw mode, read with stty without changing it; undefined if it can't be read. */
+async function readTerminalRaw(pi: ExtensionAPI, tty: string, cwd: string): Promise<boolean | undefined> {
+	try {
+		const result = await pi.exec("stty", sttyReadArgs(tty), { cwd, timeout: 2_000 });
+		return result.code === 0 && !result.killed ? sttyShowsRawMode(result.stdout ?? "") : undefined;
+	} catch {
+		return undefined;
+	}
+}
+
+/**
+ * Checks that evcxr is waiting at an empty prompt: the pane's terminal is in raw
+ * mode, which its line editor sets only while it reads input, and the cursor row
+ * is the prompt with nothing typed. Returns the pane's terminal. Throws, sending
+ * nothing, otherwise: input that arrives while a cell runs can be lost, or put the
+ * prompt out of step, in evcxr 0.22.0.
+ */
+async function checkRustReady(pi: ExtensionAPI, paneTarget: string, cwd: string): Promise<string> {
+	const ttyResult = await execTmux(pi, ["display-message", "-p", "-t", paneTarget, "#{pane_tty}"], cwd, 3_000);
+	const tty = ttyResult.stdout.trim();
+	if (ttyResult.code !== 0 || !tty.startsWith("/dev/")) throw new Error("Nothing was sent: the Rust pane's terminal couldn't be found.");
+	const [raw, row] = await Promise.all([readTerminalRaw(pi, tty, cwd), readCursorRow(pi, paneTarget, cwd)]);
+	if (raw === undefined || row === undefined) throw new Error("Nothing was sent: the Rust pane couldn't be checked for an empty prompt (stty or tmux failed).");
+	if (!raw || !RUST_PROMPT.test(row)) {
+		const typed = isRustPromptRow(row) ? row.trimEnd().replace(/^>> ?/, "") : "";
+		const why = !raw ? "a cell is still running" : typed ? `something is typed at the prompt (${JSON.stringify(typed.slice(0, 60))})` : "the cursor isn't at evcxr's prompt";
+		throw new Error(`Nothing was sent: evcxr isn't waiting at an empty prompt; ${why}. pi-repl sends to Rust only then, as evcxr can lose input that arrives while a cell runs. Check the pane with repl_status, then send again.`);
+	}
+	return tty;
+}
+
+/**
+ * Pastes a Rust cell at evcxr's prompt, bracketed, and presses Enter once the pane
+ * shows exactly the cell. If it shows something else, such as text someone typed,
+ * or not the whole cell in time, Enter isn't pressed and nothing runs; the paste
+ * stays in the prompt's input. Then watches for the cell to finish.
+ */
+async function submitRustCell(
+	pi: ExtensionAPI,
+	paneTarget: string,
+	cwd: string,
+	prepared: ReturnType<typeof prepareReplControlFiles>,
+	tty: string,
+	onSubmitted: () => void,
+	signal?: AbortSignal,
+): Promise<void> {
+	const cell = prepared.rustCell ?? "";
+	await pasteTextToTmuxPane(pi, paneTarget, cwd, cell, undefined, true, signal, false);
+	const deadline = Date.now() + 5_000 + Math.ceil(Buffer.byteLength(cell) / 16_384) * 1_000;
+	let echo = "partial";
+	while (Date.now() < deadline && !signal?.aborted) {
+		echo = rustPasteState(await capturePaneOutput(pi, paneTarget, cwd), prepared.submissionLine, cell);
+		if (echo !== "partial") break;
+		await sleep(50);
+	}
+	if (echo !== "drawn") {
+		const why = signal?.aborted ? "the send was aborted" : echo === "different" ? "the prompt showed something else as well, so someone may have typed there" : "the pane didn't show all of it in time";
+		throw new Error(`The cell was pasted at evcxr's prompt but not run: ${why}. It is still in the prompt's input; press Enter there to run it, or clear it with one Ctrl-C (a second Ctrl-C at an empty prompt ends evcxr).`);
+	}
+	await pressEnter(pi, paneTarget, cwd);
+	onSubmitted();
+	watchRustCompletion(pi, paneTarget, cwd, prepared, tty);
+}
+
+const RUST_INCOMPLETE_NOTE = "[pi-repl: evcxr took this cell as unfinished, so pi-repl pressed Enter twice more, which makes evcxr pass it to rustc as it is]";
+
+/**
+ * Writes a Rust cell's done file once evcxr is back at its prompt after it: the
+ * terminal in raw mode, and a prompt row after the cell's echo (rustWatchStep has
+ * the rules). If evcxr instead waits for more of the cell, which it does when the
+ * cell looks unfinished, pi-repl presses Enter twice more, but only while the
+ * echo is intact with nothing but blank rows after it: evcxr then passes the cell
+ * to rustc as it is, which reports what's wrong, rather than leaving it in the
+ * person's prompt. Stops when the send's files are removed or the pane is gone.
+ */
+function watchRustCompletion(
+	pi: ExtensionAPI,
+	paneTarget: string,
+	cwd: string,
+	prepared: ReturnType<typeof prepareReplControlFiles>,
+	tty: string,
+): void {
+	const { sourceFile, doneFile } = prepared.controlPaths;
+	const cell = prepared.rustCell ?? "";
+	void (async () => {
+		let waitingSince: number | undefined;
+		let extraEnters = 0;
+		let sawCooked = false;
+		let failures = 0;
+		while (existsSync(sourceFile) && !existsSync(doneFile)) {
+			try {
+				const raw = await readTerminalRaw(pi, tty, cwd);
+				if (raw === undefined) throw new Error("stty failed");
+				failures = 0;
+				if (!raw) {
+					sawCooked = true;
+					waitingSince = undefined;
+				} else {
+					const progress = rustCellProgress(rowsFromRustEcho(await capturePaneOutput(pi, paneTarget, cwd), prepared.submissionLine), cell);
+					const row = progress === "unknown" ? await readCursorRow(pi, paneTarget, cwd) : undefined;
+					if (progress === "waiting") waitingSince ??= Date.now();
+					else waitingSince = undefined;
+					const step = rustWatchStep({
+						raw, progress, sawCooked, extraEnters,
+						cursorPrompt: row !== undefined && isRustPromptRow(row),
+						waitingMs: waitingSince === undefined ? 0 : Date.now() - waitingSince,
+					});
+					if (step === "done") {
+						try { writeFileSync(doneFile, extraEnters ? "incomplete\n" : "done\n", { mode: 0o600, flag: "wx" }); } catch {}
+						return;
+					}
+					if (step === "enter") {
+						await pressEnter(pi, paneTarget, cwd);
+						extraEnters += 1;
+						waitingSince = Date.now();
+					}
+				}
+			} catch {
+				// The pane may be gone; settling verifies that before releasing anything.
+				if (++failures >= 50) return;
+			}
+			await sleepWithoutKeepingProcessAlive(REPL_SEND_POLL_MS);
+		}
+	})();
+}
+
+/** A finished send's output, from the pane before it and once it finished. */
+function cleanupSubmissionOutput(prepared: ReturnType<typeof prepareReplControlFiles>, beforeCapture: string, afterCapture: string): string {
+	if (prepared.rustCell === undefined) {
+		return cleanupReplDelta(extractPaneDelta(beforeCapture, afterCapture), prepared.submissionLine, prepared.previewComment, prepared.completionLine, prepared.display);
+	}
+	let incomplete = false;
+	try { incomplete = readFileSync(prepared.controlPaths.doneFile, "utf8") === "incomplete\n"; } catch {}
+	let output = rustCellOutput(rowsFromRustEcho(afterCapture, prepared.submissionLine), prepared.rustCell);
+	if (output === undefined) {
+		// The cell's echo has scrolled out of the captured lines: give what is there.
+		const rows = stripBoundaryBlankLines(afterCapture).split("\n");
+		if (rows.length && isRustPromptRow(rows[rows.length - 1])) rows.pop();
+		output = `[pi-repl: the start of this cell's output is beyond the pane's last ${REPL_SEND_CAPTURE_LINES} lines]\n${stripBoundaryBlankLines(rows.join("\n"))}`;
+	}
+	return incomplete ? [output, RUST_INCOMPLETE_NOTE].filter(Boolean).join("\n") : output;
 }
 
 async function capturePaneOutput(pi: ExtensionAPI, sessionTarget: string, cwd: string, timeout = 5_000): Promise<string> {
@@ -2671,15 +2847,7 @@ async function waitForReplDoneFile(
 		await sleep(REPL_SEND_POLL_MS);
 	}
 
-	const latestOutput = captureContext
-		? cleanupReplDelta(
-			extractPaneDelta(captureContext.beforeCapture, latestCapture),
-			captureContext.prepared.submissionLine,
-			captureContext.prepared.previewComment,
-			captureContext.prepared.completionLine,
-			captureContext.prepared.display,
-		)
-		: latestCapture;
+	const latestOutput = captureContext ? cleanupSubmissionOutput(captureContext.prepared, captureContext.beforeCapture, latestCapture) : latestCapture;
 	const tail = truncateTail(latestOutput, {
 		maxLines: 40,
 		maxBytes: 8 * 1024,
@@ -2700,13 +2868,14 @@ function normalizeReplSendTarget(target?: string): SessionSelector | undefined {
 	if (trimmed === "clojure" || trimmed === "clj") return "clojure";
 	if (trimmed === "ruby" || trimmed === "irb") return "ruby";
 	if (trimmed === "java" || trimmed === "jshell") return "java";
-	if (trimmed === "octave" || trimmed === "matlab" || trimmed === "gnuplot" || trimmed === "cpp") return trimmed;
+	if (trimmed === "evcxr") return "rust";
+	if (trimmed === "octave" || trimmed === "matlab" || trimmed === "gnuplot" || trimmed === "cpp" || trimmed === "rust") return trimmed;
 	throw new Error(`Unknown repl_send target: ${target}`);
 }
 
 /** Why a send can't run: its runtime's default session isn't running. */
 function missingSessionError(target: SessionSelector, sessionName: string): Error {
-	if (target === "octave" || target === "matlab" || target === "gnuplot" || target === "cpp") return new Error(`No default ${getSessionDisplayName(target)} REPL session is running (${sessionName}). Start one with /repl ${target} first.`);
+	if (target === "octave" || target === "matlab" || target === "gnuplot" || target === "cpp" || target === "rust") return new Error(`No default ${getSessionDisplayName(target)} REPL session is running (${sessionName}). Start one with /repl ${target} first.`);
 	if (target === "julia") {
 		return new Error(
 			`No default Julia REPL session is running (${DEFAULT_JULIA_SESSION}). Start one with /repl julia first.`,
@@ -2772,7 +2941,7 @@ async function runReplCode(
 
 	const sessionInfo = await readSessionInfo(pi, sessionName, ctx.cwd);
 	if (!sessionInfo) {
-		if (target === "octave" || target === "matlab" || target === "gnuplot" || target === "cpp") throw new Error(`Could not inspect the default ${getSessionDisplayName(target)} REPL session (${sessionName}). Inspect it with /repl status ${target}.`);
+		if (target === "octave" || target === "matlab" || target === "gnuplot" || target === "cpp" || target === "rust") throw new Error(`Could not inspect the default ${getSessionDisplayName(target)} REPL session (${sessionName}). Inspect it with /repl status ${target}.`);
 		if (target === "julia") {
 			throw new Error(
 				`Could not inspect the default Julia REPL session (${DEFAULT_JULIA_SESSION}). Start it again with /repl julia.`,
@@ -2836,6 +3005,8 @@ async function runReplCode(
 		: undefined;
 	const cppPane = runtime === "cpp" ? await inspectCppPane(pi, paneTarget, ctx.cwd) : undefined;
 	if (runtime === "cpp" && (!cppPane || cppPane.dead)) throw new Error("The C++ pane is ended or cannot be inspected; no code was sent and no replacement was started.");
+	// Rust takes a cell only at evcxr's empty prompt; this throws, sending nothing, otherwise.
+	const rustTty = runtime === "rust" ? await checkRustReady(pi, paneTarget, ctx.cwd) : undefined;
 	const echoMode = resolveReplSubmissionEchoMode(params.echoMode);
 	const prepared = prepareReplControlFiles(runtime, code, {
 		submissionId: options.submissionId || `pi-repl:local:${randomUUID()}`,
@@ -2860,10 +3031,12 @@ async function runReplCode(
 
 	let submissionStarted = false;
 	try {
-		await pasteTextToTmuxPane(pi, paneTarget, ctx.cwd, prepared.submissionText, () => {
+		const onSubmitted = () => {
 			submissionStarted = true;
 			options.onSubmissionStarted?.(submissionState);
-		}, runtime === "julia", signal);
+		};
+		if (rustTty) await submitRustCell(pi, paneTarget, ctx.cwd, prepared, rustTty, onSubmitted, signal);
+		else await pasteTextToTmuxPane(pi, paneTarget, ctx.cwd, prepared.submissionText, onSubmitted, runtime === "julia", signal);
 		await waitForReplDoneFile(
 			pi,
 			sessionName,
@@ -2892,8 +3065,7 @@ async function runReplCode(
 			});
 		}
 		const cppResult = prepared.cppCompletion ? readCppCompletion(prepared.cppCompletion) : undefined;
-		const delta = extractPaneDelta(beforeCapture, afterCapture);
-		const output = cleanupReplDelta(delta, prepared.submissionLine, prepared.previewComment, prepared.completionLine, prepared.display);
+		const output = cleanupSubmissionOutput(prepared, beforeCapture, afterCapture);
 		cleanupPreparedReplControlFiles(prepared);
 
 		return {
@@ -3189,7 +3361,7 @@ async function settleReplSubmission(
 			}
 			capturedAt = performance.now();
 			afterCapture = await capturePaneOutput(pi, state.paneTarget, state.cwd);
-			output = cleanupReplDelta(extractPaneDelta(state.beforeCapture, afterCapture), state.prepared.submissionLine, state.prepared.previewComment, state.prepared.completionLine, state.prepared.display);
+			output = cleanupSubmissionOutput(state.prepared, state.beforeCapture, afterCapture);
 		} catch (error) {
 			const reason = `it ran, but its output couldn't be captured (${error instanceof Error ? error.message : String(error)})`;
 			const failed = updateEntry({ status: "error", output: reason });
@@ -3849,7 +4021,9 @@ async function startDefaultReplSession(
 	checkStartAborted(signal, sessionName);
 	const exists = await tmuxSessionExists(pi, sessionName, cwd);
 	checkStartAborted(signal, sessionName);
-	const shellLaunch = buildDefaultShellRuntimeCommand(runtime, cwd);
+	// Rust's evcxr runs with a private settings folder, made before the session.
+	const rustLaunch = runtime === "rust" && !exists ? createRustLaunch() : undefined;
+	const shellLaunch = buildDefaultShellRuntimeCommand(runtime, cwd, rustLaunch?.command);
 	let created = false;
 	let sessionTarget = sessionName;
 	const warnings: string[] = [];
@@ -3862,6 +4036,8 @@ async function startDefaultReplSession(
 			...(gnuplotOwner ? ["-e", `${GNUPLOT_OWNER_ENV}=${gnuplotOwner}`] : []), shellLaunch.command,
 		], cwd, 10_000);
 		if (result.code !== 0) {
+			// Another start made the session first, with its own settings folder.
+			if (rustLaunch) removeRustConfigDir(rustLaunch.dir);
 			if (!(await tmuxSessionExists(pi, sessionName, cwd))) {
 				const reason = result.stderr.trim() || result.stdout.trim() || `exit code ${result.code}`;
 				throw new Error(`Failed to create tmux session ${sessionName}: ${reason}`);
@@ -3877,6 +4053,15 @@ async function startDefaultReplSession(
 			}
 			if (!(await setTmuxSessionOption(pi, sessionTarget, REPL_RUNTIME_OPTION, runtime, cwd))) {
 				warnings.push(`Could not record the runtime for ${sessionName}.`);
+			}
+			if (rustLaunch) {
+				if (!(await setTmuxSessionOption(pi, sessionTarget, RUST_CONFIG_OPTION, rustLaunch.dir, cwd))) {
+					warnings.push(`Could not record the session's evcxr settings folder (${rustLaunch.dir}); stopping the session won't remove it.`);
+				}
+				// pi-studio pastes into, and interrupts, only sessions whose send path is unset or "pane".
+				if (!(await setTmuxSessionOption(pi, sessionTarget, JUPYTER_OPTIONS.sendPath, RUST_SEND_PATH, cwd))) {
+					warnings.push("Could not mark the session as taking cells only through pi-repl; don't send it code or Ctrl-C from Pi Studio.");
+				}
 			}
 			const history = await enableSessionHistoryLogging(pi, sessionName, cwd, sessionTarget);
 			if (history.warning) warnings.push(history.warning);
@@ -3915,6 +4100,7 @@ async function startDefaultReplSession(
 			...(target === "python" ? ["This respects your normal shell-level Python setup (aliases, pyenv/virtualenv/conda activation, shell init, etc.)."] : []),
 			...(target === "clojure" ? ["`clojure` is used without rlwrap; `/repl clj` remains an alias."] : []),
 			...(target === "gnuplot" ? ["An inherited ownership marker identifies this session's interpreter and Qt helpers during explicit stop; plotting settings are unchanged."] : []),
+			...(target === "rust" && rustLaunch ? [`evcxr runs with a private settings folder (EVCXR_CONFIG_DIR=${rustLaunch.dir}), holding copies of your init.evcxr, prelude.rs and history, so the agent's cells are saved to its history, not yours. Stopping the session removes it.`] : []),
 		] : []),
 		ready ? "Readiness: normal prompt observed (snapshot only, not a reservation)." : "Readiness: unconfirmed.",
 		...warnings.map((warning) => `Warning: ${warning}`),
@@ -3949,7 +4135,7 @@ async function startReplCommand(pi: ExtensionAPI, ctx: ExtensionCommandContext, 
 }
 
 function formatNoSessionRunning(selector: SessionSelector): string {
-	if (selector === "octave" || selector === "matlab" || selector === "gnuplot" || selector === "cpp") return `No default ${getSessionDisplayName(selector)} REPL session is running (${getSessionNameForSelector(selector)}).\nStart one with /repl ${selector} or /lab ${selector}.`;
+	if (selector === "octave" || selector === "matlab" || selector === "gnuplot" || selector === "cpp" || selector === "rust") return `No default ${getSessionDisplayName(selector)} REPL session is running (${getSessionNameForSelector(selector)}).\nStart one with /repl ${selector} or /lab ${selector}.`;
 	if (selector === "julia") {
 		return [
 			`No default Julia REPL session is running (${DEFAULT_JULIA_SESSION}).`,
@@ -4008,7 +4194,7 @@ function buildReplStatusDetails(
 	const clojure = sessions.find((session) => session.selector === "clojure")?.info;
 	const ruby = sessions.find((session) => session.selector === "ruby")?.info;
 	const java = sessions.find((session) => session.selector === "java")?.info;
-	const additionalRuntimeDetails = Object.fromEntries((["octave", "matlab", "gnuplot", "cpp"] as const).map((selector) => {
+	const additionalRuntimeDetails = Object.fromEntries((["octave", "matlab", "gnuplot", "cpp", "rust"] as const).map((selector) => {
 		const info = sessions.find((session) => session.selector === selector)?.info;
 		return [selector, {
 			running: Boolean(info), sessionName: info?.sessionName ?? getSessionNameForSelector(selector),
@@ -4214,6 +4400,7 @@ async function stopReplSession(
 					"/repl stop matlab",
 					"/repl stop gnuplot",
 					"/repl stop cpp",
+					"/repl stop rust",
 				].join("\n"),
 				"warning",
 			);
@@ -4230,12 +4417,16 @@ async function stopReplSession(
 	}
 
 	try {
+		// Read before the session, and its options, are gone. show-options takes a pane
+		// target, so the exact session name needs its trailing colon.
+		const rustConfig = selector === "rust" ? await readTmuxSessionOption(pi, `${getSessionTarget(sessionName)}:`, RUST_CONFIG_OPTION, ctx.cwd) : undefined;
 		const result = await stopVerifiedReplSession({
 			tmux: (args: string[]) => execTmux(pi, args, ctx.cwd, 3_000),
 			sessionName,
 		});
 		const escalated = result.signals.length ? ` Cleaned up ${new Set(result.signals.map((entry) => entry.pid)).size} surviving process(es).` : "";
-		const warnings = result.warnings ?? [];
+		const warnings = [...(result.warnings ?? [])];
+		if (rustConfig && !removeRustConfigDir(rustConfig)) warnings.push(`The session's evcxr settings folder wasn't removed: ${rustConfig}`);
 		notify(ctx, `Stopped default ${getSessionDisplayName(selector)} REPL session: ${sessionName}. Verified owned runtime processes exited.${escalated}${warnings.length ? "\n" + warnings.join("\n") : ""}`, warnings.length ? "warning" : "info");
 	} catch (error) {
 		notify(ctx, `Could not fully stop ${sessionName}: ${error instanceof Error ? error.message : String(error)}`, "error");
@@ -4307,7 +4498,7 @@ async function exportReplRecord(
 				ctx,
 				[
 					"Multiple shared REPL sessions are running.",
-					"Choose one with /repl export python, julia, r, ghci, clojure, ruby, java, octave, matlab, gnuplot, or cpp.",
+					"Choose one with /repl export python, julia, r, ghci, clojure, ruby, java, octave, matlab, gnuplot, cpp, or rust.",
 				].join("\n"),
 				"warning",
 			);
@@ -4571,7 +4762,7 @@ async function handleRepl(pi: ExtensionAPI, args: string, ctx: ExtensionCommandC
 				return;
 			}
 
-			if (parsed.runtime === "octave" || parsed.runtime === "matlab" || parsed.runtime === "gnuplot" || parsed.runtime === "cpp") {
+			if (parsed.runtime === "octave" || parsed.runtime === "matlab" || parsed.runtime === "gnuplot" || parsed.runtime === "cpp" || parsed.runtime === "rust") {
 				if (parsed.name) {
 					notify(ctx, `Named ${getSessionDisplayName(parsed.runtime)} sessions are not implemented yet. For now, use /repl ${parsed.runtime} with no --name.`, "warning");
 					return;
@@ -4588,7 +4779,7 @@ async function handleRepl(pi: ExtensionAPI, args: string, ctx: ExtensionCommandC
 					"Scaffold only: parsed REPL start request.",
 					`Runtime: ${parsed.runtime}`,
 					`tmux session: ${sessionName}${nameNote}`,
-					"Only Python, IPython, Julia, R, GHCi, Clojure, Ruby, Java, Octave, MATLAB, gnuplot, and C++ session management are implemented so far.",
+					"Only Python, IPython, Julia, R, GHCi, Clojure, Ruby, Java, Octave, MATLAB, gnuplot, C++ and Rust session management are implemented so far.",
 				].join("\n"),
 				"info",
 			);
@@ -4721,11 +4912,11 @@ export default function (pi: ExtensionAPI) {
 	pi.registerTool({
 		name: "repl_status",
 		label: "REPL Status",
-		description: "Inspect shared REPL session state for Python/IPython, Julia, R, Haskell (GHCi), Clojure, Ruby, Java, Octave, MATLAB, gnuplot, and C++.",
-		promptSnippet: "Check whether the shared Python/IPython, Julia, R, Haskell (GHCi), Clojure, Ruby, Java, Octave, MATLAB, gnuplot, and C++ REPL sessions are running.",
+		description: "Inspect shared REPL session state for Python/IPython, Julia, R, Haskell (GHCi), Clojure, Ruby, Java, Octave, MATLAB, gnuplot, C++, and Rust.",
+		promptSnippet: "Check whether the shared Python/IPython, Julia, R, Haskell (GHCi), Clojure, Ruby, Java, Octave, MATLAB, gnuplot, C++, and Rust REPL sessions are running.",
 		promptGuidelines: [
 			"Use repl_status before claiming whether a shared REPL is running, especially after a previous failure or status change.",
-			"For Octave use repl_status target='octave'; for MATLAB use target='matlab'; for gnuplot use target='gnuplot'; for C++ use target='cpp'. They use separate shared sessions.",
+			"For Octave use repl_status target='octave'; for MATLAB use target='matlab'; for gnuplot use target='gnuplot'; for C++ use target='cpp'; for Rust use target='rust'. They use separate shared sessions.",
 			"If the user asks specifically about Julia, use target='julia'. If they ask specifically about R, use target='r'. If they ask specifically about GHCi or Haskell, use target='ghci'. If they ask specifically about Clojure, use target='clojure'. If they ask specifically about Ruby or IRB, use target='ruby'. If they ask specifically about Java or jshell, use target='java'. If they ask specifically about Python or IPython, use target='python'.",
 			"If you need context about prior direct REPL interaction, inspect repl_status details and read the session history file listed there.",
 			"For LFortran use target='lfortran': it shows the person's prompt, the helper and kernel, and the latest cell sent through pi-repl. To follow a particular cell, such as one that outlasted repl_send's wait or whose send failed, pass its execution or submission ID as execution.",
@@ -4754,7 +4945,7 @@ export default function (pi: ExtensionAPI) {
 				else if (targetRaw === "clojure" || targetRaw === "clj") target = "clojure";
 				else if (targetRaw === "ruby" || targetRaw === "irb") target = "ruby";
 				else if (targetRaw === "java" || targetRaw === "jshell") target = "java";
-				else if (targetRaw === "octave" || targetRaw === "matlab" || targetRaw === "gnuplot" || targetRaw === "cpp") target = targetRaw;
+				else if (targetRaw === "octave" || targetRaw === "matlab" || targetRaw === "gnuplot" || targetRaw === "cpp" || targetRaw === "rust") target = targetRaw;
 				else if (targetRaw === "python" || targetRaw === "ipython") target = "python";
 				else throw new Error(`Unknown repl_status target: ${targetRaw}`);
 			}
@@ -4815,11 +5006,11 @@ export default function (pi: ExtensionAPI) {
 	pi.registerTool({
 		name: "repl_send",
 		label: "REPL Send",
-		description: `Execute code in the shared default Python/IPython, Julia, R, Haskell (GHCi), Clojure, Ruby, Java, Octave, MATLAB, gnuplot, or C++ tmux REPL sessions (${DEFAULT_PYTHON_SESSION}, ${DEFAULT_JULIA_SESSION}, ${DEFAULT_R_SESSION}, ${DEFAULT_GHCI_SESSION}, ${DEFAULT_CLOJURE_SESSION}, ${DEFAULT_RUBY_SESSION}, ${DEFAULT_JAVA_SESSION}, ${DEFAULT_OCTAVE_SESSION}, ${DEFAULT_MATLAB_SESSION}, ${DEFAULT_GNUPLOT_SESSION}, ${DEFAULT_CPP_SESSION}). The complete response (submitted code and output) is truncated to ${DEFAULT_MAX_LINES} lines or ${formatSize(DEFAULT_MAX_BYTES)} (whichever is hit first); the full response is saved privately when truncated.`,
-		promptSnippet: "Execute a small snippet in the shared Python/IPython, Julia, R, Haskell (GHCi), Clojure, Ruby, Java, Octave, MATLAB, gnuplot, or C++ REPL and return its output.",
+		description: `Execute code in the shared default Python/IPython, Julia, R, Haskell (GHCi), Clojure, Ruby, Java, Octave, MATLAB, gnuplot, C++, or Rust tmux REPL sessions (${DEFAULT_PYTHON_SESSION}, ${DEFAULT_JULIA_SESSION}, ${DEFAULT_R_SESSION}, ${DEFAULT_GHCI_SESSION}, ${DEFAULT_CLOJURE_SESSION}, ${DEFAULT_RUBY_SESSION}, ${DEFAULT_JAVA_SESSION}, ${DEFAULT_OCTAVE_SESSION}, ${DEFAULT_MATLAB_SESSION}, ${DEFAULT_GNUPLOT_SESSION}, ${DEFAULT_CPP_SESSION}, ${DEFAULT_RUST_SESSION}). The complete response (submitted code and output) is truncated to ${DEFAULT_MAX_LINES} lines or ${formatSize(DEFAULT_MAX_BYTES)} (whichever is hit first); the full response is saved privately when truncated.`,
+		promptSnippet: "Execute a small snippet in the shared Python/IPython, Julia, R, Haskell (GHCi), Clojure, Ruby, Java, Octave, MATLAB, gnuplot, C++, or Rust REPL and return its output.",
 		promptGuidelines: [
 			"Use repl_send only after the relevant session has been started with repl_start, /repl, or /lab and is at a normal prompt. repl_send never auto-starts a missing session.",
-			"If the user asks to run code in Julia or in the shared Julia REPL, use target='julia'. If they ask to run code in R or in the shared R REPL, use target='r'. If they ask to run code in GHCi, Haskell, or the shared Haskell REPL, use target='ghci'. If they ask to run code in Clojure or in the shared Clojure REPL, use target='clojure'. If they ask to run code in Ruby or IRB or the shared Ruby REPL, use target='ruby'. If they ask to run code in Java or jshell or the shared Java REPL, use target='java'. For Octave use target='octave', for MATLAB use target='matlab', for gnuplot use target='gnuplot', and for C++ use target='cpp'. Otherwise use the shared Python/IPython session.",
+			"If the user asks to run code in Julia or in the shared Julia REPL, use target='julia'. If they ask to run code in R or in the shared R REPL, use target='r'. If they ask to run code in GHCi, Haskell, or the shared Haskell REPL, use target='ghci'. If they ask to run code in Clojure or in the shared Clojure REPL, use target='clojure'. If they ask to run code in Ruby or IRB or the shared Ruby REPL, use target='ruby'. If they ask to run code in Java or jshell or the shared Java REPL, use target='java'. For Octave use target='octave', for MATLAB use target='matlab', for gnuplot use target='gnuplot', for C++ use target='cpp', and for Rust use target='rust'. Otherwise use the shared Python/IPython session.",
 			"Use repl_status before claiming whether the shared REPL is active if there has been a prior failure or a possible state change.",
 			"If you need context about prior direct REPL interaction, inspect repl_status details and read the session history file listed there.",
 			"The session history file is raw tmux pane output, so expect prompts and echoed input as well as results.",
@@ -4833,6 +5024,7 @@ export default function (pi: ExtensionAPI) {
 			"In Java, use top-level JShell snippets: imports, variables, methods, classes, expressions, or statements. Use System.out.println(...) for visible values; /open does not echo expression results. Submit complete snippets; native /open may discard an unfinished fragment. JShell commands such as /reset and /exit change or end the live session.",
 			"For Octave use repl_send target='octave'; for MATLAB use target='matlab'. They are separate runtimes: do not silently substitute one for the other. Send complete code; use disp or fprintf for explicit output. Code executes in the base workspace, with native semicolon and ans behaviour. MATLAB function definitions belong in .m files; run scripts or call functions from the current path. clear, clear all, exit and quit are deliberate state-changing actions. This does not control an existing MATLAB desktop session.",
 			"For C++ use target='cpp': an experimental Cling-based C++ REPL. Submit complete native prompt groups (put a function's opening brace on its declaration line); include ordinary definition/header files separately. Dot commands are terminal-only; use /repl stop cpp to stop. Earlier groups may run before a later error. Compiler/link diagnostics and caught C++ exceptions are retained; there is no replay. Exit, crashes and busy Ctrl-C can end the workspace. Completion means the evaluator returned, not that library calls succeeded. Do not queue control commands behind stdin reads or restart after timeout. Cling with matching development headers must already be on your login-shell PATH; no automatic installation or alternate-runtime fallback.",
+			"For Rust use target='rust': an experimental evcxr REPL. Each cell is pasted whole at evcxr's prompt, under a `// pi-repl <id>` comment line, and only when evcxr is waiting with nothing typed; otherwise nothing is sent and the result says why, so check the pane rather than resending in a loop. Send statements, items and evcxr commands such as :dep; a cell evcxr takes as unfinished is passed to rustc, which reports the error. Output from print! without a newline, or from threads still running, can appear under a later cell. A cell that reads stdin waits for the person. Ctrl-C or std::process::exit loses the variables, and there is no replay. Never send Ctrl-C to an empty prompt: a second one in a row ends evcxr.",
 			"For gnuplot use repl_send target='gnuplot'. This is its own persistent runtime, not another REPL's plotting backend. Send complete native scripts; use print for console results. Preserve the user's terminal, output, print destination and settings; export figures only when requested. reset and reset session deliberately change state. In a loaded script, exit/quit returns from that script; exit gnuplot ends the process. Avoid pause/input waits unless explicitly wanted.",
 			"Avoid blocking interactive input() prompts or long-running code unless the user explicitly wants that.",
 			...LFORTRAN_GUIDELINES,
