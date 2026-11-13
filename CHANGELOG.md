@@ -4,6 +4,8 @@ All notable changes to `pi-repl` are documented here.
 
 ## [Unreleased]
 
+## [0.13.0] — 2026-11-13
+
 ### Added
 - An experimental Rust runtime, `rust`: evcxr's own REPL (`evcxr`) in the `pi-repl-rust` session. evcxr can't load a cell from a file and keep its variables, so pi-repl pastes each cell whole at evcxr's prompt, under a `// pi-repl <id>` comment line, and only when evcxr is waiting at an empty prompt, which it reads from the pane's terminal mode (`stty`) and the cursor's row; otherwise nothing is sent and the result says why. The same reading tells it when the cell has finished, so nothing else is typed into the pane. A cell evcxr takes as unfinished is passed to rustc with two more Enters. evcxr runs with a private settings folder holding copies of your startup files and history, which `/repl stop rust` removes, and the session's `@pi_repl_send_path` keeps Pi Studio from pasting into it or sending it Ctrl-C. Tested with evcxr 0.22.0 and evcxr's `main` on ARM64 macOS; the limits are in `docs/runtimes.md`.
 
