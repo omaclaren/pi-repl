@@ -548,6 +548,20 @@ function startedAtSeconds(startedAt) {
 
 const MARKER_BATCH = 128;
 const MAX_MARKER_CANDIDATES = 1024;
+// A process can't be read for a moment while it starts; one still unreadable is read again, this many times.
+const MARKER_RETRIES = 3;
+const MARKER_RETRY_MS = 200;
+
+/** A process's program, for a message: its executable's name, printable, or null if ps can't say. */
+async function programName(pid, list) {
+	try {
+		const result = await list("ps", ["-o", "comm=", "-p", String(pid)], { timeoutMs: 3000 });
+		const name = result.code === 0 ? basename(result.stdout.trim().split("\n")[0] ?? "") : "";
+		return name ? name.replace(/[^\x20-\x7e]/g, "?").slice(0, 80) : null;
+	} catch {
+		return null;
+	}
+}
 
 /**
  * The live processes of this user's whose initial environment carries the
@@ -558,7 +572,7 @@ const MAX_MARKER_CANDIDATES = 1024;
  * authorizes; names, PIDs and times only select what is inspected.
  * `incomplete` is set if there were too many candidates to inspect.
  */
-export async function findMarkedJupyterProcesses(table, { owner, dir, lfortran, uid, since, list = runCommand, readMarkers = readOwnerMarkers, snapshot = readStopProcessTable }) {
+export async function findMarkedJupyterProcesses(table, { owner, dir, lfortran, uid, since, list = runCommand, readMarkers = readOwnerMarkers, snapshot = readStopProcessTable, retryMs = MARKER_RETRY_MS }) {
 	if (!OWNER.test(owner)) throw new Error("Invalid LFortran session ownership marker.");
 	const candidates = new Set(dir ? pidsFromDir(dir) : []);
 	if (lfortran) {
@@ -577,19 +591,29 @@ export async function findMarkedJupyterProcesses(table, { owner, dir, lfortran, 
 	const byPid = new Map(table.map((p) => [p.pid, p]));
 	const inspected = [...candidates].filter((pid) => byPid.get(pid)?.uid === uid && live(byPid.get(pid)));
 	const incomplete = inspected.length > MAX_MARKER_CANDIDATES;
-	const rows = [];
-	for (let i = 0; i < Math.min(inspected.length, MAX_MARKER_CANDIDATES); i += MARKER_BATCH) {
-		rows.push(...await readMarkers(inspected.slice(i, i + MARKER_BATCH), { variable: JUPYTER_OWNER_ENV, label: "LFortran" }));
-	}
-	const failed = rows.filter((row) => row.error);
-	if (failed.length) {
+	const read = async (pids) => {
+		const rows = [];
+		for (let i = 0; i < pids.length; i += MARKER_BATCH) rows.push(...await readMarkers(pids.slice(i, i + MARKER_BATCH), { variable: JUPYTER_OWNER_ENV, label: "LFortran" }));
+		return rows;
+	};
+	const rows = new Map((await read(inspected.slice(0, MAX_MARKER_CANDIDATES))).map((row) => [row.pid, row]));
+	const known = (pid) => table.find((p) => p.pid === pid);
+	for (let attempt = 0; ; attempt++) {
+		const failed = [...rows.values()].filter((row) => row.error);
+		if (!failed.length) break;
 		// A process that ended, or became a zombie, while it was inspected has no metadata left; that's no failure.
 		const fresh = await snapshot();
-		const known = (pid) => table.find((p) => p.pid === pid);
-		const unread = failed.find((row) => fresh.some((p) => p.pid === row.pid && live(p) && processKey(p) === processKey(known(row.pid))));
-		if (unread) throw new Error(`Could not inspect LFortran session ownership for PID ${unread.pid}; refusing unverified cleanup.`);
+		const unread = failed.filter((row) => fresh.some((p) => p.pid === row.pid && live(p) && processKey(p) === processKey(known(row.pid))));
+		if (!unread.length) break;
+		// One that lives may only be starting, as an app launchd has just started can be: it is read again.
+		if (attempt >= MARKER_RETRIES) {
+			const name = await programName(unread[0].pid, list);
+			throw new Error(`Could not inspect LFortran session ownership for PID ${unread[0].pid}${name ? ` (${name})` : ""}, after ${MARKER_RETRIES + 1} tries; refusing unverified cleanup.`);
+		}
+		await sleep(retryMs);
+		for (const row of await read(unread.map((row) => row.pid))) rows.set(row.pid, row);
 	}
-	return { marked: rows.filter((row) => row.owner === owner && !row.gone && !row.error).map((row) => byPid.get(row.pid)).filter(Boolean), incomplete };
+	return { marked: [...rows.values()].filter((row) => row.owner === owner && !row.gone && !row.error).map((row) => byPid.get(row.pid)).filter(Boolean), incomplete };
 }
 
 /** The owner-marker values safe to compare inside a tmux format. */

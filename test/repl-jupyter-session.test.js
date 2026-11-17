@@ -295,7 +295,9 @@ test("the marked processes are found among DIR's PIDs, detached lfortran process
 	const table = [proc(101, { ppid: 50 }), proc(102, { ppid: 50 }), proc(103, { ppid: 50 }), proc(104, { ppid: 50 }), proc(105, { uid: uid + 1 }),
 		// Orphans: one since the session began, one from before it, and one with a terminal.
 		proc(106), proc(107, { startedAt: "Wed Oct 28 08:00:00 2026" }), proc(108, { tty: "ttys001" })];
-	const list = async () => ({ code: 0, stdout: `  103 ${uid} /opt/bin/lfortran\n  104 ${uid} /usr/bin/python3\n  105 ${uid + 1} /opt/bin/lfortran\n` });
+	const list = async (file, args) => args.includes("comm=")
+		? { code: 0, stdout: "/Applications/Some App.app/Contents/MacOS/Some\u001bHelper\n" }
+		: { code: 0, stdout: `  103 ${uid} /opt/bin/lfortran\n  104 ${uid} /usr/bin/python3\n  105 ${uid + 1} /opt/bin/lfortran\n` };
 	const inspected = [];
 	const markers = new Map([[101, owner], [102, owner], [103, "f".repeat(32)], [106, owner]]);
 	const readMarkers = async (pids, { variable }) => {
@@ -307,11 +309,20 @@ test("the marked processes are found among DIR's PIDs, detached lfortran process
 	assert.deepEqual(found.marked.map((p) => p.pid).sort(), [101, 102, 106]);
 	assert.equal(found.incomplete, false);
 	assert.deepEqual(inspected.sort(), [101, 102, 103, 106], "only this user's candidates are inspected");
-	// A process that can't be inspected is refused while it lives; one that ended meanwhile isn't a failure.
-	const unreadable = async (pids) => pids.map((pid) => ({ pid, error: "unavailable" }));
-	await assert.rejects(findMarkedJupyterProcesses(table, { owner, dir, lfortran: null, uid, list, readMarkers: unreadable, snapshot: async () => table }), /PID 101; refusing unverified cleanup/);
+	// A process that can't be inspected is read again, and refused, naming its program, if it still can't be and lives;
+	// one that ended meanwhile isn't a failure.
+	let reads = 0;
+	const unreadable = async (pids) => { reads++; return pids.map((pid) => ({ pid, error: "unavailable" })); };
+	await assert.rejects(findMarkedJupyterProcesses(table, { owner, dir, lfortran: null, uid, list, readMarkers: unreadable, snapshot: async () => table, retryMs: 1 }),
+		/^Error: Could not inspect LFortran session ownership for PID 101 \(Some\?Helper\), after 4 tries; refusing unverified cleanup\.$/);
+	assert.equal(reads, 4);
 	const ended = table.filter((p) => p.pid !== 101 && p.pid !== 102).concat([proc(102, { state: "Z" })]);
-	assert.deepEqual((await findMarkedJupyterProcesses(table, { owner, dir, lfortran: null, uid, list, readMarkers: unreadable, snapshot: async () => ended })).marked, []);
+	assert.deepEqual((await findMarkedJupyterProcesses(table, { owner, dir, lfortran: null, uid, list, readMarkers: unreadable, snapshot: async () => ended, retryMs: 1 })).marked, []);
+	// A process unreadable only for a moment, as one just starting can be, is found on a later try.
+	const unreadOnce = new Set([106]);
+	const starting = async (pids) => pids.map((pid) => unreadOnce.delete(pid) ? { pid, error: "unavailable" } : { pid, owner: markers.get(pid) ?? null });
+	const later = await findMarkedJupyterProcesses(table, { owner, dir, lfortran: "/somewhere/lfortran", uid, since, list, readMarkers: starting, snapshot: async () => table, retryMs: 1 });
+	assert.deepEqual(later.marked.map((p) => p.pid).sort(), [101, 102, 106]);
 	// Too many candidates to inspect: the search says it's incomplete rather than empty.
 	const crowd = Array.from({ length: 1100 }, (_, i) => proc(2000 + i));
 	const batches = [];
