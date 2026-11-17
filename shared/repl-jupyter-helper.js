@@ -22,7 +22,8 @@ import { join } from "node:path";
 import { pathToFileURL } from "node:url";
 import { Worker } from "node:worker_threads";
 import { JupyterClient, readConnectionFile } from "./repl-jupyter.js";
-import { isValidReplSessionRecordId, recordEntryKey } from "./repl-session-record.js";
+import { resolvePersonName } from "./repl-person.js";
+import { REPL_SESSION_RECORD_MAX_CODE_CHARS, isValidReplSessionRecordId, normalizeBoundedString, recordEntryKey } from "./repl-session-record.js";
 
 export const HELPER_PROTOCOL_VERSION = 1;
 export const HELPER_FILES = { connection: "k.json", socket: "h.sock", ready: "ready.json", kernelLog: "kernel.log", pid: "helper.pid", kernelPid: "kernel.pid" };
@@ -87,6 +88,17 @@ const MAX_ESCAPE_CHARS = 64;
 const MAX_SPOOL_PENDING_BYTES = 64 * 1024 * 1024;
 const RETAIN = { executions: 200, bytes: 64 * 1024 * 1024, spoolBytes: 512 * 1024 * 1024 };
 const TERMINAL_STATES = new Set(["completed", "unconfirmed", "not-sent"]);
+// The request-ID prefix of the entries for cells another client of the kernel runs, such as the
+// person's prompt (REPL_SESSION_RECORD_PROTOCOL.md, "People's sends").
+export const PROMPT_REQUEST_PREFIX = "lfortran:prompt:";
+const MAX_PROMPT_CELLS = 32;
+// A prompt cell's output kept for its entry: the record keeps at most 200,000 characters of it anyway.
+const MAX_PROMPT_OUTPUT_BYTES = 256 * 1024;
+// While the record's writes are this far behind, other clients' new cells aren't recorded, so nothing piles up.
+const MAX_PROMPT_BACKLOG_ENTRIES = 64;
+const MAX_PROMPT_BACKLOG_BYTES = 16 * 1024 * 1024;
+// The cells of other clients' seen lately, so that one is never opened twice; older ones are forgotten.
+const MAX_PROMPT_KEYS = 4096;
 const REPLY_STATUSES = new Set(["ok", "error", "aborted"]);
 const SUBMISSION_ID = /^[A-Za-z0-9_-]{8,128}$/;
 // A shared-record request ID, as the other runtimes' sends use (`tool:<id>`, `command:send:<uuid>`):
@@ -602,6 +614,9 @@ function recordOutput(execution) {
 	return [received, ...notes].filter(Boolean).join("\n");
 }
 
+/** About how much memory an entry waiting to be written holds. */
+const entryBytes = (entry) => 2 * ((entry.code?.length ?? 0) + (entry.output?.length ?? 0)) + 512;
+
 /**
  * Writes the shared clean record's entries for this helper's executions, as
  * record.json says where: one entry each, `sent` until it settles, then
@@ -619,6 +634,7 @@ export class RecordWriter {
 		this.warn = warn;
 		this.workerUrl = workerUrl;
 		this.pending = new Map();
+		this.pendingBytes = 0;
 		this.settled = new Set();
 		this.failing = false;
 		this.config = undefined;
@@ -641,13 +657,23 @@ export class RecordWriter {
 		return config;
 	}
 
-	/** Queues the execution's entry as it stands now. */
+	/** Whether the entries waiting to be written are at least `entries`, or about `bytes`. */
+	behind({ entries, bytes }) {
+		return this.pending.size + (this.inFlight ? 1 : 0) >= entries || this.pendingBytes >= bytes;
+	}
+
+	/**
+	 * Queues the execution's entry as it stands now. One with `forgetSettled`, another client's
+	 * cell, isn't kept in the settled set: its caller sees that it is never queued again.
+	 */
 	queue(execution) {
 		const key = execution.recordKey;
 		if (!this.target() || execution.state === "not-sent" || this.settled.has(key)) return;
 		const settled = TERMINAL_STATES.has(execution.state);
-		if (settled) this.settled.add(key);
-		this.pending.set(key, {
+		if (settled && !execution.forgetSettled) this.settled.add(key);
+		const replaced = this.pending.get(key);
+		if (replaced) this.pendingBytes -= entryBytes(replaced);
+		const entry = {
 			id: `pi-repl:${key}`,
 			requestId: execution.recordRequestId,
 			origin: "pi-repl",
@@ -658,7 +684,10 @@ export class RecordWriter {
 			output: settled ? recordOutput(execution) : "",
 			createdAt: execution.submittedAt,
 			completedAt: settled ? execution.settledAt : null,
-		});
+			...(execution.codeOmittedChars ? { codeOmittedChars: execution.codeOmittedChars } : {}),
+		};
+		this.pending.set(key, entry);
+		this.pendingBytes += entryBytes(entry);
 		this.pump();
 	}
 
@@ -669,6 +698,7 @@ export class RecordWriter {
 		}
 		const [key, entry] = this.pending.entries().next().value;
 		this.pending.delete(key);
+		this.pendingBytes -= entryBytes(entry);
 		try {
 			this.worker ??= this.startWorker();
 		} catch (error) {
@@ -747,7 +777,7 @@ const delay = (ms) => {
  * [command, args]; the kernel gets `launchId` as PI_REPL_JUPYTER_OWNER.
  */
 export class JupyterHelper extends EventEmitter {
-	constructor({ dir, kernelCommand, launchId = randomId(), drainMs = 2000, startTimeoutMs = 120_000, killTimeoutMs = 2000, spoolCloseMs = 1000, journal = {}, output = {}, retain = {}, maxSubmissions = MAX_SUBMISSIONS, maxRequestBytes = MAX_REQUEST_LINE_BYTES, maxClientBacklogBytes = MAX_CLIENT_BACKLOG_BYTES, maxConnections = MAX_CONNECTIONS, log = () => {} }) {
+	constructor({ dir, kernelCommand, launchId = randomId(), drainMs = 2000, startTimeoutMs = 120_000, killTimeoutMs = 2000, spoolCloseMs = 1000, journal = {}, output = {}, retain = {}, maxSubmissions = MAX_SUBMISSIONS, maxRequestBytes = MAX_REQUEST_LINE_BYTES, maxClientBacklogBytes = MAX_CLIENT_BACKLOG_BYTES, maxConnections = MAX_CONNECTIONS, personName = () => resolvePersonName().name, log = () => {} }) {
 		super();
 		if (!HEX_ID.test(launchId)) throw new Error("A launch ID (owner marker) is 32 lowercase hex characters.");
 		this.dir = dir;
@@ -785,6 +815,11 @@ export class JupyterHelper extends EventEmitter {
 		this.recordWriter = new RecordWriter(join(dir, RECORD_FILE), { owner: launchId, warn: (message) => this.warn(message) });
 		// Each record entry's key, which only one execution may have.
 		this.recordKeys = new Set();
+		// Other clients' unfinished cells, by their request's session and message ID, and those seen lately.
+		this.promptCells = new Map();
+		this.promptKeys = new Set();
+		this.promptSkipped = 0;
+		this.personName = personName;
 	}
 
 	/**
@@ -1019,7 +1054,10 @@ export class JupyterHelper extends EventEmitter {
 		if (this.state === "starting") return;
 		const journalled = channel === "iopub" ? this.journal.append(journalIopub(message)) : null;
 		const execution = this.byRequest(message.parent_header?.msg_id);
-		if (!execution) return;
+		if (!execution) {
+			if (channel === "iopub") this.promptCellMessage(message);
+			return;
+		}
 		if (journalled) this.noteEvent(execution, journalled);
 		// A settled execution is fixed: later messages for it stay in the journal only.
 		if (TERMINAL_STATES.has(execution.state)) {
@@ -1138,8 +1176,108 @@ export class JupyterHelper extends EventEmitter {
 					this.settle(execution, "unconfirmed");
 				}
 			}
+			this.endPromptCells({ kind: this.kernelExit ? "kernel-exited" : kind, reason, exit: this.kernelExit ?? null });
 			this.client?.close();
 		}, this.drainMs);
+	}
+
+	// --- Other clients' cells ---
+
+	/**
+	 * A message about a cell another client of the kernel runs, such as the
+	 * person's prompt (`lfortran --connect`): IOPub is the kernel's broadcast,
+	 * so the helper sees it. The cell is recorded from its execute_input until
+	 * the kernel goes idle for it. The helper never sees that client's
+	 * execute_reply, and IOPub can drop messages under load, so a settled
+	 * entry says only that the kernel went idle: not that the cell succeeded,
+	 * nor that its output is whole. Messages about requests that aren't
+	 * cells, and the helper's own, are left to the journal.
+	 */
+	promptCellMessage(message) {
+		const parent = message.parent_header ?? {};
+		if (this.stopping || typeof parent.msg_id !== "string" || !parent.msg_id) return;
+		if (parent.session === this.client?.session?.session) return;
+		const key = `${toText(parent.session)}\0${parent.msg_id}`;
+		const type = message.header.msg_type;
+		const content = message.content ?? {};
+		let cell = this.promptCells.get(key);
+		if (!cell) {
+			if (type !== "execute_input") return;
+			// A prompt sends the line ending it was typed with; the cell is the code before it.
+			cell = this.openPromptCell(key, toText(content.code).replace(/\r?\n$/, ""));
+			if (!cell) return;
+		}
+		if (type === "stream") {
+			cell.output.write(toText(content.text));
+		} else if (type === "error") {
+			cell.reply ??= { status: "error", ename: clip(content.ename), evalue: clip(content.evalue, 4096) };
+			cell.output.block((Array.isArray(content.traceback) && content.traceback.length ? content.traceback.map(toText) : [`${toText(content.ename)}: ${toText(content.evalue)}`]).join("\n"));
+		} else if (type === "execute_result" || type === "display_data") {
+			cell.output.block(displayText(content.data));
+		} else if (type === "clear_output") {
+			cell.output.block("[output cleared]");
+		} else if (type === "status" && content.execution_state === "idle") {
+			this.settlePromptCell(cell, "completed");
+		}
+	}
+
+	/**
+	 * Starts following another client's cell, and records it as sent. Returns null, following
+	 * nothing, when the session has no record, the cell was seen already, or the record's writes
+	 * are too far behind: then it isn't recorded, and the helper says so once, and again when
+	 * recording goes on.
+	 */
+	openPromptCell(key, code) {
+		if (!this.recordWriter.target() || this.promptKeys.has(key)) return null;
+		this.promptKeys.add(key);
+		if (this.promptKeys.size > MAX_PROMPT_KEYS) this.promptKeys.delete(this.promptKeys.values().next().value);
+		if (this.recordWriter.behind({ entries: MAX_PROMPT_BACKLOG_ENTRIES, bytes: MAX_PROMPT_BACKLOG_BYTES })) {
+			if (!this.promptSkipped++) this.warn("Cells other clients run, such as at the person's prompt, aren't being recorded while the record's writes are behind.");
+			return null;
+		}
+		if (this.promptSkipped) {
+			this.warn(`Recording the cells other clients run goes on; ${this.promptSkipped} weren't recorded while the record's writes were behind.`);
+			this.promptSkipped = 0;
+		}
+		// Bounded: past the bound, the oldest unfinished one is settled, unconfirmed.
+		if (this.promptCells.size >= MAX_PROMPT_CELLS) {
+			const [oldest] = this.promptCells.values();
+			oldest.outcome = { kind: "too-many", reason: `more than ${MAX_PROMPT_CELLS} cells from other clients were unfinished at once, so the helper stopped following this one`, exit: null, started: true };
+			this.settlePromptCell(oldest, "unconfirmed");
+		}
+		// Scoped to this kernel lifetime and that client's session; a hash, whatever the IDs hold.
+		const requestId = PROMPT_REQUEST_PREFIX + createHash("sha256").update(JSON.stringify([this.lifetimeId, ...key.split("\0")])).digest("hex").slice(0, 32);
+		const recordKey = recordEntryKey(requestId);
+		// Kept as the record would keep it, and no more.
+		const bounded = normalizeBoundedString(code, REPL_SESSION_RECORD_MAX_CODE_CHARS);
+		let label;
+		try { label = this.personName(); } catch { label = "User"; }
+		const cell = {
+			// A copy: the bounded text's pieces can keep the whole message's code alive (Astra's re-check).
+			key, recordKey, recordRequestId: requestId, label, mode: "raw", code: detach(bounded.text), codeOmittedChars: bounded.omittedChars, forgetSettled: true,
+			state: "running", status: null, reply: null, outcome: null, submittedAt: Date.now(), settledAt: null,
+			output: new OutputBuffer({ maxMemoryBytes: Math.min(this.outputOptions.maxMemoryBytes ?? MAX_PROMPT_OUTPUT_BYTES, MAX_PROMPT_OUTPUT_BYTES) }),
+		};
+		this.promptCells.set(key, cell);
+		this.recordWriter.queue(cell);
+		return cell;
+	}
+
+	settlePromptCell(cell, state) {
+		cell.state = state;
+		cell.status = cell.reply?.status ?? null;
+		cell.settledAt = Date.now();
+		cell.output.close();
+		this.promptCells.delete(cell.key);
+		this.recordWriter.queue(cell);
+	}
+
+	/** Settles every unfinished cell of other clients', unconfirmed: the connection or the helper is ending. */
+	endPromptCells(outcome) {
+		for (const cell of [...this.promptCells.values()]) {
+			cell.outcome = { ...outcome, started: true };
+			this.settlePromptCell(cell, "unconfirmed");
+		}
 	}
 
 	// --- Executions ---
@@ -1159,6 +1297,7 @@ export class JupyterHelper extends EventEmitter {
 		if (requestId !== undefined && (typeof requestId !== "string" || !RECORD_REQUEST_ID.test(requestId) || requestId.trim() !== requestId)) {
 			throw new HelperRequestError("invalid-request", "A requestId is 1–300 characters, without line breaks, NUL, or space at either end.");
 		}
+		if (requestId?.startsWith(PROMPT_REQUEST_PREFIX)) throw new HelperRequestError("invalid-request", `A requestId starting ${PROMPT_REQUEST_PREFIX} names another client's cell.`);
 		const recordKey = requestId === undefined ? undefined : recordEntryKey(requestId);
 		if (typeof code !== "string" || byteLength(code) > MAX_CODE_BYTES) throw new HelperRequestError("invalid-request", "Code must be a string of at most 16 MiB.");
 		const codeHash = hashCode(code);
@@ -1485,6 +1624,7 @@ export class JupyterHelper extends EventEmitter {
 			execution.outcome = { kind: "helper-stopped", reason: "the helper stopped", exit: this.kernelExit ?? null, started: Boolean(execution.started) };
 			this.settle(execution, "unconfirmed");
 		}
+		this.endPromptCells({ kind: "helper-stopped", reason: "the helper stopped", exit: this.kernelExit ?? null });
 		for (const set of [...this.waiters.values()]) for (const waiter of [...set]) waiter.done(true);
 		this.client?.close();
 		// A start still under way gives up at its next check; it is let finish, so that nothing it opens stays open.

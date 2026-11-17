@@ -1077,3 +1077,182 @@ test("a request ID an entry ID can't hold, such as a nested tool call's, gets a 
 	assert.notEqual(recordEntryKey("tool:a/b"), recordEntryKey("tool:a\\b"));
 	assert.ok(`pi-repl:${recordEntryKey("x/".repeat(150))}`.length <= 240);
 });
+
+test("another client's cell, such as the person's prompt, is recorded from its execute_input to idle, as a raw send under the person's name", async (t) => {
+	const { helper, client } = stubbed(t, { personName: () => "Sam" });
+	client.session = { session: "stub" };
+	const file = recordFile(t);
+	const warnings = [];
+	helper.recordWriter = new RecordWriter(file.path, { owner: file.owner, warn: (message) => warnings.push(message) });
+	const entries = async () => {
+		await helper.recordWriter.drain(5000);
+		return readReplSessionRecord(file.recordId, file.identity, { root: file.root })?.entries ?? [];
+	};
+	let ids = 0;
+	const from = (session, parent, msgType, content = {}) => helper.receive("iopub", { header: { msg_id: `kernel-${++ids}`, msg_type: msgType, session: "kernel" }, parent_header: { msg_id: parent, session }, content });
+	from("person", "p1", "status", { execution_state: "busy" });
+	from("person", "p1", "execute_input", { code: "print *, 6 * 7", execution_count: 3 });
+	const [sent] = await entries();
+	assert.match(sent.requestId, /^lfortran:prompt:[0-9a-f]{32}$/);
+	assert.equal(sent.id, `pi-repl:${recordEntryKey(sent.requestId)}`);
+	assert.deepEqual([sent.status, sent.origin, sent.mode, sent.label, sent.code, sent.output], ["sent", "pi-repl", "raw", "Sam", "print *, 6 * 7", ""]);
+	from("person", "p1", "stream", { name: "stdout", text: "42\n" });
+	from("person", "p1", "status", { execution_state: "idle" });
+	let recorded = await entries();
+	assert.deepEqual(recorded.map((e) => [e.id, e.status, e.output]), [[sent.id, "captured", "42"]], "the same entry, settled: never a second one");
+	assert.ok(recorded[0].completedAt >= recorded[0].createdAt);
+	// A failure the kernel publishes is noted; the entry is still captured: the kernel went idle.
+	from("person", "p2", "execute_input", { code: "print *, y" });
+	from("person", "p2", "error", { ename: "CompilerError", evalue: "Variable 'y' is not declared", traceback: ["semantic error: Variable 'y' is not declared"] });
+	from("person", "p2", "status", { execution_state: "idle" });
+	// Requests that aren't cells, the helper's own session, and messages after a cell has settled aren't recorded.
+	from("person", "p3", "status", { execution_state: "busy" });
+	from("person", "p3", "status", { execution_state: "idle" });
+	from("stub", "own-stray", "execute_input", { code: "print *, 'probe'" });
+	from("person", "p1", "stream", { name: "stdout", text: "late\n" });
+	recorded = await entries();
+	assert.deepEqual(recorded.map((e) => [e.code, e.status, e.output]).sort(), [
+		["print *, 6 * 7", "captured", "42"],
+		["print *, y", "captured", "semantic error: Variable 'y' is not declared\n[The cell failed: CompilerError.]"],
+	]);
+	// The same session and message ID under another kernel lifetime is another entry.
+	const { helper: other, client: otherClient } = stubbed(t, { personName: () => "Sam" });
+	otherClient.session = { session: "stub" };
+	other.recordWriter = helper.recordWriter;
+	other.receive("iopub", { header: { msg_id: "k", msg_type: "execute_input", session: "kernel" }, parent_header: { msg_id: "p1", session: "person" }, content: { code: "print *, 6 * 7" } });
+	recorded = await entries();
+	assert.equal(recorded.length, 3);
+	assert.equal(recorded.filter((e) => e.code === "print *, 6 * 7").length, 2, "another lifetime's cell is another entry");
+	other.recordWriter = new RecordWriter(join(file.dir, "missing.json"), { owner: file.owner, warn: () => {} });
+	assert.deepEqual(warnings, []);
+});
+
+test("other clients' unfinished cells are bounded, and settle unconfirmed when the connection ends", async (t) => {
+	const { helper, client } = stubbed(t, { personName: () => "Sam" });
+	client.session = { session: "stub" };
+	const file = recordFile(t);
+	helper.recordWriter = new RecordWriter(file.path, { owner: file.owner, warn: () => {} });
+	const entries = async () => {
+		await helper.recordWriter.drain(5000);
+		return readReplSessionRecord(file.recordId, file.identity, { root: file.root })?.entries ?? [];
+	};
+	for (let i = 0; i <= 32; i++) {
+		helper.receive("iopub", { header: { msg_id: `k${i}`, msg_type: "execute_input", session: "kernel" }, parent_header: { msg_id: `p${i}`, session: "person" }, content: { code: `print *, ${i}` } });
+	}
+	let recorded = await entries();
+	assert.equal(recorded.length, 33);
+	// Cells opened in one millisecond have no order in the record: each is found by its code.
+	const oldest = recorded.find((e) => e.code === "print *, 0");
+	assert.deepEqual([oldest.status, oldest.output], ["error", "[Outcome unconfirmed: more than 32 cells from other clients were unfinished at once, so the helper stopped following this one; it had started.]"]);
+	assert.ok(recorded.filter((e) => e !== oldest).every((e) => e.status === "sent"));
+	helper.receive("iopub", { header: { msg_id: "out", msg_type: "stream", session: "kernel" }, parent_header: { msg_id: "p32", session: "person" }, content: { name: "stdout", text: "partial\n" } });
+	helper.endAdmission("connection-lost", "the connection to the kernel was lost (iopub)");
+	await until(() => helper.promptCells.size === 0, { what: "the unfinished cells to settle" });
+	recorded = await entries();
+	assert.ok(recorded.every((e) => e.status === "error"));
+	assert.equal(recorded.find((e) => e.code === "print *, 32").output, "partial\n[Outcome unconfirmed: the connection to the kernel was lost (iopub); it had started.]");
+});
+
+test("a cell another client runs on a real connection is recorded, with its output", async (t) => {
+	const dir = privateDir(t);
+	const file = recordFile(t);
+	const launchId = randomBytes(16).toString("hex");
+	writeFileSync(join(dir, "record.json"), JSON.stringify({ recordId: file.recordId, root: file.root, owner: launchId, identity: file.identity }), { mode: 0o600 });
+	const helper = new JupyterHelper({ dir, kernelCommand: fakeKernel, launchId, personName: () => "Sam", drainMs: 300, startTimeoutMs: 15_000 });
+	defer(t, () => helper.stop({ killKernel: true }));
+	await helper.start();
+	const other = await JupyterClient.connect(readConnectionFile(helper.paths.connection), { timeoutMs: 10_000 });
+	defer(t, () => other.close());
+	const request = other.prepareExecute("print:from the prompt");
+	const done = waitForExecution(other, request, { timeoutMs: 5000 });
+	other.post("shell", request);
+	await done;
+	await until(() => helper.promptCells.size === 0, { what: "the cell to settle" });
+	await helper.recordWriter.drain(5000);
+	const entries = readReplSessionRecord(file.recordId, file.identity, { root: file.root })?.entries ?? [];
+	assert.deepEqual(entries.map((e) => [e.status, e.mode, e.label, e.code, e.output]), [["captured", "raw", "Sam", "print:from the prompt", "from the prompt"]]);
+	assert.match(entries[0].requestId, /^lfortran:prompt:[0-9a-f]{32}$/);
+});
+
+test("other clients' finished cells don't pile up while the record's writes are behind, nor do their keys or their code (Astra's review)", async (t) => {
+	const { helper, client } = stubbed(t, { personName: () => "Sam" });
+	client.session = { session: "stub" };
+	const file = recordFile(t);
+	const warnings = [];
+	helper.warn = (message) => warnings.push(message);
+	helper.recordWriter = new RecordWriter(file.path, { owner: file.owner, warn: (message) => warnings.push(message) });
+	// Another writer holds the record's lock, so nothing this helper queues is written.
+	mkdirSync(file.root, { recursive: true, mode: 0o700 });
+	const lock = join(file.root, `${file.recordId}.record.lock`);
+	mkdirSync(lock, { mode: 0o700 });
+	writeFileSync(join(lock, "owner.json"), JSON.stringify({ token: "other", pid: process.pid, createdAt: Date.now() }));
+	let ids = 0;
+	const cell = (n, code = `print *, ${n}`) => {
+		const parent = { msg_id: `p${n}`, session: "person" };
+		helper.receive("iopub", { header: { msg_id: `k${++ids}`, msg_type: "execute_input", session: "kernel" }, parent_header: parent, content: { code } });
+		helper.receive("iopub", { header: { msg_id: `k${++ids}`, msg_type: "stream", session: "kernel" }, parent_header: parent, content: { name: "stdout", text: "x".repeat(64 * 1024) } });
+		helper.receive("iopub", { header: { msg_id: `k${++ids}`, msg_type: "status", session: "kernel" }, parent_header: parent, content: { execution_state: "idle" } });
+	};
+	for (let n = 0; n < 300; n++) cell(n);
+	const writer = helper.recordWriter;
+	assert.equal(helper.promptCells.size, 0);
+	assert.ok(writer.pending.size <= 64, `${writer.pending.size} entries wait to be written`);
+	assert.ok(writer.pendingBytes <= 17 * 1024 * 1024, `${writer.pendingBytes} bytes wait to be written`);
+	assert.equal(writer.settled.size, 0, "another client's settled cells aren't kept in the writer's settled set");
+	assert.equal(helper.recordKeys.size, 0, "nor among the helper's own keys");
+	assert.deepEqual(warnings, ["Cells other clients run, such as at the person's prompt, aren't being recorded while the record's writes are behind."]);
+	// Its seen keys are bounded too; a cell seen already is never opened again, so a settled entry isn't rewritten.
+	for (let n = 300; n < 4500; n++) {
+		helper.receive("iopub", { header: { msg_id: `k${++ids}`, msg_type: "execute_input", session: "kernel" }, parent_header: { msg_id: `p${n}`, session: "person" }, content: { code: "" } });
+	}
+	assert.equal(helper.promptKeys.size, 4096);
+	// The writes go on: once they catch up, recording goes on, and says how many cells it missed.
+	rmSync(lock, { recursive: true, force: true });
+	await writer.drain(20_000);
+	const before = readReplSessionRecord(file.recordId, file.identity, { root: file.root }).entries.length;
+	cell(5000, "x".repeat(250_000));
+	await writer.drain(10_000);
+	const entries = readReplSessionRecord(file.recordId, file.identity, { root: file.root }).entries;
+	assert.equal(entries.length, before + 1);
+	assert.match(warnings.at(-1), /^Recording the cells other clients run goes on; \d+ weren't recorded while the record's writes were behind\.$/);
+	// A cell's code is kept as the record keeps it, and says how much was left out.
+	const long = entries.find((entry) => entry.code.startsWith("xxx"));
+	assert.ok(long.code.length <= 200_000);
+	assert.equal(long.codeOmittedChars, 250_000 - (200_000 - 96));
+	// The helper's own requests can't take the prefix that names other clients' cells.
+	assert.throws(() => helper.execute({ lifetimeId: helper.lifetimeId, submissionId: "own-prefixed-1", code: "print:a", requestId: "lfortran:prompt:abc" }), (error) => error.code === "invalid-request");
+});
+
+test("another client's cells waiting behind a stalled writer don't keep their large code alive (Astra's re-check)", (t) => {
+	v8.setFlagsFromString("--expose-gc");
+	const gc = vm.runInNewContext("gc");
+	const heap = () => {
+		gc();
+		gc();
+		return process.memoryUsage().heapUsed;
+	};
+	const { helper, client } = stubbed(t, { personName: () => "Sam" });
+	client.session = { session: "stub" };
+	// A writer that has a target and never writes: every entry waits.
+	const writer = new RecordWriter("/nonexistent/record.json", { owner: "o", warn: () => {} });
+	writer.config = { recordId: "r", root: "/nonexistent", identity: {} };
+	writer.pump = () => {};
+	helper.recordWriter = writer;
+	let ids = 0;
+	// In a function of its own, so that this test's frame doesn't still hold the last message when the heap is measured.
+	const feed = () => {
+		for (let n = 0; n < 8; n++) {
+			const parent = { msg_id: `p${n}`, session: "person" };
+			// 4 MiB strings on V8's heap, each its own (a string made from a Buffer may be stored outside it).
+			const code = String.fromCharCode(97 + n).repeat(4 * 1024 * 1024);
+			helper.receive("iopub", { header: { msg_id: `k${++ids}`, msg_type: "execute_input", session: "kernel" }, parent_header: parent, content: { code } });
+			helper.receive("iopub", { header: { msg_id: `k${++ids}`, msg_type: "status", session: "kernel" }, parent_header: parent, content: { execution_state: "idle" } });
+		}
+	};
+	const before = heap();
+	feed();
+	assert.equal(helper.promptCells.size, 0);
+	assert.equal(writer.pending.size, 8);
+	const grown = (heap() - before) / (1024 * 1024);
+	assert.ok(grown < 8, `${grown.toFixed(1)} MiB kept for 8 cells of 4 MiB, each bounded to 200,000 characters`);
+});

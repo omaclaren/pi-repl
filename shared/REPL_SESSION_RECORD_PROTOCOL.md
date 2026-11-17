@@ -96,6 +96,13 @@ These are conventions within version 1. They add no fields, so older writers kee
 | `cli:send:<uuid>`, `cli:env:<uuid>` | `pi-repl` | `agent-repl send` and `agent-repl env` | terminal |
 | `studio:send:<uuid>` | `pi-studio` | Pi Studio's editor sends | Pi Studio |
 | `studio:note:<uuid>` | `pi-studio` | both of Pi Studio's note routes, assigned when the note is created | Pi Studio |
+| `lfortran:prompt:<32 hex>` | `pi-repl` | LFortran's helper, for a cell another client of its kernel ran | LFortran prompt |
+
+**LFortran prompt cells.** LFortran's helper sees every cell its kernel runs on the kernel's IOPub broadcast. It records each cell that another client ran, from that client's `execute_input` until IOPub `status: idle` for it, with `mode: "raw"`. The 32 hex characters are the start of SHA-256 over the helper's kernel lifetime, the client's session and its request's `msg_id`, so an entry is scoped to one kernel run and one client. Three things a reader should know:
+
+- **The name is assumed.** The helper can't tell clients apart. The label is the session's person's name, because the client is normally the person's `lfortran --connect` prompt. A client an agent connected by hand would be recorded the same way.
+- **`captured` claims only that the kernel went idle for the cell.** It doesn't mean the cell succeeded, or that its output is whole: the helper never sees the other client's `execute_reply`, and IOPub can drop messages under load. A failure shows only as what the kernel published for the cell. `error` means the helper stopped following the cell before idle: the kernel or connection ended, or too many such cells were unfinished at once.
+- **Clients send through the helper.** pi-repl-family clients send LFortran cells through the helper's socket, so they are the helper's own entries. A client with its own Jupyter connection to the kernel would have its cells recorded here, under the person's name.
 
 The label is a chosen name only under one of these prefixes, on its matching origin. The prefix is a hint for display, not identity, authorisation or idempotency, and request IDs stay unique. Names are self-declared, so they suit collaborators who trust each other, not auditing. pi-repl's clients take the name from `PI_REPL_USER_NAME`, then the account's shared setting (`person.json` in `$XDG_CONFIG_HOME/pi-repl/`, else `~/.config/pi-repl/`), then `User`. Names are trimmed, at most 80 characters, with no control characters. Older person entries, with `command:send:` or `command:env:` and labels such as `/repl send`, keep them; records aren't rewritten.
 
@@ -125,7 +132,7 @@ Attribution-sensitive sends also take a separate cross-client send lease. A comp
 
 ## Clean record versus raw history
 
-The clean record includes submissions whose semantic boundaries are known to a compatible client, plus explicit literate notes. Code typed directly into tmux is retained only in the raw pane/history mirror unless future runtime-specific instrumentation can establish reliable boundaries. LFortran's helper records only the cells sent through it, not those run at LFortran's own prompt, so no reader can report those. Clients must not present raw `pipe-pane` output as reliably parsed code/output.
+The clean record includes submissions whose semantic boundaries are known to a compatible client, plus explicit literate notes. Code typed directly into tmux is retained only in the raw pane/history mirror unless future runtime-specific instrumentation can establish reliable boundaries. LFortran's helper records the cells sent through it and, best effort, those other clients of its kernel ran, such as LFortran's own prompt (see "LFortran prompt cells" above). Clients must not present raw `pipe-pane` output as reliably parsed code/output.
 
 Canonical Markdown exports identify origin, mode, status, runtime, and timestamp and include this direct-input limitation.
 

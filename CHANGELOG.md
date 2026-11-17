@@ -4,7 +4,14 @@ All notable changes to `pi-repl` are documented here.
 
 ## [Unreleased]
 
+### Added
+- Cells you run at LFortran's own prompt are recorded in the session's clean record, under your name, so the agent is told of them, `/repl export lfortran` includes them, and readers show them as "<name> · via LFortran prompt". pi-repl's helper sees them on the kernel's broadcast to its clients, so it's best effort: an entry is `captured` once the kernel goes idle for the cell, which doesn't say the cell succeeded or that its output is whole, and a burst of output can lose messages. Any other client connected to the kernel is recorded the same way. The entries keep to version 1 of the record, with the request-ID prefix `lfortran:prompt:` (`shared/REPL_SESSION_RECORD_PROTOCOL.md`, "LFortran prompt cells"); Pi Studio and the REPL page agreed the format. The start and attach notices say so.
+
+### Changed
+- `docs/runtimes.md` no longer says that your LFortran prompt shows pi's cells only when you next press Enter, or that a cell's output arrives only when it ends: LFortran fixed both on 29 Oct ([lfortran/lfortran#16303](https://github.com/lfortran/lfortran/issues/16303), [#16182](https://github.com/lfortran/lfortran/issues/16182)).
+
 ### Fixed
+- `/repl stop lfortran` refused, keeping the session's folder, when one of your processes it had to check for the session's marker couldn't be read for a moment, as an app that's just starting can't. It now reads such a process again, up to three more times, before refusing, and the refusal names the program.
 - When a person's send to Rust (`/repl send rust`, or `agent-repl send rust`) was refused because evcxr wasn't at an empty prompt, the message said "Nothing was sent:" twice. It now says it once, and asks you to look at the pane and send again once evcxr is at an empty prompt, in place of naming the agent's `repl_status` tool.
 
 ## [0.13.0] — 2026-11-13

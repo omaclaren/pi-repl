@@ -92,10 +92,10 @@ test("/repl parses lfortran and input, keeping an answer's text exactly", async 
 	assert.match((await f.repl("input"))[0].message, /Usage: \/repl input <text>, or \/repl input <token> <text>/);
 	assert.match((await f.repl("status lfortran"))[0].message, /No shared LFortran session is running/);
 	assert.match((await f.repl("help"))[0].message, /\/repl lfortran[\s\S]*\/repl input <text>/);
-	// The agent isn't told what the person's pane shows, so the attach instructions don't say it is.
+	// The agent isn't shown the person's pane, but is told of the cells run at its prompt, which the helper records.
 	const [attach] = await f.repl("attach lfortran");
 	assert.match(attach.message, /^tmux attach -t pi-repl-lfortran$/m);
-	assert.match(attach.message, /not what you run there/);
+	assert.match(attach.message, /The cells you run there are recorded under your name\.\nOther clients' entries in the shared record, with their code, output, notes and names, go to the agent/);
 	assert.doesNotMatch(attach.message, /Pane text/);
 	assert.ok(f.tools.has("repl_input"));
 	assert.ok(f.tools.get("repl_start").parameters.properties.runtime.enum.includes("lfortran"));
@@ -337,11 +337,22 @@ test("with LFortran: repl_start, repl_send, and a READ through repl_input", { sk
 	assert.match(entries()[2].output, /'no_such_variable' is not declared[\s\S]*\n\[The cell failed: CompilerError\.\]$/);
 	assert.equal(entries()[2].output.match(/is not declared/g).length, 1);
 	assert.doesNotMatch(entries()[2].output, /\x1b/);
+	// A cell run at the person's own prompt is recorded too, under the person's name.
+	const [person] = await f.windows();
+	for (const key of "print *, 6 * 7") {
+		await f.tmux(["send-keys", "-t", person[2], "-l", key]);
+		await new Promise((resolve) => setTimeout(resolve, 20));
+	}
+	await f.tmux(["send-keys", "-t", person[2], "Enter"]);
+	await until(() => entries().some((entry) => entry.code === "print *, 6 * 7" && entry.status === "captured"), { what: "the prompt's cell, settled", timeoutMs: 30_000 });
+	const typed = entries().find((entry) => entry.code === "print *, 6 * 7");
+	assert.match(typed.requestId, /^lfortran:prompt:[0-9a-f]{32}$/);
+	assert.deepEqual([typed.mode, typed.output.trim()], ["raw", "42"]);
 	const [stopped] = await f.repl("stop lfortran");
 	assert.match(stopped.message, /Stopped the shared LFortran session/);
 });
 
-test("the agent is told of other clients' LFortran cells, the helper's later settled write as an update, and not of its own cells or what's typed at the prompt", async (t) => {
+test("the agent is told of other clients' LFortran cells, the helper's later settled write as an update, and the cells run at the prompt, but not of its own cells", async (t) => {
 	const f = await piFixture(t);
 	if (!f) return;
 	assert.equal((await f.start()).details.ready, true);
@@ -389,17 +400,22 @@ test("the agent is told of other clients' LFortran cells, the helper's later set
 	const toldEnd = await runStart();
 	assert.match(toldEnd?.content ?? "", /\[updated · entry pi-repl:tool:[^\]]* · Pi · captured · [^\]]*\]\n```fortran\nread\n```\n```text\ngot 6\n```/);
 	await f.given(toldEnd.content);
-	// What's typed at LFortran's own prompt isn't recorded, so it can't be told.
+	// A cell run at LFortran's own prompt is recorded by the helper, from the kernel's broadcast, under the person's name, and told once.
 	const [person] = await f.windows();
 	await f.tmux(["send-keys", "-t", person[2], "-l", "print:typed at the prompt"]);
 	await f.tmux(["send-keys", "-t", person[2], "Enter"]);
-	await until(async () => (await f.pane(person[2])).includes("typed at the prompt\n"), { what: "the prompt's cell" });
-	assert.equal(entries().some((entry) => entry.code.includes("typed")), false);
-	assert.equal(await runStart(), undefined);
+	await until(() => entries().some((entry) => entry.code === "print:typed at the prompt" && entry.status === "captured"), { what: "the prompt's cell, settled" });
+	const typed = entries().find((entry) => entry.code === "print:typed at the prompt");
+	assert.match(typed.requestId, /^lfortran:prompt:[0-9a-f]{32}$/);
+	assert.deepEqual([typed.origin, typed.mode, typed.output.trim()], ["pi-repl", "raw", "typed at the prompt"]);
+	const toldTyped = await runStart();
+	assert.match(toldTyped?.content ?? "", /\[entry pi-repl:lfortran:prompt:[0-9a-f]{32} · [^·\]]+ · via LFortran prompt · captured · [^\]]*\]\n```fortran\nprint:typed at the prompt\n```\n```text\ntyped at the prompt\n```$/);
+	await f.given(toldTyped.content);
+	assert.equal(await runStart(), undefined, "once told, not again");
 	assert.doesNotMatch(text(await f.send("print:last")), /typed at the prompt/);
-	// repl_history finds every cell recorded, and only those.
+	// repl_history finds every cell recorded.
 	const history = text(await f.tool("repl_history", { runtime: "lfortran" }));
 	assert.match(history, new RegExp(`- pi-repl:${requestId} · Ada · via terminal · captured`));
-	assert.doesNotMatch(history, /typed/);
+	assert.match(history, /- pi-repl:lfortran:prompt:[0-9a-f]{32} · [^·\n]+ · via LFortran prompt · captured/);
 	assert.match(text(await f.tool("repl_history", { runtime: "lfortran", entryId: `pi-repl:${requestId}` })), /```text\ngot 7\n```/);
 });

@@ -40,7 +40,7 @@ export async function startLfortranRuntime({ tmux, cwd, timeoutMs = 30_000, sign
 	const lines = [
 		started.created ? `Started the shared LFortran session: ${LFORTRAN_SESSION_NAME}` : `The shared LFortran session is already running; reused without restarting it (${LFORTRAN_SESSION_NAME}).`,
 		...(preflight ? [`LFortran: ${preflight.version || "version unknown"} (${preflight.path}).`] : []),
-		"The person's window, the session's first, is LFortran's own prompt (lfortran --connect); the kernel and pi-repl's helper run in the second.",
+		"The person's window, the session's first, is LFortran's own prompt (lfortran --connect); the kernel and pi-repl's helper run in the second. Cells run at that prompt are recorded under the person's name.",
 		started.ready ? "Readiness: the helper and kernel are ready, and LFortran's prompt is shown." : started.failure ? `The session isn't usable: ${started.failure}. Stop it with ${STOP}.` : `Readiness: not confirmed within ${timeoutMs} ms (helper and kernel: ${started.hello?.state === "ready" ? "ready" : "not yet"}; the person's prompt: ${started.prompt ? "shown" : started.promptEnded ? "ended" : "not yet"}). The session keeps starting; check repl_status target='lfortran'.`,
 		...started.warnings.map((warning) => `Warning: ${warning}`),
 		`Attach: ${ATTACH}`,

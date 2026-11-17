@@ -134,7 +134,8 @@ function assertSafeRecordFile(path) {
 	return info;
 }
 
-function normalizeBoundedString(value, maxChars) {
+/** A string as the record keeps it within `maxChars`: its head and tail, with a marker, and how many characters were left out. */
+export function normalizeBoundedString(value, maxChars) {
 	const text = typeof value === "string" ? value.replace(/\r\n/g, "\n").replace(/\r/g, "\n") : "";
 	if (text.length <= maxChars) return { text, omittedChars: 0 };
 	const markerBudget = 96;

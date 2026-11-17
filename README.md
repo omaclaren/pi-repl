@@ -68,7 +68,7 @@ Sessions start through your normal interactive login shell, in Pi's working dire
 
 ### LFortran sessions (experimental)
 
-`lfortran` needs a build of LFortran's `main` branch with its shared session (`lfortran --connect`); no release has it yet. You work at LFortran's own prompt in the session's first window, and Pi's cells go to the same kernel through pi-repl's helper in the second, so you share variables and procedures. When one of Pi's cells reaches a READ, Pi answers with `repl_input`, or you can with `/repl input <text>`. Cells you run at your own prompt aren't recorded, so the agent isn't told of them.
+`lfortran` needs a build of LFortran's `main` branch with its shared session (`lfortran --connect`); no release has it yet. You work at LFortran's own prompt in the session's first window, and Pi's cells go to the same kernel through pi-repl's helper in the second, so you share variables and procedures. When one of Pi's cells reaches a READ, Pi answers with `repl_input`, or you can with `/repl input <text>`. Cells you run at your own prompt are recorded under your name too, so the agent is told of them, best effort ([details](docs/runtimes.md#lfortran-sessions-experimental)).
 
 For now, a runtime error in any cell ends the session for everyone, a cell's output arrives when it ends, and a running cell can't be interrupted.
 

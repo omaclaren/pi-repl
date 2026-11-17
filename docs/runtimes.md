@@ -150,22 +150,26 @@ integer :: n = 41
 print *, n + 1
 ```
 
-Send complete Fortran: declarations, statements, or whole program units. The kernel runs one cell at a time, and pi-repl refuses to send a cell while one it sent is unresolved. Each result gives the cell's status from the kernel and its output. A send's timeout stops waiting, not the cell; `repl_status` with `target: "lfortran"` and the result's execution ID follows it. Your prompt shows pi's cells, marked `[other client]`, when you next press Enter there ([lfortran/lfortran#16303](https://github.com/lfortran/lfortran/issues/16303)).
+Send complete Fortran: declarations, statements, or whole program units. The kernel runs one cell at a time, and pi-repl refuses to send a cell while one it sent is unresolved. Each result gives the cell's status from the kernel and its output. A send's timeout stops waiting, not the cell; `repl_status` with `target: "lfortran"` and the result's execution ID follows it. Your prompt shows pi's cells and their output as they run, marked `[other client]`, even while you aren't typing there.
 
 When one of pi's cells reaches a READ, the result says so. Pi answers it with `repl_input`, and you can answer it from Pi with `/repl input <text>`; the text is sent as given, spaces included. pi-repl doesn't write answers to its files, but they go through Pi's conversation, so don't use them for secrets.
 
 Some limits come from LFortran as it is now:
 
 - A runtime error in any cell, such as an out-of-bounds index or `error stop`, ends the session for everyone.
-- A cell's output arrives when the cell ends, not while it runs ([lfortran/lfortran#16182](https://github.com/lfortran/lfortran/issues/16182)).
 - Nothing can interrupt a running cell ([lfortran/lfortran#16183](https://github.com/lfortran/lfortran/issues/16183)). Ctrl-C at your prompt during a cell ends your prompt but not the session; `/repl status lfortran` gives the command to rejoin.
 
 And some features of the other runtimes aren't there yet:
 
-- Cells you run at your prompt aren't in the clean record, as typing into the other runtimes' panes isn't. So the agent can't be told of them: it isn't shown your prompt's pane, and what it's told of the record can't include them.
 - Echo modes don't apply: your prompt shows each of pi's cells in full.
 - pi-studio lists the session but doesn't send to it. Its Interrupt sends Ctrl-C to your prompt.
 
 The cells sent through pi-repl, the agent's and `/repl send lfortran`'s, are in the session's clean record, as the other runtimes' sends are. Each entry is `sent` until the cell finishes, then `captured`, or `error` if its outcome couldn't be confirmed. A cell that failed keeps its output, with a last line saying so. The agent is told of other clients' cells, such as another conversation's `/repl send lfortran` or `agent-repl send lfortran`, as of the other runtimes' sends ([details](details.md#record-entries)). `/repl status lfortran` shows where the record is, and `/repl export lfortran` writes it as Markdown.
+
+The cells you run at your prompt are recorded too, under your name, and shown as "<name> · via LFortran prompt". The agent isn't shown your prompt's pane, so this is how it is told of them. The helper sees them on the kernel's broadcast to its clients, which makes it best effort:
+
+- An entry is `sent` from when the cell starts until the kernel goes idle for it, then `captured`; `error` means the session ended first. `captured` says only that the cell ended. The helper never sees the kernel's reply to your prompt, so a failure shows only as the output LFortran printed for it.
+- Under a heavy burst of output the broadcast can drop messages, so an entry can lack some of its output, or a cell can be missed, without the helper knowing.
+- Any other client connected to the kernel is recorded the same way, under your name. Only your prompt connects unless you, or an agent of yours, connect another to the session's private connection file.
 
 `/repl stop lfortran` ends your prompt, the helper and the kernel, and checks that they have exited, which discards the session's state for everyone. On macOS the check needs an existing `python3`, as gnuplot's stop does.
