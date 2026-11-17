@@ -4,6 +4,8 @@ All notable changes to `pi-repl` are documented here.
 
 ## [Unreleased]
 
+## [0.13.1] — 2026-11-17
+
 ### Added
 - Cells you run at LFortran's own prompt are recorded in the session's clean record, under your name, so the agent is told of them, `/repl export lfortran` includes them, and readers show them as "<name> · via LFortran prompt". pi-repl's helper sees them on the kernel's broadcast to its clients, so it's best effort: an entry is `captured` once the kernel goes idle for the cell, which doesn't say the cell succeeded or that its output is whole, and a burst of output can lose messages. Any other client connected to the kernel is recorded the same way. The entries keep to version 1 of the record, with the request-ID prefix `lfortran:prompt:` (`shared/REPL_SESSION_RECORD_PROTOCOL.md`, "LFortran prompt cells"); Pi Studio and the REPL page agreed the format. The start and attach notices say so.
 
