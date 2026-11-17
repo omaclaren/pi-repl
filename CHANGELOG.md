@@ -4,6 +4,9 @@ All notable changes to `pi-repl` are documented here.
 
 ## [Unreleased]
 
+### Fixed
+- When a person's send to Rust (`/repl send rust`, or `agent-repl send rust`) was refused because evcxr wasn't at an empty prompt, the message said "Nothing was sent:" twice. It now says it once, and asks you to look at the pane and send again once evcxr is at an empty prompt, in place of naming the agent's `repl_status` tool.
+
 ## [0.13.0] — 2026-11-13
 
 ### Added

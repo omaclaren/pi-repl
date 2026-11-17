@@ -351,6 +351,9 @@ test("rust shares evcxr's variables with the pane, sends only at an empty prompt
 	await typeSlowly(f, pane, "let half = 1");
 	count = f.calls.length;
 	await assert.rejects(f.send("seed"), /Nothing was sent: evcxr isn't waiting at an empty prompt; something is typed at the prompt \(\"let half = 1\"\)\./);
+	// A person's send (/repl send, agent-repl send) says "Nothing was sent" once.
+	const personSend = f.module.sendAndSettle(f.pi, f.ctx, { code: "seed", target: "rust", requestId: `command:send:${randomUUID()}`, label: "/repl send" });
+	await assert.rejects(personSend, /^Error: Nothing was sent: evcxr isn't waiting at an empty prompt; something is typed at the prompt \(\"let half = 1\"\)\. .*send again once evcxr is at an empty prompt\.$/);
 	assert.ok(f.calls.slice(count).every((call) => !["paste-buffer", "send-keys", "load-buffer"].includes(call.args[0])));
 	await f.tmux("send-keys", "-t", pane, "C-u");
 	await settled();

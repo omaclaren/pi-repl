@@ -2515,7 +2515,7 @@ async function checkRustReady(pi: ExtensionAPI, paneTarget: string, cwd: string)
 	if (!raw || !RUST_PROMPT.test(row)) {
 		const typed = isRustPromptRow(row) ? row.trimEnd().replace(/^>> ?/, "") : "";
 		const why = !raw ? "a cell is still running" : typed ? `something is typed at the prompt (${JSON.stringify(typed.slice(0, 60))})` : "the cursor isn't at evcxr's prompt";
-		throw new Error(`Nothing was sent: evcxr isn't waiting at an empty prompt; ${why}. pi-repl sends to Rust only then, as evcxr can lose input that arrives while a cell runs. Check the pane with repl_status, then send again.`);
+		throw new Error(`Nothing was sent: evcxr isn't waiting at an empty prompt; ${why}. pi-repl sends to Rust only then, as evcxr can lose input that arrives while a cell runs. Look at the pane, and send again once evcxr is at an empty prompt.`);
 	}
 	return tty;
 }
@@ -3482,7 +3482,8 @@ export type SettledSendOptions = {
  * Errors before the code is sent start "Nothing was sent".
  */
 export async function sendAndSettle(pi: ExtensionAPI, ctx: ExtensionContext, options: SettledSendOptions): Promise<{ output: string; details: ReplSendDetails & { noticed: boolean } }> {
-	const notSent = (why: string) => new Error(`Nothing was sent: ${why}`);
+	// Some reasons, such as a Rust pane that isn't at an empty prompt, already say so.
+	const notSent = (why: string) => new Error(why.startsWith("Nothing was sent") ? why : `Nothing was sent: ${why}`);
 	const target = normalizeReplSendTarget(options.target) ?? "python";
 	const sessionName = getSessionNameForSelector(target);
 	if (!options.code.trim()) throw notSent("the code is empty.");
