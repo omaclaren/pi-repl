@@ -5,9 +5,9 @@ import assert from "node:assert/strict";
 import { execFile } from "node:child_process";
 import { randomUUID } from "node:crypto";
 import { getEventListeners } from "node:events";
-import { mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
+import { mkdirSync, mkdtempSync, readFileSync, realpathSync, renameSync, rmSync, writeFileSync } from "node:fs";
 import net from "node:net";
-import { join } from "node:path";
+import { dirname, join } from "node:path";
 import { promisify } from "node:util";
 import { DEFAULT_MAX_BYTES } from "@earendil-works/pi-coding-agent";
 import { visibleWidth } from "@earendil-works/pi-tui";
@@ -256,6 +256,25 @@ test("the session's clean record: an entry for each cell, as the other runtimes'
 		assert.match((await f.repl("export lfortran"))[0].message, /^pi-repl-lfortran has no clean record to export/);
 	}
 	writeFileSync(file, original);
+});
+
+test("PI_REPL_LFORTRAN names an lfortran that isn't on PATH, and the command to rejoin uses its path", async (t) => {
+	const f = await piFixture(t);
+	if (!f) return;
+	// The fixture's lfortran, moved off PATH to a folder whose name needs quoting.
+	const binary = join(f.base, "lfortran build", "lfortran");
+	mkdirSync(dirname(binary));
+	renameSync(f.lfortran, binary);
+	process.env.PI_REPL_LFORTRAN = binary;
+	defer(t, () => { delete process.env.PI_REPL_LFORTRAN; });
+	const started = await f.start();
+	assert.equal(started.details.ready, true, text(started));
+	assert.ok(text(started).includes(`(${realpathSync(binary)}, from PI_REPL_LFORTRAN).`), text(started));
+	assert.match(text(await f.send("print:hello")), /Output:\nhello$/);
+	await f.tmux(["send-keys", "-t", (await f.windows())[0][2], "C-d"]);
+	await until(async () => (await f.windows())[0][4] === "1", { what: "the person's pane to end" });
+	const status = text(await f.status({ target: "lfortran" }));
+	assert.ok(status.includes(`They can rejoin with: '${realpathSync(binary)}' --connect `), status);
 });
 
 test("a cell that ends the kernel: its outcome is unconfirmed, the session says it's over, and it still stops", async (t) => {

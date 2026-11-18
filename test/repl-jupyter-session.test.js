@@ -62,7 +62,32 @@ test("preflight finds lfortran through the login shell, and requires its shared 
 	answers.set("/bin/sh -i -l -c command -v lfortran", { code: 1, stdout: "" });
 	await assert.rejects(preflightLfortran({ shell: "/bin/sh", run }), /wasn't found by your login shell/);
 	answers.set("/bin/sh -i -l -c command -v lfortran", { code: 0, stdout: "alias lfortran=something\n" });
-	await assert.rejects(preflightLfortran({ shell: "/bin/sh", run }), /wasn't found/);
+	await assert.rejects(preflightLfortran({ shell: "/bin/sh", run }), /wasn't found[\s\S]*or PI_REPL_LFORTRAN set to its absolute path\.$/);
+});
+
+test("preflight uses the lfortran PI_REPL_LFORTRAN names, without asking the login shell", async () => {
+	const realTrue = (await import("node:fs")).realpathSync("/usr/bin/true");
+	const answers = new Map([
+		[`${realTrue} --help`, { code: 0, stdout: "  --connect TEXT  Run the prompt in the kernel\n" }],
+		[`${realTrue} kernel --help`, { code: 0, stdout: "  --managed  Stop when the last client disconnects\n" }],
+		[`${realTrue} --version`, { code: 0, stdout: "LFortran version: 0.67.0\n" }],
+	]);
+	const calls = [];
+	const run = async (file, args) => {
+		calls.push([file, ...args].join(" "));
+		return { stderr: "", ...(answers.get([file, ...args].join(" ")) ?? { code: 1, stdout: "" }) };
+	};
+	assert.deepEqual(await preflightLfortran({ shell: "/bin/sh", run, configured: "/usr/bin/true" }), { path: realTrue, version: "LFortran version: 0.67.0", from: "PI_REPL_LFORTRAN" });
+	assert.equal(calls.some((call) => call.includes("command -v")), false, calls.join("\n"));
+	await assert.rejects(preflightLfortran({ shell: "/bin/sh", run, configured: "build/lfortran" }), /^Error: PI_REPL_LFORTRAN must be the absolute path of an lfortran binary, not build\/lfortran\.$/);
+	await assert.rejects(preflightLfortran({ shell: "/bin/sh", run, configured: "/no/such/lfortran" }), /^Error: PI_REPL_LFORTRAN names \/no\/such\/lfortran, but it can't be resolved/);
+	// It's read from the environment, trimmed.
+	process.env.PI_REPL_LFORTRAN = "  /usr/bin/true  ";
+	try {
+		assert.equal((await preflightLfortran({ shell: "/bin/sh", run })).from, "PI_REPL_LFORTRAN");
+	} finally {
+		delete process.env.PI_REPL_LFORTRAN;
+	}
 });
 
 test("a session directory is new, private, short and claimed; only its own launch's files are removed with it", (t) => {

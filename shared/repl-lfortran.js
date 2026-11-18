@@ -24,6 +24,8 @@ export const LFORTRAN_GUIDELINES = [
 	"In LFortran, a runtime error (an out-of-bounds index, `error stop`) ends the session for everyone, and nothing can interrupt a cell. A plain READ waits for its answer, given with repl_input, and ends the session if it gets end of file: prefer `iostat=` in READs.",
 ];
 
+// A word for a command the person types: quoted only when the shell needs it.
+const shellWord = (value) => /^[\w@%+=:,./-]+$/.test(value) ? value : `'${value.replace(/'/g, `'"'"'`)}'`;
 const lookup = (id) => `repl_status target='lfortran' execution='${id}'`;
 const cancelled = (what) => new Error(`Cancelled before anything was sent: ${what}`);
 const noSession = () => `No shared LFortran session is running (${LFORTRAN_SESSION_NAME}). Start one with repl_start runtime='lfortran', or /repl lfortran.`;
@@ -39,7 +41,7 @@ export async function startLfortranRuntime({ tmux, cwd, timeoutMs = 30_000, sign
 	const started = await startJupyterSession({ tmux, cwd, lfortran: preflight?.path ?? existing.lfortran, shell, timeoutMs, signal });
 	const lines = [
 		started.created ? `Started the shared LFortran session: ${LFORTRAN_SESSION_NAME}` : `The shared LFortran session is already running; reused without restarting it (${LFORTRAN_SESSION_NAME}).`,
-		...(preflight ? [`LFortran: ${preflight.version || "version unknown"} (${preflight.path}).`] : []),
+		...(preflight ? [`LFortran: ${preflight.version || "version unknown"} (${preflight.path}${preflight.from ? `, from ${preflight.from}` : ""}).`] : []),
 		"The person's window, the session's first, is LFortran's own prompt (lfortran --connect); the kernel and pi-repl's helper run in the second. Cells run at that prompt are recorded under the person's name.",
 		started.ready ? "Readiness: the helper and kernel are ready, and LFortran's prompt is shown." : started.failure ? `The session isn't usable: ${started.failure}. Stop it with ${STOP}.` : `Readiness: not confirmed within ${timeoutMs} ms (helper and kernel: ${started.hello?.state === "ready" ? "ready" : "not yet"}; the person's prompt: ${started.prompt ? "shown" : started.promptEnded ? "ended" : "not yet"}). The session keeps starting; check repl_status target='lfortran'.`,
 		...started.warnings.map((warning) => `Warning: ${warning}`),
@@ -287,7 +289,7 @@ export async function lfortranStatus({ tmux, execution }) {
 	const prompt = await personPrompt(tmux, identity);
 	const lines = [`Shared LFortran session: ${LFORTRAN_SESSION_NAME}.`];
 	lines.push(prompt === "gone" ? "- The person's prompt: its pane is gone." : prompt === "ended"
-		? `- The person's prompt has ended; its pane is kept. They can rejoin with: lfortran --connect ${join(identity.dir, HELPER_FILES.connection)}`
+		? `- The person's prompt has ended; its pane is kept. They can rejoin with: ${identity.lfortran ? shellWord(identity.lfortran) : "lfortran"} --connect ${shellWord(join(identity.dir, HELPER_FILES.connection))}`
 		: `- The person's prompt: ${prompt === "prompt" ? "at LFortran's prompt" : "busy, or not at its prompt"} (the session's first window).`);
 	let status = null;
 	try {

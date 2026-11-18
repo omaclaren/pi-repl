@@ -6,6 +6,8 @@ All notable changes to `pi-repl` are documented here.
 
 ### Added
 - `PI_REPL_PYTHON` sets the command that starts the Python session, such as a project's `.venv/bin/python` or `uv run python`. It runs through your login shell, as `python` does, and IPython starts as the same command with `-m IPython`, so both use that environment. It applies when the session starts.
+- `PI_REPL_JULIA` does the same for Julia, such as `julia --project=@.` for the project in the working directory, or `JULIA_DEPOT_PATH=/path/to/depot julia`. Unlike `JULIA_PROJECT` set where Pi runs, it always reaches the session, since it's part of the session's command.
+- `PI_REPL_LFORTRAN`, the absolute path of an `lfortran` binary, starts a new LFortran session with that binary in place of the one your login shell finds, so a build of LFortran's `main` needn't be on your PATH. The start says where it came from. The command `/repl status lfortran` gives to rejoin your prompt now names the session's binary by its path.
 
 ### Changed
 - The Python session starts `python3` when there's no `python`, as on Debian and Ubuntu, which have only `python3` unless you install `python-is-python3`. This needs a POSIX login shell, such as bash or zsh; with fish or another shell the session starts `python` as before.

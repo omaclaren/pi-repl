@@ -741,12 +741,21 @@ function shellQuote(value: string): string {
 }
 
 /**
- * PI_REPL_PYTHON is the command that starts Python, such as a project's
- * `.venv/bin/python` or `uv run python`. It runs through the login shell, as
- * `python` does, and IPython starts as the same command with `-m IPython`.
+ * The setting that holds the command starting a runtime, as typed in the shell:
+ * PI_REPL_PYTHON, such as a project's `.venv/bin/python` or `uv run python`,
+ * and PI_REPL_JULIA, such as `julia --project=@.`. The command runs through the
+ * login shell, as the default does. IPython starts as PI_REPL_PYTHON's command
+ * with `-m IPython`, so that both use its environment.
  */
-function configuredPythonCommand(): string | undefined {
-	return process.env.PI_REPL_PYTHON?.trim() || undefined;
+function commandSetting(runtime: ManagedRuntime | ImplementedRuntime): "PI_REPL_PYTHON" | "PI_REPL_JULIA" | undefined {
+	if (runtime === "python" || runtime === "ipython") return "PI_REPL_PYTHON";
+	if (runtime === "julia") return "PI_REPL_JULIA";
+	return undefined;
+}
+
+function configuredCommand(runtime: ManagedRuntime | ImplementedRuntime): string | undefined {
+	const setting = commandSetting(runtime);
+	return setting ? process.env[setting]?.trim() || undefined : undefined;
 }
 
 /** The person's login shell, which starts each session's runtime. */
@@ -764,11 +773,9 @@ function pythonFallsBack(shell = loginShell()): boolean {
 }
 
 function buildRuntimeLaunchCommand(runtime: ManagedRuntime): string {
-	if (runtime === "python" || runtime === "ipython") {
-		const configured = configuredPythonCommand();
-		if (configured) return runtime === "ipython" ? `${configured} -m IPython` : configured;
-		if (runtime === "python" && pythonFallsBack()) return PYTHON_OR_PYTHON3;
-	}
+	const configured = configuredCommand(runtime);
+	if (configured) return runtime === "ipython" ? `${configured} -m IPython` : configured;
+	if (runtime === "python" && pythonFallsBack()) return PYTHON_OR_PYTHON3;
 	if (runtime === "r") return "R";
 	if (runtime === "clj" || runtime === "clojure") return "clojure";
 	if (runtime === "ruby") return "irb";
@@ -1849,10 +1856,11 @@ async function waitForReplSessionInfo(
 		const info = await readSessionInfo(pi, identity?.tmuxSessionId || sessionTarget, cwd, { inspectPrompt: true, write: true });
 		checkStartAborted(signal, sessionName);
 		if (!info) {
-			const python = (runtime === "python" || runtime === "ipython") && configuredPythonCommand()
-				? ` PI_REPL_PYTHON is set, so it starts \`${buildRuntimeLaunchCommand(runtime)}\`${runtime === "ipython" ? ", which needs IPython installed for that Python" : ""}.`
+			const setting = configuredCommand(runtime) ? commandSetting(runtime) : undefined;
+			const configured = setting
+				? ` ${setting} is set, so it starts \`${buildRuntimeLaunchCommand(runtime)}\`${runtime === "ipython" ? ", which needs IPython installed for that Python" : ""}.`
 				: "";
-			throw new Error(`REPL session ended while waiting for ${sessionName}. Check the runtime and your login-shell configuration before retrying.${python}`);
+			throw new Error(`REPL session ended while waiting for ${sessionName}. Check the runtime and your login-shell configuration before retrying.${configured}`);
 		}
 		if (identity && (info.tmuxSessionId !== identity.tmuxSessionId || info.tmuxSessionCreatedAt !== identity.tmuxSessionCreatedAt || info.recordId !== identity.recordId)) {
 			throw new Error(`REPL session ${sessionName} changed while waiting for its prompt. No replacement was started; inspect it with repl_status.`);
@@ -4131,9 +4139,10 @@ async function startDefaultReplSession(
 			: `Default ${getSessionDisplayName(target)} REPL session is already running; reused without restarting (requested: ${runtime}).`,
 		...(created ? [
 			`Launch method: ${shellLaunch.shell} -i -l -c ${shellQuote(buildRuntimeLaunchCommand(runtime))} inside tmux.`,
-			...(target === "python" ? [configuredPythonCommand()
-				? "PI_REPL_PYTHON set this command. It runs through your login shell, so your shell-level setup still applies."
-				: `This respects your normal shell-level Python setup (aliases, pyenv/virtualenv/conda activation, shell init, etc.)${pythonFallsBack() ? ", and uses python3 when there's no python" : ""}. Set PI_REPL_PYTHON to start another command.`] : []),
+			...(commandSetting(runtime) && configuredCommand(runtime) ? [`${commandSetting(runtime)} set this command. It runs through your login shell, so your shell-level setup still applies.`]
+				: target === "python" ? [`This respects your normal shell-level Python setup (aliases, pyenv/virtualenv/conda activation, shell init, etc.)${pythonFallsBack() ? ", and uses python3 when there's no python" : ""}. Set PI_REPL_PYTHON to start another command.`]
+				: target === "julia" ? ["Set PI_REPL_JULIA to start Julia another way, such as julia --project=@. for the project in the working directory."]
+				: []),
 			...(target === "clojure" ? ["`clojure` is used without rlwrap; `/repl clj` remains an alias."] : []),
 			...(target === "gnuplot" ? ["An inherited ownership marker identifies this session's interpreter and Qt helpers during explicit stop; plotting settings are unchanged."] : []),
 			...(target === "rust" && rustLaunch ? [`evcxr runs with a private settings folder (EVCXR_CONFIG_DIR=${rustLaunch.dir}), holding copies of your init.evcxr, prelude.rs and history, so the agent's cells are saved to its history, not yours. Stopping the session removes it.`] : []),

@@ -19,6 +19,9 @@ process.env.XDG_CONFIG_HOME = join(temporary, "config");
 delete process.env.PI_REPL_USER_NAME;
 process.on("exit", () => rmSync(temporary, { recursive: true, force: true }));
 export const REAL_LFORTRAN = process.env.PI_REPL_LFORTRAN;
+// pi-repl reads PI_REPL_LFORTRAN too. These tests' lfortran is the launcher on
+// each fixture's PATH, which records its processes, so pi-repl mustn't see it.
+delete process.env.PI_REPL_LFORTRAN;
 export const tmuxAvailable = process.platform !== "win32" && spawnSync("tmux", ["-V"]).status === 0;
 const quote = (text) => `'${text.replace(/'/g, `'"'"'`)}'`;
 export const sleep = (ms) => new Promise((resolve) => setTimeout(resolve, ms));

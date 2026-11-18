@@ -8,6 +8,10 @@ Python and IPython share the `pi-repl-python` session: requesting the other inte
 
 The session starts `python` through your login shell, or `python3` when there's no `python`, as on Debian and Ubuntu. That fallback is written for POSIX shells, such as bash and zsh; with fish or another login shell, the session starts `python` as before, and `PI_REPL_PYTHON=python3` covers a missing `python`. To start another interpreter, set `PI_REPL_PYTHON` to the command as you'd type it in your shell: a project's `.venv/bin/python`, say, which is found from the working directory, or `uv run python`. IPython then starts as that command with `-m IPython`, so it uses the same environment and needs IPython installed there. The setting applies when the session starts; a session that's already running keeps its interpreter.
 
+## Julia
+
+The session starts `julia` through your login shell, in Julia's default environment. To start it another way, set `PI_REPL_JULIA` to the command as you'd type it in your shell: `julia --project=@.` for the project in the working directory or a folder above it, `julia +1.11` for another version installed with juliaup, or `JULIA_DEPOT_PATH=/path/to/depot julia` for packages kept in another depot. Setting `JULIA_PROJECT` or `JULIA_DEPOT_PATH` where Pi runs doesn't always reach the session, since tmux starts it with its server's environment; `PI_REPL_JULIA` is part of the session's command, so it does. The setting applies when the session starts; a session that's already running keeps its environment.
+
 ## Haskell (GHCi)
 
 Use normal interactive syntax, such as `let` bindings or `:{ ... :}` blocks for multiline declarations.
@@ -143,7 +147,7 @@ Pi's cells are in the session's clean record, as the other runtimes' sends are, 
 
 ## LFortran sessions (experimental)
 
-`lfortran` shares one LFortran session between you and pi. It needs a build of LFortran's `main` branch with the shared session (`lfortran --connect` and `lfortran kernel --managed`), found as `lfortran` by your interactive login shell; no LFortran release has it yet. It has been tested with `main` at `edf73189fc` on ARM64 macOS.
+`lfortran` shares one LFortran session between you and pi. It needs a build of LFortran's `main` branch with the shared session (`lfortran --connect` and `lfortran kernel --managed`), found as `lfortran` by your interactive login shell, or at the absolute path `PI_REPL_LFORTRAN` gives, such as the binary in your LFortran build folder; no LFortran release has it yet. The setting applies when the session starts, and `/repl status lfortran` gives the command to rejoin with that binary. It has been tested with `main` at `edf73189fc` on ARM64 macOS.
 
 `/repl lfortran`, or `repl_start` with `runtime: "lfortran"`, starts the `pi-repl-lfortran` tmux session. Its first window is LFortran's own prompt, `lfortran --connect`, where you work. The second runs pi-repl's helper, which starts LFortran's Jupyter kernel and sends pi's cells to it over its own connection, so nothing is pasted into your prompt. Your cells and pi's run in the same kernel and share variables and procedures:
 

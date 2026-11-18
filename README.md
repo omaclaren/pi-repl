@@ -148,6 +148,8 @@ Set these in Pi's environment before starting it.
 | `PI_REPL_RECORD_ACTIVITY` | `on`, `send`, `off` | The same for other clients' record entries; follows `PI_REPL_PANE_ACTIVITY` when unset |
 | `PI_REPL_ECHO_MODE` | `summary` (default), `full`, `off` | The pane display at startup |
 | `PI_REPL_PYTHON` | a command | Start Python with this command, such as `.venv/bin/python` or `uv run python`, in place of `python` (or `python3` where there's no `python`); IPython starts as the command with `-m IPython` |
+| `PI_REPL_JULIA` | a command | Start Julia with this command, such as `julia --project=@.`, in place of `julia` |
+| `PI_REPL_LFORTRAN` | an absolute path | The `lfortran` binary for a new LFortran session, in place of the one your login shell finds |
 | `PI_REPL_USER_NAME` | a name | Record your sends under this name |
 | `PI_REPL_AGENT_LABEL` | a label | The agent's name in the record when these tools run outside Pi (`Pi` by default) |
 

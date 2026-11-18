@@ -9,10 +9,12 @@ import register from "../index.ts";
 
 const originalTmp = process.env.TMPDIR;
 const originalPython = process.env.PI_REPL_PYTHON;
+const originalJulia = process.env.PI_REPL_JULIA;
 const originalShell = process.env.SHELL;
 const root = mkdtempSync(join(tmpdir(), "pi-repl-start-"));
 process.env.TMPDIR = root;
 delete process.env.PI_REPL_PYTHON;
+delete process.env.PI_REPL_JULIA;
 // The login shell decides Python's command; these tests choose it.
 process.env.SHELL = "/bin/sh";
 after(() => {
@@ -20,6 +22,8 @@ after(() => {
 	else process.env.TMPDIR = originalTmp;
 	if (originalPython === undefined) delete process.env.PI_REPL_PYTHON;
 	else process.env.PI_REPL_PYTHON = originalPython;
+	if (originalJulia === undefined) delete process.env.PI_REPL_JULIA;
+	else process.env.PI_REPL_JULIA = originalJulia;
 	if (originalShell === undefined) delete process.env.SHELL;
 	else process.env.SHELL = originalShell;
 	rmSync(root, { recursive: true, force: true });
@@ -166,6 +170,31 @@ test("Python starts python, or python3 when there's no python", async () => {
 			assert.equal(run.status, 0, `${shell}: ${run.stderr}`);
 			assert.equal(run.stdout, `${expected}\n`, shell);
 		}
+	}
+});
+
+test("PI_REPL_JULIA is the command that starts Julia, apart from PI_REPL_PYTHON", async () => {
+	const launched = (f) => f.calls.find((call) => call.args[0] === "new-session").args.at(-1).match(/ -i -l -c '([^']*)'$/)[1];
+	try {
+		const plain = fixture({ runtime: "julia", prompt: "julia>" });
+		assert.match((await plain.start()).content[0].text, /Set PI_REPL_JULIA to start Julia another way, such as julia --project=@\. for the project in the working directory\./);
+		assert.equal(launched(plain), "julia");
+		process.env.PI_REPL_JULIA = "  julia --project=@.  ";
+		process.env.PI_REPL_PYTHON = "uv run python";
+		const julia = fixture({ runtime: "julia", prompt: "julia>" });
+		assert.match((await julia.start()).content[0].text, /PI_REPL_JULIA set this command\. It runs through your login shell/);
+		assert.equal(launched(julia), "julia --project=@.");
+		const python = fixture();
+		assert.match((await python.start()).content[0].text, /PI_REPL_PYTHON set this command\./);
+		assert.equal(launched(python), "uv run python");
+		await assert.rejects(fixture({ runtime: "julia", dieAfterCreate: true }).start(), /session ended while waiting for pi-repl-julia\. .*PI_REPL_JULIA is set, so it starts `julia --project=@\.`\.$/);
+		// Another runtime has no such setting.
+		const r = fixture({ runtime: "r", prompt: ">" });
+		assert.doesNotMatch((await r.start()).content[0].text, /PI_REPL_(PYTHON|JULIA)/);
+		assert.equal(launched(r), "R");
+	} finally {
+		delete process.env.PI_REPL_JULIA;
+		delete process.env.PI_REPL_PYTHON;
 	}
 });
 

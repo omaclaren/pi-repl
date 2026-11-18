@@ -11,7 +11,7 @@
 import { execFile } from "node:child_process";
 import { randomBytes } from "node:crypto";
 import { chmodSync, closeSync, constants, fstatSync, lstatSync, mkdirSync, openSync, readdirSync, readSync, realpathSync, renameSync, rmdirSync, unlinkSync, writeSync } from "node:fs";
-import { basename, dirname, join } from "node:path";
+import { basename, dirname, isAbsolute, join } from "node:path";
 import { fileURLToPath } from "node:url";
 import { HELPER_FILES, HELPER_PROTOCOL_VERSION, HelperClient, RECORD_FILE, checkPrivateDirectory } from "./repl-jupyter-helper.js";
 import { readOwnerMarkers } from "./repl-gnuplot-processes.js";
@@ -58,23 +58,31 @@ export function runCommand(file, args, { cwd, timeoutMs = 15_000, env } = {}) {
 }
 
 /**
- * Finds `lfortran` as the person's login shell does, and checks that it has
- * the shared session (LFortran main after #16032): `--connect`, and
- * `kernel --managed`. Resolves with its real path, which the helper then
- * runs directly, so that its child is the kernel itself.
+ * Finds `lfortran`: the binary PI_REPL_LFORTRAN names, or else the one the
+ * person's login shell finds. Checks that it has the shared session
+ * (LFortran main after #16032): `--connect`, and `kernel --managed`. Resolves
+ * with its real path, which the helper then runs directly, so that its child
+ * is the kernel itself.
  */
-export async function preflightLfortran({ shell = defaultShell(), cwd, run = runCommand, timeoutMs = 15_000 } = {}) {
-	const found = await run(shell, ["-i", "-l", "-c", "command -v lfortran"], { cwd, timeoutMs });
-	// An interactive shell's startup files can print too; the path is the last line.
-	const printed = found.code === 0 ? found.stdout.trim().split("\n").at(-1).trim() : "";
-	if (!printed.startsWith("/")) {
-		throw new Error(`lfortran wasn't found by your login shell (\`${shell} -i -l -c 'command -v lfortran'\`). The LFortran session needs LFortran main after #16032 on your PATH.`);
+export async function preflightLfortran({ shell = defaultShell(), cwd, run = runCommand, timeoutMs = 15_000, configured = process.env.PI_REPL_LFORTRAN?.trim() || undefined } = {}) {
+	let printed;
+	if (configured) {
+		// A build of main is often outside PATH, so its path is enough.
+		if (!isAbsolute(configured)) throw new Error(`PI_REPL_LFORTRAN must be the absolute path of an lfortran binary, not ${configured}.`);
+		printed = configured;
+	} else {
+		const found = await run(shell, ["-i", "-l", "-c", "command -v lfortran"], { cwd, timeoutMs });
+		// An interactive shell's startup files can print too; the path is the last line.
+		printed = found.code === 0 ? found.stdout.trim().split("\n").at(-1).trim() : "";
+		if (!printed.startsWith("/")) {
+			throw new Error(`lfortran wasn't found by your login shell (\`${shell} -i -l -c 'command -v lfortran'\`). The LFortran session needs LFortran main after #16032 on your PATH, or PI_REPL_LFORTRAN set to its absolute path.`);
+		}
 	}
 	let path;
 	try {
 		path = realpathSync(printed);
 	} catch (error) {
-		throw new Error(`lfortran was found at ${printed}, but it can't be resolved: ${error.message}`);
+		throw new Error(configured ? `PI_REPL_LFORTRAN names ${printed}, but it can't be resolved: ${error.message}` : `lfortran was found at ${printed}, but it can't be resolved: ${error.message}`);
 	}
 	const help = await run(path, ["--help"], { cwd, timeoutMs });
 	const kernelHelp = await run(path, ["kernel", "--help"], { cwd, timeoutMs });
@@ -82,7 +90,7 @@ export async function preflightLfortran({ shell = defaultShell(), cwd, run = run
 		throw new Error(`${path} has no shared session: the LFortran session needs LFortran main after #16032 (\`lfortran --connect\` and \`lfortran kernel --managed\`).`);
 	}
 	const version = await run(path, ["--version"], { cwd, timeoutMs });
-	return { path, version: (version.stdout.trim().split("\n")[0] ?? "").trim() };
+	return { path, version: (version.stdout.trim().split("\n")[0] ?? "").trim(), ...(configured ? { from: "PI_REPL_LFORTRAN" } : {}) };
 }
 
 /**
