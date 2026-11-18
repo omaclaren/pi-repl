@@ -6,6 +6,8 @@ Each runtime takes submitted code in its own way, so that it runs in the same wo
 
 Python and IPython share the `pi-repl-python` session: requesting the other interpreter while one is running keeps the one already running and reports the difference. `/repl env` shows which interpreter and environment the session is using; it's implemented for Python and IPython only. In plain Python, `print(...)` is the safest way to get values back.
 
+The session starts `python` through your login shell, or `python3` when there's no `python`, as on Debian and Ubuntu. That fallback is written for POSIX shells, such as bash and zsh; with fish or another login shell, the session starts `python` as before, and `PI_REPL_PYTHON=python3` covers a missing `python`. To start another interpreter, set `PI_REPL_PYTHON` to the command as you'd type it in your shell: a project's `.venv/bin/python`, say, which is found from the working directory, or `uv run python`. IPython then starts as that command with `-m IPython`, so it uses the same environment and needs IPython installed there. The setting applies when the session starts; a session that's already running keeps its interpreter.
+
 ## Haskell (GHCi)
 
 Use normal interactive syntax, such as `let` bindings or `:{ ... :}` blocks for multiline declarations.

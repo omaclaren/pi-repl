@@ -1,17 +1,27 @@
 import { after, test } from "node:test";
 import assert from "node:assert/strict";
-import { mkdtempSync, readFileSync, rmSync, statSync } from "node:fs";
+import { spawnSync } from "node:child_process";
+import { mkdtempSync, readFileSync, rmSync, statSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { DEFAULT_MAX_BYTES, DEFAULT_MAX_LINES } from "@earendil-works/pi-coding-agent";
 import register from "../index.ts";
 
 const originalTmp = process.env.TMPDIR;
+const originalPython = process.env.PI_REPL_PYTHON;
+const originalShell = process.env.SHELL;
 const root = mkdtempSync(join(tmpdir(), "pi-repl-start-"));
 process.env.TMPDIR = root;
+delete process.env.PI_REPL_PYTHON;
+// The login shell decides Python's command; these tests choose it.
+process.env.SHELL = "/bin/sh";
 after(() => {
 	if (originalTmp === undefined) delete process.env.TMPDIR;
 	else process.env.TMPDIR = originalTmp;
+	if (originalPython === undefined) delete process.env.PI_REPL_PYTHON;
+	else process.env.PI_REPL_PYTHON = originalPython;
+	if (originalShell === undefined) delete process.env.SHELL;
+	else process.env.SHELL = originalShell;
 	rmSync(root, { recursive: true, force: true });
 });
 
@@ -19,8 +29,9 @@ after(() => {
 const shellWord = (text) => `'${text.replace(/'/g, `'"'"'`)}'`;
 const literal = (text) => text.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
 
+const pythonFallback = "if command -v python >/dev/null 2>&1; then python; else python3; fi";
 const runtimes = [
-	["python", "python", ">>>"], ["ipython", "ipython", "In [1]:"],
+	["python", pythonFallback, ">>>"], ["ipython", "ipython", "In [1]:"],
 	["julia", "julia", "julia>"], ["r", "R", ">"], ["ghci", "ghci", "ghci>"],
 	["clojure", "clojure", "user=>"], ["ruby", "irb", "irb(main):001:0>"], ["java", "jshell", "jshell>"],
 	["octave", "octave-cli --quiet --interactive --persist --eval 'sighup_dumps_octave_core(false); sigterm_dumps_octave_core(false);'", "octave:1>"], ["matlab", "matlab -nodesktop -nosplash", ">>"],
@@ -138,6 +149,77 @@ for (const [runtime, executable, prompt] of runtimes) {
 		assert.ok(f.calls.slice(count).every((call) => !["new-session", "pipe-pane", "set-option", "send-keys", "load-buffer"].includes(call.args[0])));
 	});
 }
+
+test("Python starts python, or python3 when there's no python", async () => {
+	const f = fixture();
+	const result = await f.start();
+	assert.match(result.content[0].text, /uses python3 when there's no python\. Set PI_REPL_PYTHON to start another command\./);
+	const command = f.calls.find((call) => call.args[0] === "new-session").args.at(-1).match(/ -i -l -c '([^']*)'$/)[1];
+	assert.equal(command, pythonFallback);
+	// Run in each POSIX shell installed here, finding only these stand-ins.
+	const shells = ["/bin/sh", "bash", "zsh", "dash", "ksh"].map((shell) => spawnSync("/bin/sh", ["-c", 'command -v "$1"', "sh", shell], { encoding: "utf8" }).stdout.trim()).filter(Boolean);
+	for (const shell of shells) {
+		for (const [names, expected] of [[["python3"], "python3"], [["python", "python3"], "python"]]) {
+			const bin = mkdtempSync(join(root, "bin-"));
+			for (const name of names) writeFileSync(join(bin, name), `#!/bin/sh\necho ${name}\n`, { mode: 0o755 });
+			const run = spawnSync(shell, ["-c", command], { env: { PATH: bin }, encoding: "utf8" });
+			assert.equal(run.status, 0, `${shell}: ${run.stderr}`);
+			assert.equal(run.stdout, `${expected}\n`, shell);
+		}
+	}
+});
+
+test("Python starts plain python under a login shell that isn't a POSIX shell, such as fish", async () => {
+	try {
+		for (const [shell, falls] of [["/opt/homebrew/bin/fish", false], ["/usr/bin/nu", false], ["/bin/zsh", true], ["/usr/local/bin/bash", true]]) {
+			process.env.SHELL = shell;
+			const f = fixture();
+			const result = await f.start();
+			const launch = f.calls.find((call) => call.args[0] === "new-session").args.at(-1);
+			assert.match(launch, new RegExp(`^${literal(shellWord(shell))} -i -l -c ${literal(shellWord(falls ? pythonFallback : "python"))}$`));
+			assert.equal(/uses python3 when there's no python/.test(result.content[0].text), falls, shell);
+			assert.match(result.content[0].text, /Set PI_REPL_PYTHON to start another command\./);
+		}
+		// PI_REPL_PYTHON applies whatever the shell.
+		process.env.SHELL = "/opt/homebrew/bin/fish";
+		process.env.PI_REPL_PYTHON = "python3";
+		const f = fixture();
+		await f.start();
+		assert.match(f.calls.find((call) => call.args[0] === "new-session").args.at(-1), / -i -l -c 'python3'$/);
+	} finally {
+		process.env.SHELL = "/bin/sh";
+		delete process.env.PI_REPL_PYTHON;
+	}
+});
+
+test("PI_REPL_PYTHON is the command that starts Python, and IPython is it with -m IPython", async () => {
+	try {
+		process.env.PI_REPL_PYTHON = "  uv run python  ";
+		for (const [runtime, prompt, expected] of [["python", ">>>", "uv run python"], ["ipython", "In [1]:", "uv run python -m IPython"]]) {
+			const f = fixture({ runtime, prompt });
+			const result = await f.start();
+			assert.match(f.calls.find((call) => call.args[0] === "new-session").args.at(-1), new RegExp(` -i -l -c ${literal(shellWord(expected))}$`));
+			assert.match(result.content[0].text, /PI_REPL_PYTHON set this command\. It runs through your login shell/);
+		}
+		// A blank setting is no setting.
+		process.env.PI_REPL_PYTHON = "   ";
+		const blank = fixture();
+		await blank.start();
+		assert.match(blank.calls.find((call) => call.args[0] === "new-session").args.at(-1), new RegExp(` -i -l -c ${literal(shellWord(pythonFallback))}$`));
+		// A session that ends at once says what PI_REPL_PYTHON started.
+		for (const [runtime, said] of [["python", "starts `uv run python`."], ["ipython", "starts `uv run python -m IPython`, which needs IPython installed for that Python."]]) {
+			process.env.PI_REPL_PYTHON = "uv run python";
+			await assert.rejects(fixture({ runtime, dieAfterCreate: true }).start(), new RegExp(`session ended while waiting for pi-repl-python\\. .*PI_REPL_PYTHON is set, so it ${literal(said)}$`));
+		}
+		// A running session keeps its interpreter.
+		process.env.PI_REPL_PYTHON = ".venv/bin/python";
+		const running = fixture({ exists: true });
+		assert.equal((await running.start()).details.reused, true);
+		assert.equal(running.calls.some((call) => call.args[0] === "new-session"), false);
+	} finally {
+		delete process.env.PI_REPL_PYTHON;
+	}
+});
 
 test("repl_start requires a canonical explicit runtime; no send auto-start or destructive tools", async () => {
 	const f = fixture();

@@ -15,7 +15,7 @@ import { createTestTmux, readProcessTable } from "./helpers/repl-test-tmux.js";
 import { visibleWidth } from "@earendil-works/pi-tui";
 
 const exec = promisify(execFile);
-const originalEnv = { TMPDIR: process.env.TMPDIR, PI_REPL_CONTROL_ROOT: process.env.PI_REPL_CONTROL_ROOT, SHELL: process.env.SHELL, PI_REPL_ECHO_MODE: process.env.PI_REPL_ECHO_MODE, XDG_CONFIG_HOME: process.env.XDG_CONFIG_HOME, PI_REPL_USER_NAME: process.env.PI_REPL_USER_NAME, PI_REPL_PANE_ACTIVITY: process.env.PI_REPL_PANE_ACTIVITY, PI_REPL_RECORD_ACTIVITY: process.env.PI_REPL_RECORD_ACTIVITY };
+const originalEnv = { TMPDIR: process.env.TMPDIR, PI_REPL_CONTROL_ROOT: process.env.PI_REPL_CONTROL_ROOT, SHELL: process.env.SHELL, PI_REPL_ECHO_MODE: process.env.PI_REPL_ECHO_MODE, XDG_CONFIG_HOME: process.env.XDG_CONFIG_HOME, PI_REPL_USER_NAME: process.env.PI_REPL_USER_NAME, PI_REPL_PANE_ACTIVITY: process.env.PI_REPL_PANE_ACTIVITY, PI_REPL_RECORD_ACTIVITY: process.env.PI_REPL_RECORD_ACTIVITY, PI_REPL_PYTHON: process.env.PI_REPL_PYTHON };
 const root = mkdtempSync(join(tmpdir(), "pi-repl-integration-"));
 process.env.TMPDIR = root;
 process.env.PI_REPL_CONTROL_ROOT = join(root, "controls");
@@ -25,6 +25,8 @@ delete process.env.PI_REPL_ECHO_MODE;
 process.env.XDG_CONFIG_HOME = join(root, "config");
 delete process.env.PI_REPL_USER_NAME;
 delete process.env.PI_REPL_PANE_ACTIVITY;
+// Python starts from the test's own launcher.
+delete process.env.PI_REPL_PYTHON;
 // What an agent is told of the record (D5) has tests of its own, which turn it on; the rest
 // see results and prompt starts as they are without it.
 process.env.PI_REPL_RECORD_ACTIVITY = "off";

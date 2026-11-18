@@ -4,6 +4,12 @@ All notable changes to `pi-repl` are documented here.
 
 ## [Unreleased]
 
+### Added
+- `PI_REPL_PYTHON` sets the command that starts the Python session, such as a project's `.venv/bin/python` or `uv run python`. It runs through your login shell, as `python` does, and IPython starts as the same command with `-m IPython`, so both use that environment. It applies when the session starts.
+
+### Changed
+- The Python session starts `python3` when there's no `python`, as on Debian and Ubuntu, which have only `python3` unless you install `python-is-python3`. This needs a POSIX login shell, such as bash or zsh; with fish or another shell the session starts `python` as before.
+
 ## [0.13.1] — 2026-11-17
 
 ### Added
