@@ -69,6 +69,9 @@ function fixture({ runtime = "python", exists = false, prompt = ">>>", ...option
 					return fail("duplicate session");
 				}
 				if (state.createFailure) return fail("permission denied");
+				// A tmux wrapper or host whose diagnostic quotes the command it was given.
+				if (state.createEcho) return fail(`could not run ${args.at(-1)}`);
+				if (state.createThrows) throw new Error(`exec failed: tmux ${args.join(" ")}`);
 				if (state.exists) return fail("duplicate session");
 				state.exists = !state.dieAfterCreate;
 				state.afterCreate?.();
@@ -182,12 +185,12 @@ test("PI_REPL_JULIA is the command that starts Julia, apart from PI_REPL_PYTHON"
 		process.env.PI_REPL_JULIA = "  julia --project=@.  ";
 		process.env.PI_REPL_PYTHON = "uv run python";
 		const julia = fixture({ runtime: "julia", prompt: "julia>" });
-		assert.match((await julia.start()).content[0].text, /PI_REPL_JULIA set this command\. It runs through your login shell/);
+		assert.match((await julia.start()).content[0].text, /Launch method: PI_REPL_JULIA's command, run as \/bin\/sh -i -l -c '…' inside tmux\.\nPI_REPL_JULIA chose the command, which isn't shown here/);
 		assert.equal(launched(julia), "julia --project=@.");
 		const python = fixture();
-		assert.match((await python.start()).content[0].text, /PI_REPL_PYTHON set this command\./);
+		assert.match((await python.start()).content[0].text, /PI_REPL_PYTHON chose the command, which isn't shown here/);
 		assert.equal(launched(python), "uv run python");
-		await assert.rejects(fixture({ runtime: "julia", dieAfterCreate: true }).start(), /session ended while waiting for pi-repl-julia\. .*PI_REPL_JULIA is set, so it starts `julia --project=@\.`\.$/);
+		await assert.rejects(fixture({ runtime: "julia", dieAfterCreate: true }).start(), /session ended while waiting for pi-repl-julia\. .*PI_REPL_JULIA is set, so the session ran its command; try that in a terminal\.$/);
 		// Another runtime has no such setting.
 		const r = fixture({ runtime: "r", prompt: ">" });
 		assert.doesNotMatch((await r.start()).content[0].text, /PI_REPL_(PYTHON|JULIA)/);
@@ -223,23 +226,39 @@ test("Python starts plain python under a login shell that isn't a POSIX shell, s
 
 test("PI_REPL_PYTHON is the command that starts Python, and IPython is it with -m IPython", async () => {
 	try {
-		process.env.PI_REPL_PYTHON = "  uv run python  ";
-		for (const [runtime, prompt, expected] of [["python", ">>>", "uv run python"], ["ipython", "In [1]:", "uv run python -m IPython"]]) {
+		// The command can carry a credential, so what the agent is told names the setting, not its text.
+		const command = "UV_INDEX_URL=https://user:s3cret@example.invalid/simple uv run python";
+		process.env.PI_REPL_PYTHON = `  ${command}  `;
+		for (const [runtime, prompt, expected, launch] of [["python", ">>>", command, "PI_REPL_PYTHON's command"], ["ipython", "In [1]:", `${command} -m IPython`, "PI_REPL_PYTHON's command with -m IPython"]]) {
 			const f = fixture({ runtime, prompt });
 			const result = await f.start();
 			assert.match(f.calls.find((call) => call.args[0] === "new-session").args.at(-1), new RegExp(` -i -l -c ${literal(shellWord(expected))}$`));
-			assert.match(result.content[0].text, /PI_REPL_PYTHON set this command\. It runs through your login shell/);
+			const told = result.content[0].text;
+			assert.ok(told.includes(`Launch method: ${launch}, run as /bin/sh -i -l -c '…' inside tmux.`), told);
+			assert.match(told, /PI_REPL_PYTHON chose the command, which isn't shown here since it can hold secrets\. It runs through your login shell/);
+			assert.equal(JSON.stringify(result).includes("s3cret"), false, "the credential reached the result");
 		}
 		// A blank setting is no setting.
 		process.env.PI_REPL_PYTHON = "   ";
 		const blank = fixture();
 		await blank.start();
 		assert.match(blank.calls.find((call) => call.args[0] === "new-session").args.at(-1), new RegExp(` -i -l -c ${literal(shellWord(pythonFallback))}$`));
-		// A session that ends at once says what PI_REPL_PYTHON started.
-		for (const [runtime, said] of [["python", "starts `uv run python`."], ["ipython", "starts `uv run python -m IPython`, which needs IPython installed for that Python."]]) {
-			process.env.PI_REPL_PYTHON = "uv run python";
-			await assert.rejects(fixture({ runtime, dieAfterCreate: true }).start(), new RegExp(`session ended while waiting for pi-repl-python\\. .*PI_REPL_PYTHON is set, so it ${literal(said)}$`));
+		// A session that ends at once names PI_REPL_PYTHON, not its command.
+		for (const [runtime, said] of [["python", "ran its command; try that in a terminal."], ["ipython", "ran its command with -m IPython, which needs IPython installed for that Python; try that in a terminal."]]) {
+			process.env.PI_REPL_PYTHON = command;
+			const error = await fixture({ runtime, dieAfterCreate: true }).start().then(() => assert.fail("started"), (failure) => failure.message);
+			assert.match(error, new RegExp(`session ended while waiting for pi-repl-python\\. .*PI_REPL_PYTHON is set, so the session ${literal(said)}$`));
+			assert.equal(error.includes("s3cret"), false, error);
 		}
+		// Nor does a failure to make the session, whose diagnostic could quote the command.
+		for (const options of [{ createEcho: true }, { createThrows: true }]) {
+			const error = await fixture(options).start().then(() => assert.fail("started"), (failure) => failure.message);
+			assert.match(error, /^Failed to create tmux session pi-repl-python with PI_REPL_PYTHON's command \((exit code 1|tmux didn't run)\)\. tmux's message isn't shown/);
+			assert.equal(error.includes("s3cret"), false, error);
+		}
+		// Without a setting, tmux's message is shown as before.
+		delete process.env.PI_REPL_PYTHON;
+		await assert.rejects(fixture({ createEcho: true }).start(), /^Error: Failed to create tmux session pi-repl-python: could not run /);
 		// A running session keeps its interpreter.
 		process.env.PI_REPL_PYTHON = ".venv/bin/python";
 		const running = fixture({ exists: true });

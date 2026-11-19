@@ -11,7 +11,7 @@ import { dirname, join } from "node:path";
 import { promisify } from "node:util";
 import { DEFAULT_MAX_BYTES } from "@earendil-works/pi-coding-agent";
 import { visibleWidth } from "@earendil-works/pi-tui";
-import { answerLfortranInput, formatExecution, lfortranStatus, sendLfortranCode } from "../shared/repl-lfortran.js";
+import { answerLfortranInput, formatExecution, lfortranStatus, sendLfortranCode, startLfortranRuntime } from "../shared/repl-lfortran.js";
 import { readSessionIdentity } from "../shared/repl-jupyter-session.js";
 import { REAL_LFORTRAN, defer, lfortranFixture, until } from "./helpers/repl-test-lfortran.js";
 
@@ -275,6 +275,27 @@ test("PI_REPL_LFORTRAN names an lfortran that isn't on PATH, and the command to 
 	await until(async () => (await f.windows())[0][4] === "1", { what: "the person's pane to end" });
 	const status = text(await f.status({ target: "lfortran" }));
 	assert.ok(status.includes(`They can rejoin with: '${realpathSync(binary)}' --connect `), status);
+});
+
+test("a start that finds another start's session reports no lfortran of its own", async (t) => {
+	const f = await piFixture(t);
+	if (!f) return;
+	assert.equal((await f.start()).details.created, true);
+	// This start looked before the other made the session, so it found lfortran itself, and then reused the other's session.
+	let hidden = true;
+	const tmux = async (args) => {
+		if (hidden && args[0] === "list-sessions") {
+			hidden = false;
+			return { code: 0, stdout: "", stderr: "" };
+		}
+		return f.tmux(args);
+	};
+	const result = await startLfortranRuntime({ tmux, cwd: f.base, shell: "/bin/sh", run: f.run, timeoutMs: 30_000 });
+	assert.equal(hidden, false);
+	assert.equal(result.details.created, false, result.text);
+	assert.doesNotMatch(result.text, /^LFortran: /m);
+	assert.equal(result.details.lfortran, undefined);
+	assert.equal(result.details.version, undefined);
 });
 
 test("a cell that ends the kernel: its outcome is unconfirmed, the session says it's over, and it still stops", async (t) => {

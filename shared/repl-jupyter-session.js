@@ -57,6 +57,8 @@ export function runCommand(file, args, { cwd, timeoutMs = 15_000, env } = {}) {
 	});
 }
 
+const LOOKUP_MARKER = "pi-repl-lfortran-lookup";
+
 /**
  * Finds `lfortran`: the binary PI_REPL_LFORTRAN names, or else the one the
  * person's login shell finds. Checks that it has the shared session
@@ -71,9 +73,11 @@ export async function preflightLfortran({ shell = defaultShell(), cwd, run = run
 		if (!isAbsolute(configured)) throw new Error(`PI_REPL_LFORTRAN must be the absolute path of an lfortran binary, not ${configured}.`);
 		printed = configured;
 	} else {
-		const found = await run(shell, ["-i", "-l", "-c", "command -v lfortran"], { cwd, timeoutMs });
-		// An interactive shell's startup files can print too; the path is the last line.
-		printed = found.code === 0 ? found.stdout.trim().split("\n").at(-1).trim() : "";
+		// An interactive shell's startup files can print too, so a marker line comes first, and
+		// everything after it, but its last newline, is the path: one with a line break stays whole.
+		const found = await run(shell, ["-i", "-l", "-c", `echo ${LOOKUP_MARKER}; command -v lfortran`], { cwd, timeoutMs });
+		const after = found.code === 0 ? new RegExp(`(?:^|\n)${LOOKUP_MARKER}\n([\\s\\S]*)$`).exec(found.stdout)?.[1] : undefined;
+		printed = after?.replace(/\n$/, "") ?? "";
 		if (!printed.startsWith("/")) {
 			throw new Error(`lfortran wasn't found by your login shell (\`${shell} -i -l -c 'command -v lfortran'\`). The LFortran session needs LFortran main after #16032 on your PATH, or PI_REPL_LFORTRAN set to its absolute path.`);
 		}
@@ -83,6 +87,10 @@ export async function preflightLfortran({ shell = defaultShell(), cwd, run = run
 		path = realpathSync(printed);
 	} catch (error) {
 		throw new Error(configured ? `PI_REPL_LFORTRAN names ${printed}, but it can't be resolved: ${error.message}` : `lfortran was found at ${printed}, but it can't be resolved: ${error.message}`);
+	}
+	// The session keeps the path in a tmux option, read back as tab-separated lines.
+	if (/[\x00-\x1f\x7f]/.test(path)) {
+		throw new Error(`lfortran's path, ${JSON.stringify(path)}, has a tab, line break or other control character, which the session can't keep. Use a path without one${configured ? " in PI_REPL_LFORTRAN" : ""}.`);
 	}
 	const help = await run(path, ["--help"], { cwd, timeoutMs });
 	const kernelHelp = await run(path, ["kernel", "--help"], { cwd, timeoutMs });
@@ -357,7 +365,9 @@ const complete = (identity) => identity.runtime === "lfortran" && OWNER.test(ide
  * kept after it ends; then its command replaces it. Waits up to `timeoutMs`
  * for the helper and kernel to be ready and the person's prompt to show; a
  * session that isn't confirmed by then keeps starting. Cancelling stops the
- * waiting, never a session already created.
+ * waiting, never a session already created. `lfortran` is the binary's path,
+ * or a function that finds it, called only when this call is about to make
+ * the session, before anything is made.
  */
 export async function startJupyterSession({
 	tmux, cwd, lfortran, shell = defaultShell(), nodePath = process.execPath, helperScript = HELPER_SCRIPT,
@@ -369,6 +379,10 @@ export async function startJupyterSession({
 	let created = false;
 	if (!identity) {
 		if (signal?.aborted) throw new Error(`Starting ${sessionName} was cancelled before anything was created.`);
+		if (typeof lfortran === "function") {
+			lfortran = await lfortran();
+			if (signal?.aborted) throw new Error(`Starting ${sessionName} was cancelled before anything was created.`);
+		}
 		const owner = randomBytes(16).toString("hex");
 		const dir = createSessionDir({ root, uid, owner });
 		const made = await tmux(["new-session", "-d", "-P", "-F", "#{session_id}\t#{window_id}\t#{pane_id}", "-s", sessionName, "-c", cwd, PLACEHOLDER]);

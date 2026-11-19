@@ -36,12 +36,16 @@ const noSession = () => `No shared LFortran session is running (${LFORTRAN_SESSI
  * @param {{ tmux: Tmux, cwd: string, timeoutMs?: number, signal?: AbortSignal, shell?: string, run?: typeof runCommand }} options
  */
 export async function startLfortranRuntime({ tmux, cwd, timeoutMs = 30_000, signal, shell = defaultShell(), run = runCommand }) {
-	const existing = await readSessionIdentity(tmux, LFORTRAN_SESSION_NAME);
-	const preflight = existing ? null : await preflightLfortran({ shell, cwd, run });
-	const started = await startJupyterSession({ tmux, cwd, lfortran: preflight?.path ?? existing.lfortran, shell, timeoutMs, signal });
+	// lfortran is found only for a session this call makes, just before it's made, so a session seen
+	// earlier and stopped since can't lend it its binary.
+	let preflight = null;
+	const find = async () => (preflight = await preflightLfortran({ shell, cwd, run })).path;
+	const started = await startJupyterSession({ tmux, cwd, lfortran: find, shell, timeoutMs, signal });
+	// Another start can make the session first, with its own lfortran: only a session this call made ran the one it found.
+	const found = started.created ? preflight : null;
 	const lines = [
 		started.created ? `Started the shared LFortran session: ${LFORTRAN_SESSION_NAME}` : `The shared LFortran session is already running; reused without restarting it (${LFORTRAN_SESSION_NAME}).`,
-		...(preflight ? [`LFortran: ${preflight.version || "version unknown"} (${preflight.path}${preflight.from ? `, from ${preflight.from}` : ""}).`] : []),
+		...(found ? [`LFortran: ${found.version || "version unknown"} (${found.path}${found.from ? `, from ${found.from}` : ""}).`] : []),
 		"The person's window, the session's first, is LFortran's own prompt (lfortran --connect); the kernel and pi-repl's helper run in the second. Cells run at that prompt are recorded under the person's name.",
 		started.ready ? "Readiness: the helper and kernel are ready, and LFortran's prompt is shown." : started.failure ? `The session isn't usable: ${started.failure}. Stop it with ${STOP}.` : `Readiness: not confirmed within ${timeoutMs} ms (helper and kernel: ${started.hello?.state === "ready" ? "ready" : "not yet"}; the person's prompt: ${started.prompt ? "shown" : started.promptEnded ? "ended" : "not yet"}). The session keeps starting; check repl_status target='lfortran'.`,
 		...started.warnings.map((warning) => `Warning: ${warning}`),
@@ -52,7 +56,7 @@ export async function startLfortranRuntime({ tmux, cwd, timeoutMs = 30_000, sign
 		details: {
 			runtime: "lfortran", sessionName: LFORTRAN_SESSION_NAME, created: started.created, reused: started.reused, ready: started.ready,
 			helper: Boolean(started.hello), prompt: started.prompt, failure: started.failure, timeoutMs, attachCommand: ATTACH, warnings: started.warnings,
-			...(preflight ? { lfortran: preflight.path, version: preflight.version } : {}),
+			...(found ? { lfortran: found.path, version: found.version } : {}),
 		},
 	};
 }

@@ -2,6 +2,7 @@ import test from "node:test";
 import assert from "node:assert/strict";
 import { execFile } from "node:child_process";
 import { chmodSync, existsSync, lstatSync, mkdirSync, mkdtempSync, readFileSync, readdirSync, renameSync, rmSync, symlinkSync, writeFileSync } from "node:fs";
+import { tmpdir } from "node:os";
 import { basename, join } from "node:path";
 import { HelperClient } from "../shared/repl-jupyter-helper.js";
 import {
@@ -45,9 +46,13 @@ const alive = async (pids) => {
 	return pids.filter((pid) => table.some((p) => p.pid === pid && !p.state.startsWith("Z")));
 };
 
+// What the login shell runs to find lfortran: a marker line, then command -v's.
+const LOOKUP = "/bin/sh -i -l -c echo pi-repl-lfortran-lookup; command -v lfortran";
+const MARK = "pi-repl-lfortran-lookup\n";
+
 test("preflight finds lfortran through the login shell, and requires its shared session", async () => {
 	const answers = new Map([
-		["/bin/sh -i -l -c command -v lfortran", { code: 0, stdout: "some startup noise\n/usr/bin/true\n" }],
+		[LOOKUP, { code: 0, stdout: `some startup noise\n${MARK}/usr/bin/true\n` }],
 		["/usr/bin/true --help", { code: 0, stdout: "  --connect TEXT  Run the prompt in the kernel\n" }],
 		["/usr/bin/true kernel --help", { code: 0, stdout: "  --managed  Stop when the last client disconnects\n" }],
 		["/usr/bin/true --version", { code: 0, stdout: "LFortran version: 0.67.0\nPlatform: macOS\n" }],
@@ -59,9 +64,9 @@ test("preflight finds lfortran through the login shell, and requires its shared 
 	}
 	answers.set("/usr/bin/true --help", { code: 0, stdout: "no shared session here\n" });
 	await assert.rejects(preflightLfortran({ shell: "/bin/sh", run }), /needs LFortran main after #16032/);
-	answers.set("/bin/sh -i -l -c command -v lfortran", { code: 1, stdout: "" });
+	answers.set(LOOKUP, { code: 1, stdout: MARK });
 	await assert.rejects(preflightLfortran({ shell: "/bin/sh", run }), /wasn't found by your login shell/);
-	answers.set("/bin/sh -i -l -c command -v lfortran", { code: 0, stdout: "alias lfortran=something\n" });
+	answers.set(LOOKUP, { code: 0, stdout: `${MARK}alias lfortran=something\n` });
 	await assert.rejects(preflightLfortran({ shell: "/bin/sh", run }), /wasn't found[\s\S]*or PI_REPL_LFORTRAN set to its absolute path\.$/);
 });
 
@@ -81,6 +86,28 @@ test("preflight uses the lfortran PI_REPL_LFORTRAN names, without asking the log
 	assert.equal(calls.some((call) => call.includes("command -v")), false, calls.join("\n"));
 	await assert.rejects(preflightLfortran({ shell: "/bin/sh", run, configured: "build/lfortran" }), /^Error: PI_REPL_LFORTRAN must be the absolute path of an lfortran binary, not build\/lfortran\.$/);
 	await assert.rejects(preflightLfortran({ shell: "/bin/sh", run, configured: "/no/such/lfortran" }), /^Error: PI_REPL_LFORTRAN names \/no\/such\/lfortran, but it can't be resolved/);
+	// The session keeps the path in a tmux option read back as tab-separated lines, so a path with a tab or line break is refused before anything starts.
+	const odd = mkdtempSync(join(tmpdir(), "pi-repl-preflight-"));
+	try {
+		for (const name of ["with\ttab", "with\nbreak"]) {
+			const binary = join(odd, name, "lfortran");
+			mkdirSync(join(odd, name));
+			writeFileSync(binary, "#!/bin/sh\n", { mode: 0o700 });
+			calls.length = 0;
+			await assert.rejects(preflightLfortran({ shell: "/bin/sh", run, configured: binary }), /has a tab, line break or other control character, which the session can't keep\. Use a path without one in PI_REPL_LFORTRAN\.$/);
+			assert.deepEqual(calls, [], "nothing ran");
+			answers.set(LOOKUP, { code: 0, stdout: `${MARK}${binary}\n` });
+			await assert.rejects(preflightLfortran({ shell: "/bin/sh", run }), /control character, which the session can't keep\. Use a path without one\.$/);
+			assert.deepEqual(calls.filter((call) => call !== LOOKUP), [], "nothing but the lookup ran");
+		}
+		// A found path with a line break is kept whole, so the line after the break, an executable on its own, isn't run.
+		calls.length = 0;
+		answers.set(LOOKUP, { code: 0, stdout: `${MARK}${join(odd, "no such")}\n/usr/bin/true\n` });
+		await assert.rejects(preflightLfortran({ shell: "/bin/sh", run }), /lfortran was found at .*no such\n\/usr\/bin\/true, but it can't be resolved/);
+		assert.deepEqual(calls, [LOOKUP]);
+	} finally {
+		rmSync(odd, { recursive: true, force: true });
+	}
 	// It's read from the environment, trimmed.
 	process.env.PI_REPL_LFORTRAN = "  /usr/bin/true  ";
 	try {
@@ -451,6 +478,28 @@ test("the person's prompt ending keeps its pane and the session; the session sti
 	const result = await f.stop();
 	assert.equal(existsSync(started.dir), false);
 	assert.deepEqual(result.warnings, []);
+});
+
+test("a new session's lfortran is found just before it's made, and never for a session reused", async (t) => {
+	const f = sessionFixture(t);
+	if (!f) return;
+	let finds = 0;
+	const find = async () => {
+		finds += 1;
+		// Nothing is made before lfortran is found.
+		assert.equal(await readSessionIdentity(f.tmux, "pi-repl-lfortran"), null);
+		return f.lfortran;
+	};
+	const started = await f.start({ lfortran: find });
+	assert.equal(started.created, true);
+	assert.equal(finds, 1);
+	const again = await f.start({ lfortran: find });
+	assert.equal(again.created, false);
+	assert.equal(finds, 1);
+	await f.stop();
+	// When lfortran can't be found, nothing is made.
+	await assert.rejects(f.start({ lfortran: async () => { throw new Error("no lfortran here"); } }), /no lfortran here/);
+	assert.equal(await readSessionIdentity(f.tmux, "pi-repl-lfortran"), null);
 });
 
 test("a helper that can't start the kernel: start says why, the person's window too, and the session still stops", async (t) => {

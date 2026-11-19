@@ -789,6 +789,17 @@ function buildRuntimeLaunchCommand(runtime: ManagedRuntime): string {
 	return runtime;
 }
 
+/**
+ * The runtime's command as the agent and the conversation may see it. A
+ * configured command is named by its setting, not shown: it can carry a
+ * credential, as an environment assignment or in a URL.
+ */
+function describeRuntimeLaunchCommand(runtime: ManagedRuntime | ImplementedRuntime, shell = loginShell()): string {
+	const setting = configuredCommand(runtime) ? commandSetting(runtime) : undefined;
+	if (setting) return `${setting}'s command${runtime === "ipython" ? " with -m IPython" : ""}, run as ${shell} -i -l -c '…'`;
+	return `${shell} -i -l -c ${shellQuote(buildRuntimeLaunchCommand(runtime as ManagedRuntime))}`;
+}
+
 function buildDefaultShellRuntimeCommand(runtime: ManagedRuntime, cwd?: string, launchCommand?: string): { shell: string; command: string } {
 	const shell = loginShell();
 	const runtimeCommand = launchCommand ?? buildRuntimeLaunchCommand(runtime) + (runtime === "matlab" && cwd ? ` -sd ${shellQuote(cwd)}` : "");
@@ -1858,7 +1869,7 @@ async function waitForReplSessionInfo(
 		if (!info) {
 			const setting = configuredCommand(runtime) ? commandSetting(runtime) : undefined;
 			const configured = setting
-				? ` ${setting} is set, so it starts \`${buildRuntimeLaunchCommand(runtime)}\`${runtime === "ipython" ? ", which needs IPython installed for that Python" : ""}.`
+				? ` ${setting} is set, so the session ran its command${runtime === "ipython" ? " with -m IPython, which needs IPython installed for that Python" : ""}; try that in a terminal.`
 				: "";
 			throw new Error(`REPL session ended while waiting for ${sessionName}. Check the runtime and your login-shell configuration before retrying.${configured}`);
 		}
@@ -4073,14 +4084,21 @@ async function startDefaultReplSession(
 		// tmux atomically creates the name. Do not use -A, respawn or kill: a
 		// concurrent winner must be reused without rewriting its metadata/log.
 		const gnuplotOwner = runtime === "gnuplot" ? randomUUID().replace(/-/g, "") : undefined;
+		// A diagnostic of a failed launch could quote the command, and a configured one can carry a credential.
+		const setting = configuredCommand(runtime) ? commandSetting(runtime) : undefined;
+		const launchFailed = (detail: string) => new Error(`Failed to create tmux session ${sessionName} with ${setting}'s command (${detail}). tmux's message isn't shown, since it could repeat the command; try the command in a terminal.`);
 		const result = await execTmux(pi, [
 			"new-session", "-d", "-P", "-F", "#{session_id}", "-s", sessionName, "-c", cwd,
 			...(gnuplotOwner ? ["-e", `${GNUPLOT_OWNER_ENV}=${gnuplotOwner}`] : []), shellLaunch.command,
-		], cwd, 10_000);
+		], cwd, 10_000).catch((error) => {
+			if (setting) throw launchFailed("tmux didn't run");
+			throw error;
+		});
 		if (result.code !== 0) {
 			// Another start made the session first, with its own settings folder.
 			if (rustLaunch) removeRustConfigDir(rustLaunch.dir);
 			if (!(await tmuxSessionExists(pi, sessionName, cwd))) {
+				if (setting) throw launchFailed(`exit code ${result.code}`);
 				const reason = result.stderr.trim() || result.stdout.trim() || `exit code ${result.code}`;
 				throw new Error(`Failed to create tmux session ${sessionName}: ${reason}`);
 			}
@@ -4138,8 +4156,8 @@ async function startDefaultReplSession(
 			? `Started default ${getSessionDisplayName(target)} REPL session: ${sessionName}`
 			: `Default ${getSessionDisplayName(target)} REPL session is already running; reused without restarting (requested: ${runtime}).`,
 		...(created ? [
-			`Launch method: ${shellLaunch.shell} -i -l -c ${shellQuote(buildRuntimeLaunchCommand(runtime))} inside tmux.`,
-			...(commandSetting(runtime) && configuredCommand(runtime) ? [`${commandSetting(runtime)} set this command. It runs through your login shell, so your shell-level setup still applies.`]
+			`Launch method: ${describeRuntimeLaunchCommand(runtime, shellLaunch.shell)} inside tmux.`,
+			...(commandSetting(runtime) && configuredCommand(runtime) ? [`${commandSetting(runtime)} chose the command, which isn't shown here since it can hold secrets. It runs through your login shell, so your shell-level setup still applies.`]
 				: target === "python" ? [`This respects your normal shell-level Python setup (aliases, pyenv/virtualenv/conda activation, shell init, etc.)${pythonFallsBack() ? ", and uses python3 when there's no python" : ""}. Set PI_REPL_PYTHON to start another command.`]
 				: target === "julia" ? ["Set PI_REPL_JULIA to start Julia another way, such as julia --project=@. for the project in the working directory."]
 				: []),
